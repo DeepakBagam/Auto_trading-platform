@@ -10,7 +10,6 @@ htmlcov/
 .env
 models/artifacts/
 *.log
-trading.db
 trading.db-shm
 trading.db-wal
 trading.db.backup*
