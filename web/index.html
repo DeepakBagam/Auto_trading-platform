@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quant Architect</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/web/styles.css?v=20260415-1">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <p class="eyebrow">AI OPTIONS PLATFORM</p>
+        <h1>Quant Architect</h1>
+        <p class="subtle">NIFTY · BANK NIFTY · SENSEX · INDIA VIX</p>
+      </div>
+
+      <nav class="nav" aria-label="Primary navigation">
+        <button class="nav-link active" data-view="dashboard">Dashboard</button>
+        <button class="nav-link" data-view="options">Options Desk</button>
+        <button class="nav-link" data-view="intelligence">ML Intelligence</button>
+        <button class="nav-link" data-view="trades">Trades &amp; Ops</button>
+        <button class="nav-link" data-view="calendar">Calendar</button>
+      </nav>
+
+      <div class="sidebar-spacer"></div>
+      <button id="emergencyStopBtn" class="danger-button">Emergency Stop</button>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div class="header-title">
+          <strong>Realtime Execution Desk</strong>
+          <span id="headerSubtext">Loading market context...</span>
+        </div>
+        <div class="header-right">
+          <label class="header-control">
+            <span>Symbol</span>
+            <select id="symbolSelect"></select>
+          </label>
+          <div class="header-pill" id="headerPrice">-</div>
+          <div class="header-pill" id="apiStatus">API</div>
+          <div class="header-pill" id="clockIst">IST --:--:--</div>
+        </div>
+      </header>
+
+      <main class="views">
+        <section class="view active" data-panel="dashboard">
+          <section class="stats-grid">
+            <article class="stat-card">
+              <span>Win Rate</span>
+              <strong id="statWinRate">0.00%</strong>
+              <small id="statWinMeta">0 wins / 0 trades today</small>
+            </article>
+            <article class="stat-card">
+              <span>Total P&amp;L Today</span>
+              <strong id="statPnl">0.00</strong>
+              <small id="statPnlMeta">Net realized P&amp;L</small>
+            </article>
+            <article class="stat-card">
+              <span>Open Positions</span>
+              <strong id="statOpenPositions">0</strong>
+              <small id="statOpenMeta">0.00 unrealized</small>
+            </article>
+            <article class="stat-card">
+              <span>Max Drawdown</span>
+              <strong id="statDrawdown">0.00%</strong>
+              <small id="statDrawdownMeta">Peak to trough</small>
+            </article>
+          </section>
+
+          <section class="dashboard-grid">
+            <article class="panel chart-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Market Chart</h2>
+                  <p id="chartMeta">1-minute candles with trade markers</p>
+                </div>
+              </div>
+              <div id="chart"></div>
+            </article>
+
+            <aside class="panel consensus-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Live Consensus</h2>
+                  <p>ML + Pine + AI + risk gates</p>
+                </div>
+              </div>
+
+              <div class="signal-box" id="mlBox">
+                <div class="signal-head">
+                  <span>ML Signal</span>
+                  <strong id="mlDirection">-</strong>
+                </div>
+                <div class="bar-track"><div id="mlConfidenceBar" class="bar-fill"></div></div>
+                <div class="signal-row">
+                  <span id="mlConfidenceText">Confidence -</span>
+                  <span id="mlMoveText">Move -</span>
+                </div>
+                <div class="status-line">
+                  <span class="status-badge" id="mlStatusBadge">WAIT</span>
+                  <span id="mlReason">-</span>
+                </div>
+              </div>
+
+              <div class="signal-box" id="pineBox">
+                <div class="signal-head">
+                  <span>Pine Signal</span>
+                  <strong id="pineDirection">-</strong>
+                </div>
+                <div class="signal-row">
+                  <span id="pineAgeText">Age -</span>
+                  <span id="pineFreshnessText">Freshness -</span>
+                </div>
+                <div class="status-line">
+                  <span class="status-badge" id="pineStatusBadge">WAIT</span>
+                  <span id="pineReason">-</span>
+                </div>
+              </div>
+
+              <div class="signal-box ai-box">
+                <div class="signal-head">
+                  <span>AI Quality</span>
+                  <strong id="aiScoreText">0</strong>
+                </div>
+                <div class="gauge" id="aiGauge">
+                  <div class="gauge-core">
+                    <span id="aiGaugeValue">0</span>
+                    <small>/100</small>
+                  </div>
+                </div>
+                <div class="status-line">
+                  <span class="status-badge" id="aiStatusBadge">WAIT</span>
+                  <span id="aiReason">-</span>
+                </div>
+              </div>
+
+              <div class="verdict">
+                <span class="verdict-label">Final Verdict</span>
+                <strong id="verdictText">NO TRADE</strong>
+                <small id="verdictMeta">Waiting for a valid setup</small>
+              </div>
+            </aside>
+          </section>
+
+          <section class="bottom-grid">
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Open Positions</h2>
+                  <p>Live P&amp;L, SL, TSL, target, and manual actions</p>
+                </div>
+              </div>
+              <div class="table-shell">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Strike</th>
+                      <th>Type</th>
+                      <th>Entry</th>
+                      <th>Current</th>
+                      <th>P&amp;L</th>
+                      <th>SL</th>
+                      <th>TSL</th>
+                      <th>Entry Time</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="openPositionsTable"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Signal Log</h2>
+                  <p>Last 10 consensus evaluations</p>
+                </div>
+              </div>
+              <div id="signalLogFeed" class="feed"></div>
+            </article>
+          </section>
+        </section>
+
+        <section class="view" data-panel="options">
+          <section class="options-grid">
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Auto Selection</h2>
+                  <p>Current contract candidate and execution plan</p>
+                </div>
+              </div>
+              <div class="selection-card">
+                <div class="selection-row"><span>Direction</span><strong id="optionDirection">-</strong></div>
+                <div class="selection-row"><span>Contract</span><strong id="optionContract">-</strong></div>
+                <div class="selection-row"><span>Expiry</span><strong id="optionExpiry">-</strong></div>
+                <div class="selection-row"><span>Entry Premium</span><strong id="optionEntry">-</strong></div>
+                <div class="selection-row"><span>Stop / Target</span><strong id="optionRiskPlan">-</strong></div>
+                <div class="selection-row"><span>Strategy</span><strong id="optionStrategy">Consensus CE/PE</strong></div>
+                <div class="selection-reason" id="optionReason">Waiting for a tradeable setup.</div>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Open Position Cards</h2>
+                  <p>Realtime order cards for all active trades</p>
+                </div>
+              </div>
+              <div id="positionCards" class="cards-grid"></div>
+            </article>
+          </section>
+        </section>
+
+        <section class="view" data-panel="intelligence">
+          <section class="intelligence-grid">
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>ML Reasoning</h2>
+                  <p>Thresholds, strategy checks, and expected move</p>
+                </div>
+              </div>
+              <div id="mlReasons" class="list-stack"></div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>AI Reasoning</h2>
+                  <p>Trade quality, time-of-day, volatility, and sentiment</p>
+                </div>
+              </div>
+              <div id="aiReasons" class="list-stack"></div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Signal Inputs</h2>
+                  <p>Current live data coming into the consensus engine</p>
+                </div>
+              </div>
+              <div id="consensusDetails" class="detail-grid"></div>
+            </article>
+          </section>
+        </section>
+
+        <section class="view" data-panel="trades">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Recent Orders</h2>
+                <p>Latest broker and paper-trade order activity for the selected symbol</p>
+              </div>
+            </div>
+            <div class="table-shell">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th>Contract</th>
+                    <th>Kind</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Price</th>
+                    <th>Trigger</th>
+                    <th>Realized P&amp;L</th>
+                    <th>Open P&amp;L</th>
+                    <th>Status</th>
+                    <th>Broker Order</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="ordersTable"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Trade History</h2>
+                <p>Closed positions with entry, exit, duration, and exit reasons</p>
+              </div>
+            </div>
+            <div class="table-shell">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th>Strike</th>
+                    <th>Type</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>Qty</th>
+                    <th>P&amp;L</th>
+                    <th>Exit Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="historyTable"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="calendar">
+          <section class="panel calendar-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Trade Calendar</h2>
+                <p>Monthly P&amp;L map with drill-down into daily trades</p>
+              </div>
+              <div class="calendar-controls">
+                <button id="prevMonthBtn" class="ghost-button">Prev</button>
+                <strong id="calendarMonthLabel">-</strong>
+                <button id="nextMonthBtn" class="ghost-button">Next</button>
+              </div>
+            </div>
+            <div id="calendarSummary" class="calendar-summary"></div>
+            <div id="calendarGrid" class="calendar-grid"></div>
+            <div id="calendarDayPanel" class="calendar-day-panel"></div>
+          </section>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <div id="tradeModal" class="modal hidden">
+    <div class="modal-backdrop" data-close-modal="true"></div>
+    <div class="modal-card">
+      <button class="modal-close" data-close-modal="true">×</button>
+      <h3 id="modalTitle">Trade Detail</h3>
+      <div id="modalMeta" class="detail-grid"></div>
+      <div class="mini-chart-wrap">
+        <svg id="miniChart" viewBox="0 0 400 120" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/web/app.js?v=20260417-2"></script>
+</body>
+</html>

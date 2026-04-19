@@ -1,0 +1,53 @@
+{
+  "defaults": {
+    "entry_score_threshold": 75.0,
+    "pine_led_score_threshold": 52.0,
+    "ml_confidence_floor": 0.56,
+    "combined_score_floor": 0.52,
+    "ai_score_floor": 45.0,
+    "pine_led_ai_floor": 40.0,
+    "expected_move_floor": 45.0,
+    "pine_max_age_seconds": 180,
+    "trade_drought_lookback_bars": 20,
+    "trade_drought_relax_pct": 0.10,
+    "lunch_relax_pct": 0.05,
+    "friday_relax_pct": 0.03,
+    "low_activity_trade_target": 3,
+    "low_activity_relax_pct": 0.12,
+    "max_total_relax_pct": 0.25
+  },
+  "symbols": {
+    "NIFTY50": {
+      "entry_score_threshold": 75.0,
+      "ml_confidence_floor": 0.56,
+      "combined_score_floor": 0.52,
+      "ai_score_floor": 45.0,
+      "expected_move_floor": 48.0
+    },
+    "BANKNIFTY": {
+      "entry_score_threshold": 75.0,
+      "ml_confidence_floor": 0.58,
+      "combined_score_floor": 0.54,
+      "ai_score_floor": 45.0,
+      "expected_move_floor": 70.0
+    },
+    "SENSEX": {
+      "entry_score_threshold": 78.0,
+      "ml_confidence_floor": 0.58,
+      "combined_score_floor": 0.54,
+      "ai_score_floor": 47.0,
+      "expected_move_floor": 55.0
+    },
+    "INDIAVIX": {
+      "entry_score_threshold": 999.0,
+      "pine_led_score_threshold": 999.0,
+      "ml_confidence_floor": 0.99,
+      "combined_score_floor": 0.99,
+      "ai_score_floor": 999.0,
+      "pine_led_ai_floor": 999.0,
+      "expected_move_floor": 999.0,
+      "trade_drought_relax_pct": 0.0,
+      "max_total_relax_pct": 0.0
+    }
+  }
+}

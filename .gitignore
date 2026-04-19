@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+models/artifacts/
+*.log
+trading.db
+trading.db-shm
+trading.db-wal
+trading.db.backup*
+*.db.backup*

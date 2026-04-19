@@ -1,0 +1,146 @@
+{
+  "trade_date": "2026-04-17",
+  "generated_at": "2026-04-19T23:09:32.838501+05:30",
+  "symbols": {
+    "Nifty 50": {
+      "status": "ok",
+      "symbol": "Nifty 50",
+      "start_date": "2026-04-17",
+      "end_date": "2026-04-17",
+      "sessions": 1,
+      "bars": 375,
+      "signals": 3,
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "win_rate_pct": 100.0,
+      "gross_return_pct": 0.48,
+      "final_equity": 100477.93,
+      "max_drawdown_pct": 0.0,
+      "sharpe": 0.0,
+      "equity_curve": [
+        {
+          "x": "2026-04-17T15:16:00+05:30",
+          "value": 100478.0
+        }
+      ],
+      "trade_log": [
+        {
+          "entry_time": "2026-04-17T10:03:00+05:30",
+          "exit_time": "2026-04-17T15:16:00+05:30",
+          "side": "BUY",
+          "entry_price": 24239.9,
+          "exit_price": 24355.75,
+          "pnl_points": 115.85,
+          "return_pct": 0.478,
+          "exit_reason": "FORCE_EXIT"
+        }
+      ]
+    },
+    "Bank Nifty": {
+      "status": "ok",
+      "symbol": "Bank Nifty",
+      "start_date": "2026-04-17",
+      "end_date": "2026-04-17",
+      "sessions": 1,
+      "bars": 375,
+      "signals": 3,
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "win_rate_pct": 100.0,
+      "gross_return_pct": 0.7,
+      "final_equity": 100697.08,
+      "max_drawdown_pct": 0.0,
+      "sharpe": 0.0,
+      "equity_curve": [
+        {
+          "x": "2026-04-17T15:16:00+05:30",
+          "value": 100697.0
+        }
+      ],
+      "trade_log": [
+        {
+          "entry_time": "2026-04-17T10:04:00+05:30",
+          "exit_time": "2026-04-17T15:16:00+05:30",
+          "side": "BUY",
+          "entry_price": 56191.2,
+          "exit_price": 56582.9,
+          "pnl_points": 391.7,
+          "return_pct": 0.697,
+          "exit_reason": "FORCE_EXIT"
+        }
+      ]
+    },
+    "India VIX": {
+      "status": "ok",
+      "symbol": "India VIX",
+      "start_date": "2026-04-17",
+      "end_date": "2026-04-17",
+      "sessions": 1,
+      "bars": 375,
+      "signals": 1,
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "win_rate_pct": 100.0,
+      "gross_return_pct": 3.86,
+      "final_equity": 103861.22,
+      "max_drawdown_pct": 0.0,
+      "sharpe": 0.0,
+      "equity_curve": [
+        {
+          "x": "2026-04-17T15:16:00+05:30",
+          "value": 103861.0
+        }
+      ],
+      "trade_log": [
+        {
+          "entry_time": "2026-04-17T10:18:00+05:30",
+          "exit_time": "2026-04-17T15:16:00+05:30",
+          "side": "SELL",
+          "entry_price": 17.87,
+          "exit_price": 17.18,
+          "pnl_points": 0.69,
+          "return_pct": 3.861,
+          "exit_reason": "FORCE_EXIT"
+        }
+      ]
+    },
+    "SENSEX": {
+      "status": "ok",
+      "symbol": "SENSEX",
+      "start_date": "2026-04-17",
+      "end_date": "2026-04-17",
+      "sessions": 1,
+      "bars": 375,
+      "signals": 4,
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "win_rate_pct": 100.0,
+      "gross_return_pct": 0.44,
+      "final_equity": 100441.18,
+      "max_drawdown_pct": 0.0,
+      "sharpe": 0.0,
+      "equity_curve": [
+        {
+          "x": "2026-04-17T15:16:00+05:30",
+          "value": 100441.0
+        }
+      ],
+      "trade_log": [
+        {
+          "entry_time": "2026-04-17T09:56:00+05:30",
+          "exit_time": "2026-04-17T15:16:00+05:30",
+          "side": "BUY",
+          "entry_price": 78151.73,
+          "exit_price": 78496.52,
+          "pnl_points": 344.79,
+          "return_pct": 0.441,
+          "exit_reason": "FORCE_EXIT"
+        }
+      ]
+    }
+  }
+}
