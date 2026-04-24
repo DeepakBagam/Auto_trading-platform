@@ -107,6 +107,40 @@ def get_vix_level(db: Session) -> float:
     return float(vix_candle.close) if vix_candle else 20.0
 
 
+def get_vix_context(db: Session) -> tuple[float, float, float]:
+    """Return (current_vix, vix_ma20, vix_ratio).
+
+    vix_ratio = current / ma20.  >1.40 = spike; <0.70 & level <12 = too calm.
+    Falls back to (20.0, 20.0, 1.0) when no VIX data is available.
+    """
+    from db.models import RawCandle
+
+    candles = (
+        db.execute(
+            select(RawCandle)
+            .where(
+                and_(
+                    instrument_key_filter(RawCandle.instrument_key, "India VIX"),
+                    RawCandle.interval == "1minute",
+                )
+            )
+            .order_by(RawCandle.ts.desc())
+            .limit(200)
+        )
+        .scalars()
+        .all()
+    )
+    if not candles:
+        return 20.0, 20.0, 1.0
+
+    closes = [float(c.close) for c in candles]
+    current_vix = closes[0]
+    window = closes[: min(20, len(closes))]
+    ma20 = sum(window) / len(window)
+    ratio = current_vix / ma20 if ma20 > 0 else 1.0
+    return current_vix, ma20, ratio
+
+
 def get_time_of_day_premium(now: datetime) -> float:
     """
     Get time-of-day slippage premium.

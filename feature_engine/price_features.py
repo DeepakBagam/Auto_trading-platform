@@ -34,6 +34,33 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
+def _adx(df: pd.DataFrame, period: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Return (adx, plus_di, minus_di) using Wilder's exponential smoothing."""
+    high = df["high"]
+    low = df["low"]
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = df["close"].shift(1)
+
+    up_move = high - prev_high
+    down_move = prev_low - low
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    alpha = 1.0 / period
+    smoothed_tr = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / (smoothed_tr + 1e-9)
+    minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / (smoothed_tr + 1e-9)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx, plus_di, minus_di
+
+
 def _engulfing_pattern(out: pd.DataFrame) -> pd.Series:
     prev_open = out["open"].shift(1)
     prev_close = out["close"].shift(1)
@@ -87,6 +114,11 @@ def build_price_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_upper"] = out["bb_mid"] + 2 * bb_std
     out["bb_lower"] = out["bb_mid"] - 2 * bb_std
     out["atr_14"] = _atr(out, 14)
+    out["atr_14_mean_20"] = out["atr_14"].rolling(20, min_periods=10).mean()
+    adx_series, plus_di_series, minus_di_series = _adx(out, 14)
+    out["adx_14"] = adx_series
+    out["plus_di_14"] = plus_di_series
+    out["minus_di_14"] = minus_di_series
     out["kc_mid"] = _ema(out["close"], 20)
     out["kc_upper"] = out["kc_mid"] + 2 * _atr(out, 10)
     out["kc_lower"] = out["kc_mid"] - 2 * _atr(out, 10)

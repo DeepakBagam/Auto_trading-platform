@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     option_chain_refresh_seconds: int = 4
     signal_min_score: float = 63.0
     signal_cooldown_minutes: int = 12
-    signal_max_per_day: int = 3
+    signal_max_per_day: int = 2
     ui_stream_interval_ms: int = 500
     ui_tick_interval_ms: int = 75
     history_retention_years: int = 2
@@ -99,7 +99,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("EXECUTION_MAX_SIMULTANEOUS_TRADES", "MAX_SIMULTANEOUS_TRADES"),
     )
     execution_max_daily_trades: int = Field(
-        default=5,
+        default=2,
         validation_alias=AliasChoices("EXECUTION_MAX_DAILY_TRADES", "MAX_DAILY_TRADES"),
     )
     execution_lot_size: int = 1
@@ -118,10 +118,12 @@ class Settings(BaseSettings):
     combined_score_threshold: float = Field(default=0.65, validation_alias="COMBINED_SCORE_THRESHOLD")
     tsl_activation_percent: float = Field(default=0.05, validation_alias="TSL_ACTIVATION_PERCENT")
     tsl_trail_percent: float = Field(default=0.03, validation_alias="TSL_TRAIL_PERCENT")
+    tsl_immediate: bool = Field(default=True, validation_alias="TSL_IMMEDIATE")
     target_profit_percent: float = Field(default=0.30, validation_alias="TARGET_PROFIT_PERCENT")
     force_squareoff_time: str = Field(default="15:15", validation_alias="FORCE_SQUAREOFF_TIME")
     entry_window_start: str = Field(default="09:20", validation_alias="ENTRY_WINDOW_START")
-    entry_window_end: str = Field(default="13:30", validation_alias="ENTRY_WINDOW_END")
+    entry_window_end: str = Field(default="12:30", validation_alias="ENTRY_WINDOW_END")
+    second_trade_entry_end: str = Field(default="11:00", validation_alias="SECOND_TRADE_ENTRY_END")
     live_execution_blocked_symbols: str = "India VIX"
 
     # Redis configuration for Celery

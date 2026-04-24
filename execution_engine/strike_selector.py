@@ -40,6 +40,44 @@ def _to_float(value) -> float | None:
         return None
 
 
+def compute_position_lots(
+    confidence: float,
+    regime: str,
+    base_lots: int,
+    max_lots: int = 2,
+) -> int:
+    """Scale position size by confidence and market regime.
+
+    Rules:
+    - HIGH_VOLATILITY: always base_lots (never size up into chaos)
+    - RANGE_BOUND: always base_lots (range can reverse hard)
+    - TRENDING + high confidence (>=0.80): allow up to 2× base
+    - TRENDING + medium confidence (>=0.70): allow up to 1.5× base
+    - Otherwise: base_lots
+    """
+    if regime in {"HIGH_VOLATILITY", "RANGE_BOUND"}:
+        return base_lots
+    if confidence >= 0.80:
+        return min(max_lots, base_lots * 2)
+    if confidence >= 0.70:
+        return min(max_lots, max(base_lots, int(base_lots * 1.5)))
+    return base_lots
+
+
+def _compute_pcr(chain_rows: list[dict]) -> float | None:
+    """Put-Call Ratio from chain OI.  >1.5 = heavy put buying; <0.5 = heavy call buying."""
+    total_ce = 0.0
+    total_pe = 0.0
+    for row in chain_rows:
+        ce_oi = _to_float((row.get("ce") or {}).get("oi")) or 0.0
+        pe_oi = _to_float((row.get("pe") or {}).get("oi")) or 0.0
+        total_ce += ce_oi
+        total_pe += pe_oi
+    if total_ce <= 0:
+        return None
+    return total_pe / total_ce
+
+
 def confidence_to_delta_range(confidence: float) -> tuple[float, float]:
     """Map confidence to target delta range for intraday option buying.
 
@@ -164,115 +202,133 @@ def select_option_contract(
     premium_max: float = 100000.0,
     days_to_expiry: int = 7,
     capital_per_trade: float = 100000.0,
+    iv_rank: float | None = None,
 ) -> StrikeSelectionResult | None:
-    """Enhanced strike selection with delta-based, volatility-aware logic."""
+    """Strike selection with delta targeting, OI delta, PCR filter, and IV rank."""
     if signal_action not in {"BUY", "SELL"}:
         return None
 
     option_type: OptionType = "CE" if signal_action == "BUY" else "PE"
     atm = nearest_strike(spot_price, strike_step)
-    rows_by_strike = {float(row.get("strike")): row for row in chain_rows if _to_float(row.get("strike")) is not None}
-    
-    # Calculate expected move and IV context
+    rows_by_strike = {
+        float(row.get("strike")): row
+        for row in chain_rows
+        if _to_float(row.get("strike")) is not None
+    }
+
     expected_move = calculate_expected_move(chain_rows, atm, strike_step)
     atm_iv = get_atm_iv(chain_rows, atm)
-    
-    # Get target delta range based on confidence
+
+    # PCR sentiment check — penalise crowded trades
+    pcr = _compute_pcr(chain_rows)
+    # CE trade when everyone is also buying CEs (PCR < 0.5) = crowded long
+    # PE trade when everyone is also buying PEs (PCR > 2.0) = crowded short
+    pcr_crowded = (
+        (option_type == "CE" and pcr is not None and pcr < 0.5)
+        or (option_type == "PE" and pcr is not None and pcr > 2.0)
+    )
+
+    # IV rank guard: if IV is in top 30% of its range, premium is expensive
+    # Reduce premium max to limit overpaying
+    iv_rank_expensive = iv_rank is not None and iv_rank > 0.70
+
     delta_min, delta_max = confidence_to_delta_range(confidence)
-    
-    # Adjust for time to expiry — near expiry always tighten toward ATM
+
+    # Tighten toward ATM near expiry to avoid gamma explosion
     if days_to_expiry <= 1:
         delta_min = max(0.45, delta_min)
         delta_max = min(0.55, delta_max)
     elif days_to_expiry <= 5:
         delta_min = max(0.40, delta_min)
         delta_max = min(0.55, delta_max)
-    # Hard floor: never buy options with delta below 0.38 intraday
-    delta_min = max(0.38, delta_min)
-    
-    # Dynamic premium cap based on risk (1-2% of capital)
-    max_premium_risk = capital_per_trade * 0.02
-    premium_max = min(premium_max, max_premium_risk)
-    
-    # Get OI cluster strikes (support/resistance)
+    delta_min = max(0.38, delta_min)  # hard floor
+
+    # Cap premium: 2% of capital, reduced to 1% when IV is expensive
+    risk_pct = 0.01 if iv_rank_expensive else 0.02
+    premium_max = min(premium_max, capital_per_trade * risk_pct)
+
     oi_clusters = get_oi_cluster_strikes(chain_rows, option_type, top_n=5)
 
-    # Score all candidates
-    candidates = []
-    relaxed_candidates = []
+    candidates: list[dict] = []
+    relaxed_candidates: list[dict] = []
+
     for strike, row in rows_by_strike.items():
         quote = _quote_for_row(row, option_type)
         if not quote:
             continue
-        
+
         premium = _to_float(quote.get("ltp"))
         delta = _to_float(quote.get("delta"))
         iv = _to_float(quote.get("iv"))
-        
+        oi = _to_float(quote.get("oi"))
+        prev_oi = _to_float(quote.get("prev_oi"))
+
         if not premium or not delta:
             continue
-        
-        # Filter: premium range
         if premium < premium_min or premium > premium_max:
             continue
-        
-        # Filter: delta range (probability-based)
+
         abs_delta = abs(delta)
         delta_in_band = delta_min <= abs_delta <= delta_max
 
-        # Filter: within expected move range
         distance_from_atm = abs(strike - atm)
         if distance_from_atm > expected_move * 1.5:
             continue
-        
-        # Enhanced liquidity check
-        liquid, oi, spread_rupees, spread_pct, volume = _liquidity_check(
-            quote,
-            ltp=premium,
-            min_oi=1000.0,
-            max_spread_pct=0.06,
-            min_volume=100.0,
+
+        liquid, _oi, spread_rupees, spread_pct, volume = _liquidity_check(
+            quote, ltp=premium, min_oi=1000.0, max_spread_pct=0.06, min_volume=100.0,
         )
         if not liquid and spread_pct is not None and spread_pct > 0.10:
             continue
 
-        # Calculate score
         score = 0.0
-        
-        # Delta score (prefer middle of range)
+
+        # 1. Delta closeness (35%)
         delta_target = (delta_min + delta_max) / 2
-        delta_score = 1.0 - abs(abs_delta - delta_target) / 0.25
+        delta_score = max(0.0, 1.0 - abs(abs_delta - delta_target) / 0.25)
         score += delta_score * 0.35
-        
-        # OI cluster bonus (support/resistance)
+
+        # 2. OI cluster alignment (20%)
         if strike in oi_clusters:
             cluster_rank = oi_clusters.index(strike)
-            score += (0.20 - cluster_rank * 0.05)
-        
-        # Liquidity score
-        if oi:
-            oi_score = min(1.0, oi / 10000.0)
-            score += oi_score * 0.15
-        
+            score += max(0.0, 0.20 - cluster_rank * 0.05)
+
+        # 3. Absolute OI quality (15%)
+        if _oi:
+            score += min(1.0, _oi / 10000.0) * 0.15
+
+        # 4. Bid-ask spread (15%)
         if spread_pct:
-            spread_score = max(0, 1.0 - spread_pct / 0.03)
-            score += spread_score * 0.15
-        
+            score += max(0.0, 1.0 - spread_pct / 0.03) * 0.15
+
+        # 5. Volume (10%)
         if volume:
-            volume_score = min(1.0, volume / 1000.0)
-            score += volume_score * 0.10
-        
-        # IV score (prefer reasonable IV, not too high)
+            score += min(1.0, volume / 1000.0) * 0.10
+
+        # 6. IV ratio vs ATM (5%)
         if iv and atm_iv:
             iv_ratio = iv / atm_iv
             if 0.9 <= iv_ratio <= 1.2:
                 score += 0.05
 
+        # 7. OI delta bonus/penalty (up to ±0.08)
+        # Fresh OI build = participants entering in direction of trade (bullish for CE, bearish for PE)
+        if _oi is not None and prev_oi is not None and prev_oi > 0:
+            oi_delta_pct = (_oi - prev_oi) / prev_oi
+            if oi_delta_pct > 0.02:
+                score += min(0.08, oi_delta_pct * 2.0)  # OI expanding: strong participation
+            elif oi_delta_pct < -0.05:
+                score -= 0.04  # OI unwinding: participants exiting
+
+        # 8. PCR crowding penalty
+        if pcr_crowded:
+            score *= 0.90  # 10% penalty when trade direction is crowded
+
         candidate = {
             "strike": strike,
             "premium": premium,
             "delta": delta,
-            "oi": oi,
+            "oi": _oi,
             "spread_rupees": spread_rupees,
             "spread_pct": spread_pct,
             "volume": volume,
@@ -283,9 +339,9 @@ def select_option_contract(
         if delta_in_band and liquid:
             candidates.append(candidate)
         else:
+            # Relaxed pool: penalise for being out of band or illiquid
             relaxed_score = score
             if not delta_in_band:
-                delta_target = (delta_min + delta_max) / 2
                 relaxed_score -= min(0.20, abs(abs_delta - delta_target) / 0.35)
             if spread_pct is not None and spread_pct > 0.06:
                 relaxed_score -= min(0.10, (spread_pct - 0.06) / 0.08)
@@ -296,13 +352,11 @@ def select_option_contract(
         candidates = [c for c in relaxed_candidates if c["score"] > 0]
     if not candidates:
         return None
-    
-    # Select best candidate
+
     best = max(candidates, key=lambda x: x["score"])
-    
+
     reason_parts = [
-        "dynamic_heatmap_maxpain_selection",
-        "delta_based_selection",
+        "regime_adaptive_strike_selection",
         f"target_delta={delta_min:.2f}-{delta_max:.2f}",
         f"actual_delta={abs(best['delta']):.2f}",
         f"expected_move={expected_move:.0f}",
@@ -312,7 +366,11 @@ def select_option_contract(
         reason_parts.append("oi_cluster_zone")
     if atm_iv:
         reason_parts.append(f"atm_iv={atm_iv:.2%}")
-    
+    if pcr is not None:
+        reason_parts.append(f"pcr={pcr:.2f}{'(crowded)' if pcr_crowded else ''}")
+    if iv_rank is not None:
+        reason_parts.append(f"iv_rank={iv_rank:.2f}{'(expensive)' if iv_rank_expensive else ''}")
+
     return StrikeSelectionResult(
         option_type=option_type,
         strike=float(best["strike"]),

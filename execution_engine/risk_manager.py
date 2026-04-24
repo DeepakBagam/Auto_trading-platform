@@ -136,35 +136,59 @@ def update_risk_plan(
     target_price: float,
     tsl_activation_percent: float = 0.05,
     tsl_trail_percent: float = 0.03,
+    tsl_immediate: bool = True,
 ) -> RiskUpdate:
-    """Update risk plan with trailing stop and breakeven logic."""
+    """Update risk plan with trailing stop logic.
+
+    Two modes:
+
+    tsl_immediate=True  (default / recommended):
+        TSL is always active from the first tick.  The trail distance is the
+        absolute rupee risk at entry (entry - initial_sl).
+        Example: entry=100, SL=99 → trail=1.
+          price→101: SL=100   price→103: SL=102
+        SL only moves UP, never DOWN.
+
+    tsl_immediate=False  (legacy percentage mode):
+        TSL activates after `tsl_activation_percent` profit, then trails
+        `tsl_trail_percent` below peak.  Also moves SL to breakeven at 1R.
+    """
     entry = float(entry_price)
     price = float(current_price)
     peak = max(float(peak_price), price)
     active = bool(tsl_active)
-    trailing_sl = None
-    risk = entry - float(initial_sl)
-    
-    # Move SL to breakeven at 1R profit
-    if price >= entry + risk and float(current_sl) < entry:
-        current_sl = entry
-    
-    # Activate trailing stop at 1.5R profit
-    if price >= entry + (1.5 * risk):
+    trailing_sl: float | None = None
+    risk = max(entry - float(initial_sl), 1e-6)  # absolute trail amount
+
+    if tsl_immediate:
+        # --- Immediate percentage trail (configured via TSL_TRAIL_PERCENT in .env) ---
+        # TSL is active from the very first tick — no waiting for a profit target.
+        # Trail distance = peak × tsl_trail_percent  (scales with the premium price)
         active = True
-        peak = max(peak, price)
         trailing_sl = round(peak * (1.0 - float(tsl_trail_percent)), 2)
-        current_sl = round(max(float(current_sl), float(trailing_sl)), 2)
-    elif active:
-        peak = max(peak, price)
-        trailing_sl = round(peak * (1.0 - float(tsl_trail_percent)), 2)
-        current_sl = round(max(float(current_sl), float(trailing_sl)), 2)
+        current_sl = round(max(float(current_sl), trailing_sl), 2)
     else:
-        current_sl = round(max(float(initial_sl), float(current_sl)), 2)
-    
+        # --- Legacy percentage mode ---
+        # Move SL to breakeven at 1R profit
+        if price >= entry + risk and float(current_sl) < entry:
+            current_sl = entry
+
+        # Activate trailing stop at 1.5R profit
+        if price >= entry + (1.5 * risk):
+            active = True
+            peak = max(peak, price)
+            trailing_sl = round(peak * (1.0 - float(tsl_trail_percent)), 2)
+            current_sl = round(max(float(current_sl), float(trailing_sl)), 2)
+        elif active:
+            peak = max(peak, price)
+            trailing_sl = round(peak * (1.0 - float(tsl_trail_percent)), 2)
+            current_sl = round(max(float(current_sl), float(trailing_sl)), 2)
+        else:
+            current_sl = round(max(float(initial_sl), float(current_sl)), 2)
+
     target_hit = price >= float(target_price)
-    exit_reason = None
     exit_triggered = False
+    exit_reason: str | None = None
     if target_hit:
         exit_triggered = True
         exit_reason = "TP_HIT"
@@ -176,7 +200,7 @@ def update_risk_plan(
             exit_reason = "TSL_HIT"
         else:
             exit_reason = "SL_HIT"
-    
+
     return RiskUpdate(
         current_sl=float(current_sl),
         trailing_sl=(float(trailing_sl) if trailing_sl is not None else None),

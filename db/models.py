@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -11,7 +11,10 @@ class Base(DeclarativeBase):
 
 class RawCandle(Base):
     __tablename__ = "raw_candles"
-    __table_args__ = (UniqueConstraint("instrument_key", "interval", "ts", name="uq_raw_candle"),)
+    __table_args__ = (
+        UniqueConstraint("instrument_key", "interval", "ts", name="uq_raw_candle"),
+        Index("ix_raw_candles_instrument_interval_ts", "instrument_key", "interval", "ts"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     instrument_key: Mapped[str] = mapped_column(String(128), index=True)
@@ -74,6 +77,7 @@ class PredictionsDaily(Base):
     __tablename__ = "predictions_daily"
     __table_args__ = (
         UniqueConstraint("symbol", "interval", "target_session_date", "model_version", name="uq_pred_daily"),
+        Index("ix_predictions_symbol_interval_target", "symbol", "interval", "target_session_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -96,6 +100,7 @@ class PredictionsIntraday(Base):
     __tablename__ = "predictions_intraday"
     __table_args__ = (
         UniqueConstraint("symbol", "interval", "target_ts", "model_version", name="uq_pred_intraday"),
+        Index("ix_predictions_intraday_symbol_interval_ts", "symbol", "interval", "target_ts"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -143,6 +148,7 @@ class OOFPrediction(Base):
             "model_name",
             name="uq_oof_predictions",
         ),
+        Index("ix_oof_run_symbol_date", "run_id", "symbol", "session_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -170,6 +176,7 @@ class CalibrationRegistry(Base):
             "calibration_version",
             name="uq_calibration_registry",
         ),
+        Index("ix_calibration_symbol_family_active", "symbol", "model_family", "is_active"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -187,6 +194,7 @@ class BacktestRun(Base):
     __tablename__ = "backtest_runs"
     __table_args__ = (
         UniqueConstraint("run_id", "symbol", "model_family", name="uq_backtest_runs"),
+        Index("ix_backtest_symbol_family_created", "symbol", "model_family", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -202,6 +210,9 @@ class BacktestRun(Base):
 
 class DriftMetric(Base):
     __tablename__ = "drift_metrics"
+    __table_args__ = (
+        Index("ix_drift_symbol_family_metric", "symbol", "model_family", "metric_name", "computed_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(128), index=True)
@@ -234,6 +245,8 @@ class OptionQuote(Base):
             "ts",
             name="uq_option_quote_snapshot",
         ),
+        Index("ix_option_quotes_underlying_expiry_strike_type_ts",
+              "underlying_symbol", "expiry_date", "strike", "option_type", "ts"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -267,6 +280,10 @@ class OptionQuote(Base):
 
 class OptionTradeSignal(Base):
     __tablename__ = "option_trade_signals"
+    __table_args__ = (
+        Index("ix_option_signals_symbol_interval_expiry_generated",
+              "symbol", "interval", "expiry_date", "generated_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(64), index=True)
@@ -290,6 +307,9 @@ class OptionTradeSignal(Base):
 
 class ExecutionPosition(Base):
     __tablename__ = "execution_positions"
+    __table_args__ = (
+        Index("ix_execution_positions_trade_status_symbol", "trade_date", "status", "symbol"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     trade_date: Mapped[datetime] = mapped_column(Date, index=True)
@@ -333,6 +353,10 @@ class ExecutionPosition(Base):
 
 class ExecutionOrder(Base):
     __tablename__ = "execution_orders"
+    __table_args__ = (
+        Index("ix_execution_orders_position_status", "position_id", "status", "created_at"),
+        Index("ix_execution_orders_trade_symbol_kind", "trade_date", "symbol", "order_kind", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     position_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
@@ -369,6 +393,9 @@ class ExecutionOrder(Base):
 
 class DailySummary(Base):
     __tablename__ = "daily_summary"
+    __table_args__ = (
+        Index("ix_daily_summary_pnl", "date", "total_pnl", "total_trades"),
+    )
 
     date: Mapped[datetime] = mapped_column(Date, primary_key=True)
     total_trades: Mapped[int] = mapped_column(Integer, default=0)
@@ -384,6 +411,9 @@ class DailySummary(Base):
 
 class SignalLog(Base):
     __tablename__ = "signal_log"
+    __table_args__ = (
+        Index("ix_signal_log_symbol_ts", "symbol", "interval", "timestamp"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, server_default=func.now())
@@ -408,6 +438,7 @@ class ExecutionSignalAudit(Base):
     __tablename__ = "execution_signal_audit"
     __table_args__ = (
         UniqueConstraint("symbol", "interval", "candle_ts", name="uq_execution_signal_candle"),
+        Index("ix_execution_signal_audit_trade_symbol", "trade_date", "symbol", "interval", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -428,6 +459,9 @@ class ExecutionExternalSignal(Base):
     __tablename__ = "execution_external_signals"
     __table_args__ = (
         UniqueConstraint("source", "symbol", "interval", "signal_ts", name="uq_execution_external_signal"),
+        Index("ix_execution_external_signal_consume",
+              "symbol", "interval", "processed", "signal_ts", "created_at"),
+        Index("ix_execution_external_signals_source_processed", "source", "processed", "signal_ts"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

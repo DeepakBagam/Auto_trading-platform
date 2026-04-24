@@ -13,13 +13,22 @@ from sqlalchemy.orm import Session
 from api.market_stream_runtime import get_market_stream_runtime_status
 from data_layer.collectors.upstox_option_chain import UpstoxOptionChainCollector
 from db.models import DataFreshness, DailySummary, ExecutionOrder, ExecutionPosition, OptionQuote, RawCandle, SignalLog
+from execution_engine.intraday_rules import (
+    DEFAULT_EXECUTION_CONSTRAINTS,
+    adaptive_stop_points,
+    ema_separation_floor,
+    ema_separation_is_valid,
+    runner_target_points,
+)
 from execution_engine.risk_manager import build_risk_plan
-from execution_engine.slippage_tracker import get_vix_level
+from execution_engine.slippage_tracker import get_vix_context, get_vix_level
+from execution_engine.strike_selector import get_atm_iv as _strike_get_atm_iv
 from execution_engine.strike_selector import select_option_contract
 from feature_engine.price_features import build_price_features
 from prediction_engine.options_engine import (
     OptionQuoteView,
     build_chain_rows,
+    nearest_strike,
     next_weekly_expiries,
     strike_step_for_symbol,
     synthetic_option_chain,
@@ -41,9 +50,9 @@ LIVE_INTERVAL = "1minute"
 DIRECTIONAL_SIGNALS_ENABLED = True
 DEFAULT_SIGNAL_COOLDOWN_MINUTES = 12
 DEFAULT_SIGNAL_MIN_SCORE = 63.0
-VIX_MAX_THRESHOLD = 22.0   # Skip signals when VIX is too high (options too expensive)
+VIX_MAX_THRESHOLD = 20.0   # Skip signals when VIX is too high (options too expensive)
 VIX_MIN_THRESHOLD = 11.0   # Skip signals when VIX is too low (premiums too small)
-DEFAULT_MAX_SIGNALS_PER_DAY = 3
+DEFAULT_MAX_SIGNALS_PER_DAY = 2
 DEFAULT_CHART_RANGE = "1d"
 CHART_RANGE_SPECS: dict[str, dict[str, Any]] = {
     "1d": {"label": "1D Live", "interval": "1minute", "days": 1, "supports_live": True},
@@ -67,6 +76,90 @@ CHART_MARKER_LIMITS: dict[str, int] = {
     "2y": 30,
 }
 _CHART_PAYLOAD_CACHE: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# Market regime constants
+# ---------------------------------------------------------------------------
+_REGIME_TRENDING = "TRENDING"
+_REGIME_RANGE = "RANGE_BOUND"
+_REGIME_VOLATILE = "HIGH_VOLATILITY"
+
+# Data staleness: if last candle is older than this, halt signal generation.
+_DATA_STALE_SECONDS = 600
+
+
+def _detect_regime(
+    adx: float,
+    plus_di: float,
+    minus_di: float,
+    atr: float,
+    atr_mean: float,
+) -> str:
+    """Classify current market into TRENDING / RANGE_BOUND / HIGH_VOLATILITY.
+
+    Priority order: HIGH_VOLATILITY > TRENDING > RANGE_BOUND so we never
+    mistake an ATR spike for normal trend continuation.
+    """
+    atr_ratio = atr / max(atr_mean, 1e-9)
+    if atr_ratio > 1.6:
+        return _REGIME_VOLATILE
+    if adx >= 25.0 and abs(plus_di - minus_di) >= 10.0:
+        return _REGIME_TRENDING
+    if adx < 20.0:
+        return _REGIME_RANGE
+    return _REGIME_TRENDING  # transitional → treat as trending
+
+
+def _dynamic_threshold(regime: str, vix_ratio: float) -> float:
+    """Adaptive minimum score.  Higher = harder to fire a signal.
+
+    Base shifts with VIX relative to its own MA: a spike raises the bar,
+    a calm market lowers it slightly.  Regime then applies a flat offset.
+    """
+    base = 58.0 + (vix_ratio - 1.0) * 15.0
+    if regime == _REGIME_TRENDING:
+        base -= 6.0    # Trending: easier threshold, continuation expected
+    elif regime == _REGIME_RANGE:
+        base += 10.0   # Range-bound: much stricter, only clean breakouts
+    elif regime == _REGIME_VOLATILE:
+        base += 8.0    # Volatile: stricter, premium already expensive
+    return max(48.0, min(80.0, base))
+
+
+def _rsi_buy_sell_bands(regime: str) -> tuple[float, float, float, float]:
+    """Return (buy_lo, buy_hi, sell_lo, sell_hi) for RSI momentum gate.
+
+    In a trending market RSI can stay elevated for many bars; forcing it
+    below 72 misses the meat of the move.  Range-bound markets need tighter
+    bands to avoid buying near resistance.
+    """
+    if regime == _REGIME_TRENDING:
+        return 50.0, 82.0, 18.0, 50.0
+    if regime == _REGIME_RANGE:
+        return 56.0, 72.0, 28.0, 44.0
+    # HIGH_VOLATILITY
+    return 52.0, 78.0, 22.0, 48.0
+
+
+def _regime_exit_multipliers(regime: str) -> tuple[float, float, float]:
+    """Return (sl_atr, t1_atr, t2_atr) multipliers for SL and target levels.
+
+    Trending: ride the move with wider stops and ambitious targets.
+    Range: quick scalp with tight stops.
+    Volatile: medium — market can reverse fast.
+    """
+    if regime == _REGIME_TRENDING:
+        return 1.5, 2.5, 4.0
+    if regime == _REGIME_RANGE:
+        return 0.8, 1.3, 2.0
+    return 1.2, 2.0, 3.0
+
+
+def _expiry_entry_cutoff(days_to_expiry: int) -> time | None:
+    """On expiry day restrict entries to first 90 minutes only."""
+    if days_to_expiry == 0:
+        return time(11, 0)
+    return None
 
 
 @dataclass(slots=True)
@@ -543,7 +636,8 @@ def _build_chart_markers(
     max_signals_today = max(1, int(getattr(settings, "signal_max_per_day", DEFAULT_MAX_SIGNALS_PER_DAY)))
     min_score = float(getattr(settings, "signal_min_score", DEFAULT_SIGNAL_MIN_SCORE))
     entry_start = _parse_time(settings.entry_window_start, time(9, 20))
-    entry_end = _parse_time(settings.entry_window_end, time(13, 30))
+    entry_end = _parse_time(settings.entry_window_end, time(12, 30))
+    second_trade_entry_end = _parse_time(getattr(settings, "second_trade_entry_end", "11:00"), time(11, 0))
 
     markers: list[dict[str, Any]] = []
     signal_count_by_day: dict[date, int] = {}
@@ -789,9 +883,36 @@ def build_technical_signal(
 ) -> TechnicalSignal:
     settings = settings or get_settings()
     now = _ensure_ist(now) or datetime.now(IST_ZONE)
+
     if not DIRECTIONAL_SIGNALS_ENABLED:
         return _disabled_signal(context, now=now)
+
     rows = context.signal_rows
+
+    # --- Data freshness guard: halt if feed is stale ---
+    if rows:
+        last_ts = _ensure_ist(rows[-1].ts)
+        if last_ts is not None:
+            age_seconds = int((now - last_ts).total_seconds())
+            if age_seconds > _DATA_STALE_SECONDS:
+                return TechnicalSignal(
+                    symbol=context.symbol,
+                    interval=LIVE_INTERVAL,
+                    timestamp=now,
+                    action="HOLD",
+                    bias="NEUTRAL",
+                    score=0.0,
+                    confidence=0.0,
+                    conviction="low",
+                    entry_price=context.latest_price,
+                    stop_loss=None,
+                    take_profit=None,
+                    cooldown_seconds=0,
+                    max_signals_reached=False,
+                    reasons=[f"Data feed stale: last candle is {age_seconds}s old — no signal."],
+                    details={"data_stale": True, "last_candle_age_seconds": age_seconds},
+                )
+
     if len(rows) < 60:
         return TechnicalSignal(
             symbol=context.symbol,
@@ -811,22 +932,31 @@ def build_technical_signal(
             details={"warmup_candles": len(rows)},
         )
 
+    # --- Build features ---
     frame = build_price_features(_candles_to_frame(rows))
     row = frame.iloc[-1]
     prev = frame.iloc[-2]
+    prev2 = frame.iloc[-3] if len(frame) >= 3 else prev
+
+    # --- Multi-timeframe confirmation ---
     frame_3m = _resample_frame(frame[["ts", "open", "high", "low", "close", "volume"]], "3min")
     frame_5m = _resample_frame(frame[["ts", "open", "high", "low", "close", "volume"]], "5min")
     confirm_3m_buy, confirm_3m_sell = _timeframe_confirmation(frame_3m)
     confirm_5m_buy, confirm_5m_sell = _timeframe_confirmation(frame_5m)
 
+    # --- Extract all indicators ---
     close = _to_float(row.get("close")) or context.latest_price
+    open_ = _to_float(row.get("open")) or close
     high = _to_float(row.get("high")) or close
     low = _to_float(row.get("low")) or close
     prev_high = _to_float(prev.get("high")) or high
     prev_low = _to_float(prev.get("low")) or low
+    prev_close = _to_float(prev.get("close")) or close
+
     ema_21 = _to_float(row.get("ema_21")) or close
     ema_50 = _to_float(row.get("ema_50")) or close
     ema_21_slope = _to_float(row.get("ema_21_slope_3")) or 0.0
+    ema_separation = abs(ema_21 - ema_50)
     vwap = _to_float(row.get("vwap")) or close
     rsi = _to_float(row.get("rsi_14")) or 50.0
     macd_hist = _to_float(row.get("macd_hist")) or 0.0
@@ -836,38 +966,79 @@ def build_technical_signal(
     breakout_high = _to_float(row.get("breakout_high_20"))
     breakout_low = _to_float(row.get("breakout_low_20"))
     atr = max(1e-9, _to_float(row.get("atr_14")) or 0.0)
+    atr_mean = max(atr, _to_float(row.get("atr_14_mean_20")) or atr)
+    adx = _to_float(row.get("adx_14")) or 15.0
+    plus_di = _to_float(row.get("plus_di_14")) or 20.0
+    minus_di = _to_float(row.get("minus_di_14")) or 20.0
     candle_range = max(0.0, high - low)
+    execution_rules = DEFAULT_EXECUTION_CONSTRAINTS
 
+    # --- Market regime detection ---
+    regime = _detect_regime(adx, plus_di, minus_di, atr, atr_mean)
+
+    # --- Relative VIX filter (not fixed threshold) ---
+    vix_level, vix_ma20, vix_ratio = get_vix_context(db)
+    # Spike: 40%+ above own MA → options too expensive
+    vix_too_high = vix_ratio > 1.40
+    # Dead calm: 30%+ below MA AND absolute level below 12 → premium too small
+    vix_too_low = vix_ratio < 0.70 and vix_level < 12.0
+
+    # --- Expiry-day awareness ---
+    _today = now.date()
+    try:
+        _expiries = next_weekly_expiries(symbol=context.symbol, count=2, start_dt=now)
+        days_to_expiry = int((_expiries[0] - _today).days) if _expiries else 7
+    except Exception:
+        days_to_expiry = 7
+
+    # --- Adaptive RSI thresholds ---
+    rsi_buy_lo, rsi_buy_hi, rsi_sell_lo, rsi_sell_hi = _rsi_buy_sell_bands(regime)
+
+    # --- Primary structural conditions ---
     trend_buy = close > ema_21 > ema_50 and close >= vwap and ema_21_slope > 0.0
     trend_sell = close < ema_21 < ema_50 and close <= vwap and ema_21_slope < 0.0
+
+    # 2-candle confirmed breakout: body must close above level, prev bar had to approach it
     breakout_buy = bool(
         breakout_high is not None
-        and close > breakout_high
-        and body_pct_range >= 0.52
+        and close > breakout_high        # Body close above (green candle only)
+        and open_ < close                # Green candle — not a wick tag
+        and body_pct_range >= 0.55       # Solid body, not a doji
         and candle_range >= atr * 0.75
+        and prev_close >= breakout_high * 0.996  # Prev bar was testing the level
     )
     breakout_sell = bool(
         breakout_low is not None
         and close < breakout_low
-        and body_pct_range >= 0.52
+        and open_ > close                # Red candle
+        and body_pct_range >= 0.55
         and candle_range >= atr * 0.75
+        and prev_close <= breakout_low * 1.004
     )
     continuation_buy = bool(
         trend_buy
         and close > prev_high
-        and 56.0 <= rsi <= 72.0
+        and rsi_buy_lo <= rsi <= rsi_buy_hi
         and macd_hist > 0.0
         and macd_delta >= -0.02
     )
     continuation_sell = bool(
         trend_sell
         and close < prev_low
-        and 28.0 <= rsi <= 44.0
+        and rsi_sell_lo <= rsi <= rsi_sell_hi
         and macd_hist < 0.0
         and macd_delta <= 0.02
     )
     range_bound = abs(close - ema_21) <= max(atr * 0.25, close * 0.0008) and 45.0 <= rsi <= 55.0
+    ema_sep_ok = ema_separation_is_valid(
+        ema_21=ema_21,
+        ema_50=ema_50,
+        atr=atr,
+        close=close,
+        constraints=execution_rules,
+    )
 
+    # --- Regime-aware scoring ---
     score_buy = 0.0
     score_sell = 0.0
     reasons_buy: list[str] = []
@@ -875,109 +1046,160 @@ def build_technical_signal(
 
     if trend_buy:
         score_buy += 28.0
-        reasons_buy.append("Price is stacked above EMA 21 and EMA 50 with VWAP support.")
+        reasons_buy.append("Price stacked above EMA 21/50 with VWAP support.")
     if trend_sell:
         score_sell += 28.0
-        reasons_sell.append("Price is stacked below EMA 21 and EMA 50 with VWAP resistance.")
+        reasons_sell.append("Price stacked below EMA 21/50 with VWAP resistance.")
 
     if breakout_buy:
         score_buy += 28.0
-        reasons_buy.append("Fresh upside breakout cleared the 20-bar high with range expansion.")
+        reasons_buy.append("2-bar confirmed breakout above 20-bar high.")
     elif continuation_buy:
         score_buy += 22.0
-        reasons_buy.append("Bullish continuation is holding above the prior bar high.")
+        reasons_buy.append("Bullish continuation above prior bar high.")
 
     if breakout_sell:
         score_sell += 28.0
-        reasons_sell.append("Fresh downside breakout broke the 20-bar low with range expansion.")
+        reasons_sell.append("2-bar confirmed breakdown below 20-bar low.")
     elif continuation_sell:
         score_sell += 22.0
-        reasons_sell.append("Bearish continuation is holding below the prior bar low.")
+        reasons_sell.append("Bearish continuation below prior bar low.")
 
     if confirm_3m_buy:
         score_buy += 18.0
-        reasons_buy.append("3-minute trend confirms the long side.")
+        reasons_buy.append("3-minute timeframe confirms bullish alignment.")
     if confirm_3m_sell:
         score_sell += 18.0
-        reasons_sell.append("3-minute trend confirms the short side.")
+        reasons_sell.append("3-minute timeframe confirms bearish alignment.")
 
     if confirm_5m_buy:
         score_buy += 14.0
-        reasons_buy.append("5-minute trend is aligned with the long side.")
+        reasons_buy.append("5-minute timeframe aligned long.")
     if confirm_5m_sell:
         score_sell += 14.0
-        reasons_sell.append("5-minute trend is aligned with the short side.")
+        reasons_sell.append("5-minute timeframe aligned short.")
 
-    if rsi >= 58.0 and macd_hist > 0.0:
+    # Adaptive RSI+MACD momentum bonus
+    if rsi >= (rsi_buy_lo + 5) and macd_hist > 0.0:
         score_buy += 8.0
-    if rsi <= 42.0 and macd_hist < 0.0:
+    if rsi <= (rsi_sell_hi - 5) and macd_hist < 0.0:
         score_sell += 8.0
 
     if volume_ratio >= 1.10 or candle_range >= atr:
         score_buy += 4.0
         score_sell += 4.0
 
-    # VIX filter: skip when volatility makes options too expensive or too cheap
-    vix_level = get_vix_level(db)
-    vix_too_high = vix_level > VIX_MAX_THRESHOLD
-    vix_too_low = vix_level > 0 and vix_level < VIX_MIN_THRESHOLD
+    # ADX regime bonus: strong directional market → reward aligned side
+    if regime == _REGIME_TRENDING and adx >= 30.0:
+        if plus_di > minus_di:
+            score_buy += 5.0
+            reasons_buy.append(f"ADX {adx:.0f} strong uptrend (+DI dominant).")
+        else:
+            score_sell += 5.0
+            reasons_sell.append(f"ADX {adx:.0f} strong downtrend (-DI dominant).")
 
+    # Range suppression: break-even both sides in choppy market
+    if regime == _REGIME_RANGE:
+        score_buy *= 0.85
+        score_sell *= 0.85
+
+    # --- Direction & dynamic threshold ---
     bias = "BUY" if score_buy > score_sell else ("SELL" if score_sell > score_buy else "NEUTRAL")
     raw_action = "BUY" if score_buy >= score_sell else "SELL"
     raw_score = score_buy if raw_action == "BUY" else score_sell
     base_reasons = reasons_buy if raw_action == "BUY" else reasons_sell
 
-    max_signals_today = max(
-        1,
-        int(getattr(settings, "signal_max_per_day", DEFAULT_MAX_SIGNALS_PER_DAY)),
-    )
+    min_score = _dynamic_threshold(regime, vix_ratio)
+
+    # --- Guard rails ---
+    max_signals_today = max(1, int(getattr(settings, "signal_max_per_day", DEFAULT_MAX_SIGNALS_PER_DAY)))
     signal_count_today, cooldown_seconds = _signal_guardrails(
-        db,
-        symbol=context.symbol,
-        now=now,
-        settings=settings,
+        db, symbol=context.symbol, now=now, settings=settings,
     )
     entry_start = _parse_time(settings.entry_window_start, time(9, 20))
-    entry_end = _parse_time(settings.entry_window_end, time(13, 30))
-    now_time = now.timetz().replace(tzinfo=None)
-    min_score = float(getattr(settings, "signal_min_score", DEFAULT_SIGNAL_MIN_SCORE))
+    entry_end = _parse_time(settings.entry_window_end, time(12, 30))
+    second_trade_entry_end = _parse_time(getattr(settings, "second_trade_entry_end", "11:00"), time(11, 0))
 
+    # Expiry day: cut off entries after 11:00
+    expiry_cutoff = _expiry_entry_cutoff(days_to_expiry)
+    if expiry_cutoff is not None:
+        entry_end = min(entry_end, expiry_cutoff)
+
+    now_time = now.timetz().replace(tzinfo=None)
     reasons = list(base_reasons)
     action = raw_action
+
     if vix_too_high:
         action = "HOLD"
-        reasons.append(f"India VIX {vix_level:.1f} above {VIX_MAX_THRESHOLD:.0f} — options overpriced, skipping.")
+        reasons.append(
+            f"VIX {vix_level:.1f} is {(vix_ratio - 1) * 100:.0f}% above its MA — options overpriced."
+        )
     if vix_too_low:
         action = "HOLD"
-        reasons.append(f"India VIX {vix_level:.1f} below {VIX_MIN_THRESHOLD:.0f} — option premiums too small.")
+        reasons.append(f"VIX {vix_level:.1f} unusually low — option premiums too small.")
+    if adx < execution_rules.min_adx:
+        action = "HOLD"
+        reasons.append(f"ADX {adx:.1f} below live minimum {execution_rules.min_adx:.0f}.")
+    if not ema_sep_ok:
+        sep_floor = ema_separation_floor(atr=atr, close=close, constraints=execution_rules)
+        action = "HOLD"
+        reasons.append(f"EMA 21/50 separation {ema_separation:.1f} below required {sep_floor:.1f}.")
     if range_bound:
         action = "HOLD"
-        reasons.append("Market is too compressed around EMA 21; no clean edge.")
+        reasons.append("Market is compressed around EMA 21 — no clean edge.")
+    # In range-bound regime, only allow confirmed breakouts
+    if regime == _REGIME_RANGE and not (breakout_buy or breakout_sell):
+        action = "HOLD"
+        reasons.append("Range-bound market — only confirmed breakouts are allowed.")
     if raw_score < min_score:
         action = "HOLD"
-        reasons.append(f"Signal score {raw_score:.0f} is below the trade threshold {min_score:.0f}.")
+        reasons.append(f"Score {raw_score:.0f} below adaptive threshold {min_score:.0f} ({regime}).")
     if raw_action == "BUY" and not (breakout_buy or continuation_buy):
         action = "HOLD"
-        reasons.append("Long side lacks a breakout or continuation trigger.")
+        reasons.append("Long side has no breakout or continuation trigger.")
     if raw_action == "SELL" and not (breakout_sell or continuation_sell):
         action = "HOLD"
-        reasons.append("Short side lacks a breakout or continuation trigger.")
+        reasons.append("Short side has no breakout or continuation trigger.")
     if not (entry_start <= now_time <= entry_end):
         action = "HOLD"
-        reasons.append("Outside the active entry window.")
+        reasons.append(
+            f"Outside entry window {entry_start.strftime('%H:%M')}–{entry_end.strftime('%H:%M')} IST."
+        )
+    if signal_count_today >= 1 and now_time > second_trade_entry_end:
+        action = "HOLD"
+        reasons.append(f"Second-trade cutoff passed at {second_trade_entry_end.strftime('%H:%M')} IST.")
     if cooldown_seconds > 0:
         action = "HOLD"
-        reasons.append(f"Cooldown active for another {cooldown_seconds}s.")
+        reasons.append(f"Cooldown active — {cooldown_seconds}s remaining.")
     max_reached = signal_count_today >= max_signals_today
     if max_reached:
         action = "HOLD"
         reasons.append(f"Daily signal cap reached ({signal_count_today}/{max_signals_today}).")
+    # Expiry day + non-trending market = skip (gamma + directionless = bad combination)
+    if days_to_expiry == 0 and regime != _REGIME_TRENDING:
+        action = "HOLD"
+        reasons.append("Expiry day with non-trending market — skipping to avoid gamma risk.")
+
+    # --- Regime-aware exit levels ---
+    stop_offset = adaptive_stop_points(atr=atr, constraints=execution_rules)
+    t1_offset = runner_target_points(stop_points=stop_offset, constraints=execution_rules)
+    t2_offset = t1_offset
+
+    if action == "BUY":
+        stop_loss = round(close - stop_offset, 2)
+        take_profit = round(close + t1_offset, 2)
+        take_profit_2 = round(close + t2_offset, 2)
+    elif action == "SELL":
+        stop_loss = round(close + stop_offset, 2)
+        take_profit = round(close - t1_offset, 2)
+        take_profit_2 = round(close - t2_offset, 2)
+    else:
+        stop_loss = None
+        take_profit = None
+        take_profit_2 = None
 
     confidence = round(_clip(raw_score / 100.0, 0.0, 0.95), 2)
     conviction = "high" if raw_score >= 88.0 else ("medium" if raw_score >= min_score else "low")
-    stop_offset = max(atr * 1.15, close * 0.0025)
-    stop_loss = round(close - stop_offset, 2) if action == "BUY" else (round(close + stop_offset, 2) if action == "SELL" else None)
-    take_profit = round(close + (stop_offset * 2.2), 2) if action == "BUY" else (round(close - (stop_offset * 2.2), 2) if action == "SELL" else None)
     expected_move = round(atr * 1.5, 2)
     expected_move_pct = round(expected_move / max(close, 1e-9), 4)
 
@@ -986,16 +1208,24 @@ def build_technical_signal(
         "vwap": round(vwap, 2),
         "ema_21": round(ema_21, 2),
         "ema_50": round(ema_50, 2),
+        "ema_separation": round(ema_separation, 2),
         "rsi_14": round(rsi, 2),
+        "rsi_buy_band": [round(rsi_buy_lo, 1), round(rsi_buy_hi, 1)],
+        "rsi_sell_band": [round(rsi_sell_lo, 1), round(rsi_sell_hi, 1)],
         "macd_hist": round(macd_hist, 4),
         "macd_hist_delta_1": round(macd_delta, 4),
         "atr_14": round(atr, 2),
+        "atr_14_mean_20": round(atr_mean, 2),
+        "adx_14": round(adx, 1),
+        "plus_di_14": round(plus_di, 1),
+        "minus_di_14": round(minus_di, 1),
         "volume_ratio_20": round(volume_ratio, 2),
         "body_pct_range": round(body_pct_range, 2),
         "breakout_high_20": round(breakout_high, 2) if breakout_high is not None else None,
         "breakout_low_20": round(breakout_low, 2) if breakout_low is not None else None,
         "trend_buy": trend_buy,
         "trend_sell": trend_sell,
+        "ema_separation_ok": ema_sep_ok,
         "breakout_buy": breakout_buy,
         "breakout_sell": breakout_sell,
         "continuation_buy": continuation_buy,
@@ -1006,12 +1236,29 @@ def build_technical_signal(
         "confirm_5m_sell": confirm_5m_sell,
         "score_buy": round(score_buy, 1),
         "score_sell": round(score_sell, 1),
+        "regime": regime,
+        "adx_regime_note": f"ADX={adx:.1f} +DI={plus_di:.1f} -DI={minus_di:.1f}",
+        "adaptive_threshold": round(min_score, 1),
+        "days_to_expiry": days_to_expiry,
         "vix_level": round(vix_level, 2),
+        "vix_ma20": round(vix_ma20, 2),
+        "vix_ratio": round(vix_ratio, 3),
         "vix_too_high": vix_too_high,
+        "take_profit_2": take_profit_2,
         "expected_move_points": expected_move,
         "expected_move_pct": expected_move_pct,
         "signal_count_today": signal_count_today,
         "signal_candle_ts": _ensure_ist(rows[-1].ts).isoformat() if rows else None,
+        "execution_plan": {
+            "stop_range_points": [execution_rules.stop_points_min, execution_rules.stop_points_max],
+            "partial_exit_points": execution_rules.partial_exit_points,
+            "breakeven_trigger_points": execution_rules.breakeven_trigger_points,
+            "lock_trigger_points": execution_rules.lock_trigger_points,
+            "lock_points": execution_rules.lock_points,
+            "trail_trigger_points": execution_rules.trail_trigger_points,
+            "trail_distance_points": execution_rules.trail_distance_points,
+            "max_hold_minutes": execution_rules.max_hold_minutes,
+        },
     }
     timestamp = _ensure_ist(rows[-1].ts) if rows else now
     return TechnicalSignal(
@@ -1163,6 +1410,35 @@ def _latest_option_quote_ts(db: Session, symbol: str, expiry_date: date) -> date
     )
 
 
+def _compute_iv_rank(
+    db: Session,
+    symbol: str,
+    current_atm_iv: float | None,
+) -> float | None:
+    """IV rank = (current IV − 90d low) / (90d high − 90d low).
+
+    Returns None when there is insufficient historical data.
+    Returns a value in [0, 1]: 0 = historically cheap, 1 = historically expensive.
+    """
+    if not current_atm_iv or current_atm_iv <= 0:
+        return None
+    cutoff = datetime.now(IST_ZONE) - timedelta(days=90)
+    stats = db.execute(
+        select(func.min(OptionQuote.iv), func.max(OptionQuote.iv)).where(
+            symbol_value_filter(OptionQuote.underlying_symbol, symbol),
+            OptionQuote.iv.isnot(None),
+            OptionQuote.ts >= cutoff,
+        )
+    ).one_or_none()
+    if stats is None or stats[0] is None or stats[1] is None:
+        return None
+    iv_low, iv_high = float(stats[0]), float(stats[1])
+    if iv_high <= iv_low + 1e-9:
+        return None
+    rank = (current_atm_iv - iv_low) / (iv_high - iv_low)
+    return round(max(0.0, min(1.0, rank)), 3)
+
+
 def _maybe_refresh_option_chain(
     db: Session,
     *,
@@ -1247,6 +1523,12 @@ def build_option_selection(
         chain_source = "synthetic"
         chain_generated_at = datetime.now(IST_ZONE)
     chain_rows = build_chain_rows(quotes)
+
+    # Compute IV rank for this symbol using 90-day history
+    _atm = nearest_strike(context.latest_price, strike_step)
+    _atm_iv = _strike_get_atm_iv(chain_rows, _atm)
+    iv_rank = _compute_iv_rank(db, context.symbol, _atm_iv)
+
     signal_payload: dict[str, Any] = {
         "action": "HOLD",
         "option_type": None,
@@ -1258,6 +1540,7 @@ def build_option_selection(
         "reasons": ["Waiting for a qualified directional signal."],
     }
 
+    dte = max(1, (expiry_date - datetime.now(IST_ZONE).date()).days)
     pick = select_option_contract(
         signal_action=signal.action,  # type: ignore[arg-type]
         spot_price=context.latest_price,
@@ -1267,8 +1550,9 @@ def build_option_selection(
         expected_return_pct=float(signal.details.get("expected_move_pct") or 0.0),
         premium_min=float(settings.execution_premium_min),
         premium_max=float(settings.execution_premium_max),
-        days_to_expiry=max(1, (expiry_date - datetime.now(IST_ZONE).date()).days),
+        days_to_expiry=dte,
         capital_per_trade=float(settings.execution_capital) * float(settings.execution_per_trade_risk_pct),
+        iv_rank=iv_rank,
     )
     if pick is not None:
         risk_plan = build_risk_plan(
@@ -1285,9 +1569,11 @@ def build_option_selection(
             "take_profit": float(risk_plan.target_price),
             "confidence": signal.confidence,
             "instrument_key": pick.instrument_key,
+            "iv_rank": iv_rank,
+            "days_to_expiry": dte,
             "reasons": [
                 f"{signal.action} signal mapped to {pick.option_type}.",
-                "Selected the most liquid strike inside the target delta band.",
+                "Selected best-scored strike: delta-targeted, OI-delta-weighted, PCR-filtered.",
                 pick.reason,
                 f"Chain source: {chain_source}.",
             ],

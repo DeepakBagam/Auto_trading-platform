@@ -24,7 +24,7 @@ def _mask_token(token: str) -> str:
 
 @dataclass(slots=True)
 class BrokerOrderRequest:
-    symbol: str
+    instrument_key: str  # Upstox key: "{exchange_segment}|{token}", e.g. "NSE_FO|57807"
     option_type: str
     strike: float
     expiry_date: str
@@ -101,7 +101,7 @@ class PaperBroker(BaseBroker):
             )
         req: BrokerOrderRequest = row["request"]
         row["request"] = BrokerOrderRequest(
-            symbol=req.symbol,
+            instrument_key=req.instrument_key,
             option_type=req.option_type,
             strike=req.strike,
             expiry_date=req.expiry_date,
@@ -163,6 +163,9 @@ class UpstoxBroker(BaseBroker):
     _CB_FAILURE_THRESHOLD = 5
     _CB_RESET_SECONDS = 60
 
+    # Token refresh: re-read env/file at most once per minute to avoid syscall overhead
+    _TOKEN_CHECK_INTERVAL_SECONDS = 60
+
     def __init__(self, *, base_url: str, access_token: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
@@ -173,6 +176,8 @@ class UpstoxBroker(BaseBroker):
         }
         self._consecutive_failures = 0
         self._circuit_open_until: datetime | None = None
+        self._last_token_check: datetime | None = None
+        self._token_set_at: datetime = datetime.now(IST_ZONE)
 
     def _is_circuit_open(self) -> bool:
         if self._circuit_open_until is None:
@@ -198,17 +203,60 @@ class UpstoxBroker(BaseBroker):
         self._consecutive_failures = 0
         self._circuit_open_until = None
 
+    def _read_token_from_sources(self) -> str:
+        """Read the latest token from env var or token file (whichever is populated).
+
+        Priority: UPSTOX_TOKEN_FILE path > UPSTOX_ACCESS_TOKEN env var.
+        Token file contains just the raw token string (no 'Bearer' prefix).
+        """
+        token_file = os.environ.get("UPSTOX_TOKEN_FILE", "").strip()
+        if token_file:
+            try:
+                from pathlib import Path
+                content = Path(token_file).read_text(encoding="utf-8").strip()
+                if content:
+                    return content
+            except OSError:
+                pass
+        return os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+
     def _refresh_token_if_available(self) -> None:
-        """Re-read token from environment in case it was refreshed externally."""
-        token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+        """Proactively re-read token from env/file; rate-limited to once per minute."""
+        now = datetime.now(IST_ZONE)
+        if (
+            self._last_token_check is not None
+            and (now - self._last_token_check).total_seconds() < self._TOKEN_CHECK_INTERVAL_SECONDS
+        ):
+            return
+        self._last_token_check = now
+
+        token = self._read_token_from_sources()
         if not token:
             return
         new_auth = f"Bearer {token}"
         if self.headers.get("Authorization") != new_auth:
+            age_hours = (now - self._token_set_at).total_seconds() / 3600
             self.headers["Authorization"] = new_auth
-            logger.info("UpstoxBroker access token refreshed from environment (%s)", _mask_token(token))
+            self._token_set_at = now
+            logger.info(
+                "UpstoxBroker access token rotated (previous age=%.1fh, new=%s)",
+                age_hours,
+                _mask_token(token),
+            )
+
+        # Warn if the current token has been unchanged for > 22 h (likely stale)
+        token_age_h = (now - self._token_set_at).total_seconds() / 3600
+        if token_age_h > 22:
+            logger.warning(
+                "UpstoxBroker token unchanged for %.1f hours — it may have expired. "
+                "Update UPSTOX_ACCESS_TOKEN or UPSTOX_TOKEN_FILE.",
+                token_age_h,
+            )
 
     def _post(self, path: str, payload: dict[str, Any]) -> BrokerOrderResponse:
+        # Proactively rotate token before every call (rate-limited internally to once/min)
+        self._refresh_token_if_available()
+
         if self._is_circuit_open():
             return BrokerOrderResponse(
                 success=False,
@@ -226,6 +274,8 @@ class UpstoxBroker(BaseBroker):
                 res = self.session.post(url, headers=self.headers, json=payload, timeout=15)
                 data = res.json() if res.content else {}
                 if res.status_code == 401 and attempt == 0:
+                    # Force immediate re-read by resetting the throttle clock
+                    self._last_token_check = None
                     self._refresh_token_if_available()
                     continue
                 break
@@ -269,16 +319,30 @@ class UpstoxBroker(BaseBroker):
         )
 
     def place_order(self, request: BrokerOrderRequest) -> BrokerOrderResponse:
+        if "|" not in request.instrument_key:
+            logger.error(
+                "UpstoxBroker.place_order: instrument_key %r is not a valid Upstox token (expected 'exchange|token'). "
+                "Order aborted.",
+                request.instrument_key,
+            )
+            return BrokerOrderResponse(
+                success=False,
+                order_id=None,
+                status="INVALID_INSTRUMENT",
+                message=f"instrument_key {request.instrument_key!r} is not a valid Upstox key",
+                payload={},
+            )
         payload = {
             "quantity": int(request.qty),
             "product": request.product,
             "validity": "DAY",
             "price": float(request.price or 0.0),
             "tag": request.tag or "ai_options_exec",
-            "instrument_token": request.symbol,
+            "instrument_token": request.instrument_key,
             "order_type": request.order_type,
             "transaction_type": request.side.upper(),
             "trigger_price": float(request.trigger_price) if request.trigger_price is not None else 0.0,
+            "disclosed_quantity": 0,
             "is_amo": False,
         }
         return self._post("/v2/order/place", payload)

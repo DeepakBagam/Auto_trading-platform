@@ -76,7 +76,13 @@ def _context() -> MarketContext:
     )
 
 
-def test_build_technical_signal_returns_disabled_hold_payload() -> None:
+def test_build_technical_signal_holds_when_vix_too_high(monkeypatch) -> None:
+    """VIX ratio >1.40 above its MA must force HOLD regardless of technicals."""
+    # VIX=25, MA=17 → ratio≈1.47 (>1.40 threshold)
+    monkeypatch.setattr(
+        "execution_engine.live_service.get_vix_context",
+        lambda _db: (25.0, 17.0, 25.0 / 17.0),
+    )
     context = _context()
     fake_db = _FakeDb()
 
@@ -87,15 +93,20 @@ def test_build_technical_signal_returns_disabled_hold_payload() -> None:
     )
 
     assert signal.action == "HOLD"
-    assert signal.bias == "NEUTRAL"
-    assert signal.conviction == "disabled"
-    assert signal.cooldown_seconds == 0
-    assert signal.details["signals_enabled"] is False
-    assert any("disabled" in reason.lower() for reason in signal.reasons)
+    assert signal.details["vix_level"] == 25.0
+    assert signal.details["vix_too_high"] is True
+    assert any("vix" in reason.lower() for reason in signal.reasons)
 
 
-def test_build_technical_signal_skips_guardrails_when_disabled() -> None:
+def test_build_technical_signal_holds_during_cooldown(monkeypatch) -> None:
+    """When a signal was fired 6 min ago and cooldown is 12 min, action must be HOLD."""
+    # VIX=15, MA=15 → ratio=1.0 (neutral, no VIX block)
+    monkeypatch.setattr(
+        "execution_engine.live_service.get_vix_context",
+        lambda _db: (15.0, 15.0, 1.0),
+    )
     context = _context()
+    # Latest signal 6 minutes ago; default cooldown = 12 minutes → 360 s remaining
     fake_db = _FakeDb(
         signal_count=1,
         latest_signal_ts=datetime(2026, 4, 21, 11, 10, tzinfo=IST_ZONE),
@@ -108,9 +119,8 @@ def test_build_technical_signal_skips_guardrails_when_disabled() -> None:
     )
 
     assert signal.action == "HOLD"
-    assert signal.cooldown_seconds == 0
-    assert signal.details["signals_enabled"] is False
-    assert any("data-only mode" in reason.lower() for reason in signal.reasons)
+    assert signal.cooldown_seconds > 0
+    assert any("cooldown" in reason.lower() for reason in signal.reasons)
 
 
 def test_build_chart_payload_exposes_two_year_range_options() -> None:

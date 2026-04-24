@@ -18,7 +18,7 @@ from execution_engine.live_service import (
 )
 from execution_engine.risk_manager import compute_quantity, update_risk_plan
 from execution_engine.slippage_tracker import estimate_slippage
-from execution_engine.strike_selector import lot_size_for_symbol
+from execution_engine.strike_selector import compute_position_lots, lot_size_for_symbol
 from utils.calendar_utils import is_trading_day
 from utils.config import Settings, get_settings
 from utils.constants import IST_ZONE
@@ -228,9 +228,29 @@ class IntradayOptionsExecutionEngine:
         reason: str,
         exit_premium: float,
     ) -> ExecutionOrder:
-        instrument_key = (position.metadata_json or {}).get("instrument_key") or position.symbol
+        instrument_key = (position.metadata_json or {}).get("instrument_key") or ""
+
+        # Log slippage estimate for exits (never block — exits are always executed)
+        try:
+            if instrument_key and "|" in instrument_key:
+                slip = estimate_slippage(
+                    db,
+                    symbol=position.symbol,
+                    instrument_key=instrument_key,
+                    quantity=int(position.quantity),
+                    order_type="MARKET",
+                    side="SELL",
+                    now=now,
+                )
+                logger.info(
+                    "Exit slippage estimate symbol=%s reason=%s bps=%.1f confidence=%.2f",
+                    position.symbol, reason, slip.estimated_slippage_bps, slip.confidence,
+                )
+        except Exception:
+            pass
+
         request = BrokerOrderRequest(
-            symbol=str(instrument_key),
+            instrument_key=str(instrument_key),
             option_type=str(position.option_type),
             strike=float(position.strike),
             expiry_date=position.expiry_date.isoformat(),
@@ -322,6 +342,7 @@ class IntradayOptionsExecutionEngine:
                 target_price=float(position.target_premium or position.take_profit or 0.0),
                 tsl_activation_percent=float(self.settings.tsl_activation_percent),
                 tsl_trail_percent=float(self.settings.tsl_trail_percent),
+                tsl_immediate=bool(getattr(self.settings, "tsl_immediate", True)),
             )
             position.current_sl = float(risk_update.current_sl)
             position.trailing_stop = float(risk_update.current_sl)
@@ -439,14 +460,31 @@ class IntradayOptionsExecutionEngine:
             return "skip:synthetic_chain_live_blocked"
 
         entry_price = float(option_signal["entry_price"])
+        regime = str(signal.details.get("regime", "TRENDING"))
+        base_lots = max(1, int(getattr(self.settings, "execution_lot_size", 1) or 1))
+        max_lots = max(base_lots, int(getattr(self.settings, "execution_max_lots", 2)))
+        scaled_lots = compute_position_lots(
+            confidence=signal.confidence,
+            regime=regime,
+            base_lots=base_lots,
+            max_lots=max_lots,
+        )
         sizing = compute_quantity(
             capital=float(self.settings.execution_capital),
             capital_per_trade_pct=float(self.settings.execution_per_trade_risk_pct),
             entry_price=entry_price,
             lot_size=lot_size_for_symbol(symbol),
-            fixed_lots=max(1, int(getattr(self.settings, "execution_lot_size", 1) or 1)),
+            fixed_lots=scaled_lots,
         )
-        instrument_key = str(option_signal.get("instrument_key") or symbol)
+        instrument_key = str(option_signal.get("instrument_key") or "")
+        if not instrument_key or "|" not in instrument_key:
+            logger.warning(
+                "No valid Upstox instrument_key for %s (got %r) — cannot place order",
+                symbol, instrument_key,
+            )
+            log_row.skip_reason = f"missing_instrument_key:{instrument_key or 'empty'}"
+            db.commit()
+            return "skip:no_instrument_key"
         slippage_meta: dict = {}
         try:
             slip = estimate_slippage(
@@ -472,7 +510,7 @@ class IntradayOptionsExecutionEngine:
             logger.warning("Slippage estimation failed for %s, proceeding anyway", symbol)
 
         request = BrokerOrderRequest(
-            symbol=instrument_key,
+            instrument_key=instrument_key,
             option_type=str(option_signal["option_type"]),
             strike=float(option_signal["strike"]),
             expiry_date=option_selection.expiry_date.isoformat(),

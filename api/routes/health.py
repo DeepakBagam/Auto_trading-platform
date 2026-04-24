@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import requests as _requests
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -60,13 +61,37 @@ def health_detailed(db: Session = Depends(get_db_session)) -> dict:
     except Exception as exc:
         checks["market_stream"] = {"status": "error", "detail": str(exc)}
 
-    # 4. Upstox token configured
+    # 4. Broker API reachability — ping Upstox profile endpoint
     settings = get_settings()
-    token_ok = bool(settings.upstox_access_token.strip())
-    checks["broker_token"] = {
-        "status": "ok" if token_ok else "error",
-        "detail": "token configured" if token_ok else "UPSTOX_ACCESS_TOKEN not set",
-    }
+    token = settings.upstox_access_token.strip()
+    if not token:
+        checks["broker"] = {"status": "error", "detail": "UPSTOX_ACCESS_TOKEN not set"}
+    else:
+        try:
+            resp = _requests.get(
+                f"{settings.upstox_base_url}/v2/user/profile",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                profile = resp.json().get("data", {})
+                checks["broker"] = {
+                    "status": "ok",
+                    "user_name": profile.get("user_name", ""),
+                    "email": profile.get("email", ""),
+                    "broker": profile.get("broker", ""),
+                }
+            elif resp.status_code == 401:
+                checks["broker"] = {"status": "error", "detail": "token expired or invalid (HTTP 401)"}
+            else:
+                checks["broker"] = {
+                    "status": "warn",
+                    "detail": f"unexpected HTTP {resp.status_code} from Upstox profile API",
+                }
+        except _requests.exceptions.Timeout:
+            checks["broker"] = {"status": "warn", "detail": "Upstox API timed out (>5s)"}
+        except Exception as exc:
+            checks["broker"] = {"status": "error", "detail": str(exc)}
 
     # 5. Execution state
     checks["execution"] = {
