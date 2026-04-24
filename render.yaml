@@ -24,6 +24,18 @@ services:
         value: "true"
       - key: EXECUTION_MODE
         value: "paper"
+      - key: EXECUTION_POLL_SECONDS
+        value: "1"
+      - key: SIGNAL_MAX_PER_DAY
+        value: "3"
+      - key: SIGNAL_MIN_SCORE
+        value: "78"
+      - key: UI_STREAM_INTERVAL_MS
+        value: "800"
+      - key: UI_TICK_INTERVAL_MS
+        value: "150"
+      - key: HISTORY_RETENTION_YEARS
+        value: "2"
     
   - type: worker
     name: trading-stream
@@ -34,6 +46,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.0"
+      - key: HISTORY_RETENTION_YEARS
+        value: "2"
+      - key: HISTORY_BOOTSTRAP_ON_START
+        value: "true"
 
 databases:
   - name: trading-db

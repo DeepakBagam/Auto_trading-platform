@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from itertools import count
 from typing import Any
 
@@ -11,6 +12,14 @@ from utils.constants import IST_ZONE
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_REDACTED = "***REDACTED***"
+
+
+def _mask_token(token: str) -> str:
+    if not token or len(token) < 8:
+        return _REDACTED
+    return token[:4] + "..." + token[-4:]
 
 
 @dataclass(slots=True)
@@ -150,6 +159,10 @@ class PaperBroker(BaseBroker):
 class UpstoxBroker(BaseBroker):
     broker_name = "upstox"
 
+    # Circuit breaker: open after this many consecutive failures
+    _CB_FAILURE_THRESHOLD = 5
+    _CB_RESET_SECONDS = 60
+
     def __init__(self, *, base_url: str, access_token: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
@@ -158,12 +171,53 @@ class UpstoxBroker(BaseBroker):
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+        self._consecutive_failures = 0
+        self._circuit_open_until: datetime | None = None
+
+    def _is_circuit_open(self) -> bool:
+        if self._circuit_open_until is None:
+            return False
+        if datetime.now(IST_ZONE) >= self._circuit_open_until:
+            self._circuit_open_until = None
+            self._consecutive_failures = 0
+            logger.info("UpstoxBroker circuit breaker reset — retrying")
+            return False
+        return True
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._CB_FAILURE_THRESHOLD:
+            self._circuit_open_until = datetime.now(IST_ZONE) + timedelta(seconds=self._CB_RESET_SECONDS)
+            logger.error(
+                "UpstoxBroker circuit breaker OPEN after %d consecutive failures — pausing for %ds",
+                self._consecutive_failures,
+                self._CB_RESET_SECONDS,
+            )
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._circuit_open_until = None
 
     def _refresh_token_if_available(self) -> None:
-        # Token refresh flow differs by deployment; keep hook for production wiring.
-        return None
+        """Re-read token from environment in case it was refreshed externally."""
+        token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+        if not token:
+            return
+        new_auth = f"Bearer {token}"
+        if self.headers.get("Authorization") != new_auth:
+            self.headers["Authorization"] = new_auth
+            logger.info("UpstoxBroker access token refreshed from environment (%s)", _mask_token(token))
 
     def _post(self, path: str, payload: dict[str, Any]) -> BrokerOrderResponse:
+        if self._is_circuit_open():
+            return BrokerOrderResponse(
+                success=False,
+                order_id=None,
+                status="CIRCUIT_OPEN",
+                message=f"Circuit breaker open until {self._circuit_open_until}",
+                payload={"path": path},
+            )
+
         url = f"{self.base_url}{path}"
         res = None
         data: dict[str, Any] | Any = {}
@@ -176,6 +230,7 @@ class UpstoxBroker(BaseBroker):
                     continue
                 break
             except Exception as exc:
+                self._record_failure()
                 if attempt == 1:
                     return BrokerOrderResponse(
                         success=False,
@@ -186,6 +241,11 @@ class UpstoxBroker(BaseBroker):
                     )
 
         if not res.ok:
+            self._record_failure()
+            logger.error(
+                "UpstoxBroker order rejected path=%s status=%s response=%s",
+                path, res.status_code, str(data)[:200],
+            )
             return BrokerOrderResponse(
                 success=False,
                 order_id=None,
@@ -194,6 +254,7 @@ class UpstoxBroker(BaseBroker):
                 payload={"path": path, "response": data},
             )
 
+        self._record_success()
         order_id = (
             (data.get("data") or {}).get("order_id")
             or (data.get("data") or {}).get("id")

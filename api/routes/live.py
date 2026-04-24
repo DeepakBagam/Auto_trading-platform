@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
-from db.connection import SessionLocal
+from db.connection import SessionLocal, get_db_session
 from execution_engine.live_service import (
     build_chart_payload,
     build_live_price_update,
@@ -20,33 +21,29 @@ router = APIRouter(prefix="/api/live", tags=["live"])
 
 
 @router.get("/symbols")
-def symbols() -> dict:
-    db = SessionLocal()
-    try:
-        return {"symbols": list_symbols(db, settings=get_settings())}
-    finally:
-        db.close()
+def symbols(db: Session = Depends(get_db_session)) -> dict:
+    return {"symbols": list_symbols(db, settings=get_settings())}
 
 
 @router.get("/snapshot")
-def snapshot(symbol: str | None = Query(None)) -> dict:
-    db = SessionLocal()
+def snapshot(
+    symbol: str | None = Query(None),
+    db: Session = Depends(get_db_session),
+) -> dict:
     try:
         target = symbol or default_symbol(get_settings())
         return build_live_snapshot(db, symbol=target, settings=get_settings())
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    finally:
-        db.close()
 
 
 @router.get("/chart")
 def chart(
     symbol: str | None = Query(None),
     range_key: str | None = Query(None, alias="range"),
+    db: Session = Depends(get_db_session),
 ) -> dict:
     settings = get_settings()
-    db = SessionLocal()
     try:
         target = symbol or default_symbol(settings)
         return build_chart_payload(
@@ -57,8 +54,6 @@ def chart(
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    finally:
-        db.close()
 
 
 @router.get("/stream")

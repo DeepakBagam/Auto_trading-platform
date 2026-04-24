@@ -6,19 +6,25 @@ from typing import Any
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
-from api.routes.options import options_signal
-from data_layer.collectors.upstox_option_chain import UpstoxOptionChainCollector
-from db.models import DailySummary, ExecutionExternalSignal, ExecutionOrder, ExecutionPosition, OptionQuote, RawCandle
+from db.models import DailySummary, ExecutionOrder, ExecutionPosition
 from execution_engine.broker import BaseBroker, BrokerOrderRequest, PaperBroker, UpstoxBroker
-from execution_engine.risk_manager import build_risk_plan, compute_quantity, update_risk_plan
-from execution_engine.strike_selector import lot_size_for_symbol, select_option_contract
-from prediction_engine.consensus_engine import ConsensusResult, get_consensus_signal, log_consensus_result
+from execution_engine.live_service import (
+    DIRECTIONAL_SIGNALS_ENABLED,
+    build_option_selection,
+    build_technical_signal,
+    latest_option_premium,
+    load_market_context,
+    log_signal_decision,
+)
+from execution_engine.risk_manager import compute_quantity, update_risk_plan
+from execution_engine.slippage_tracker import estimate_slippage
+from execution_engine.strike_selector import lot_size_for_symbol
 from utils.calendar_utils import is_trading_day
 from utils.config import Settings, get_settings
 from utils.constants import IST_ZONE
 from utils.logger import get_logger
 from utils.notifications import send_order_notification
-from utils.symbols import instrument_key_filter, normalize_symbol_key, symbol_aliases, symbol_value_filter
+from utils.symbols import normalize_symbol_key, symbol_value_filter
 
 logger = get_logger(__name__)
 
@@ -35,19 +41,11 @@ def _parse_time(value: str, fallback: time) -> time:
         return fallback
 
 
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        parsed = float(value)
-        return parsed if parsed == parsed else default
-    except (TypeError, ValueError):
-        return default
-
-
 class IntradayOptionsExecutionEngine:
     def __init__(self, settings: Settings | None = None, broker: BaseBroker | None = None) -> None:
         self.settings = settings or get_settings()
         self.broker = broker or self._build_broker()
-        self._last_entry_candle: dict[str, datetime] = {}
+        self._last_entry_candle: dict[str, str] = {}
 
     def _build_broker(self) -> BaseBroker:
         if str(self.settings.execution_mode).lower() == "live":
@@ -74,76 +72,11 @@ class IntradayOptionsExecutionEngine:
         current = now.timetz().replace(tzinfo=None)
         return current >= self._force_squareoff_time()
 
-    def _latest_candle_ts(self, db: Session, symbol: str, interval: str) -> datetime | None:
-        return db.scalar(
-            select(func.max(RawCandle.ts)).where(
-                and_(
-                    instrument_key_filter(RawCandle.instrument_key, symbol),
-                    RawCandle.interval == interval,
-                )
-            )
-        )
-
     def _open_positions(self, db: Session, symbol: str | None = None) -> list[ExecutionPosition]:
         query = select(ExecutionPosition).where(ExecutionPosition.status == "OPEN")
         if symbol:
             query = query.where(symbol_value_filter(ExecutionPosition.symbol, symbol))
         return db.execute(query.order_by(ExecutionPosition.opened_at.asc())).scalars().all()
-
-    def _latest_option_premium(
-        self,
-        db: Session,
-        *,
-        symbol: str,
-        expiry_date: date,
-        strike: float,
-        option_type: str,
-    ) -> float | None:
-        premium = db.scalar(
-            select(OptionQuote.ltp)
-            .where(
-                and_(
-                    symbol_value_filter(OptionQuote.underlying_symbol, symbol),
-                    OptionQuote.expiry_date == expiry_date,
-                    OptionQuote.strike == float(strike),
-                    OptionQuote.option_type == option_type,
-                )
-            )
-            .order_by(OptionQuote.ts.desc())
-            .limit(1)
-        )
-        return float(premium) if premium is not None else None
-
-    def _resolve_underlying_key(self, symbol: str) -> str | None:
-        aliases = {normalize_symbol_key(value) for value in symbol_aliases(symbol)}
-        for instrument_key in self.settings.instrument_keys:
-            display = instrument_key.split("|", 1)[1] if "|" in instrument_key else instrument_key
-            if normalize_symbol_key(display) in aliases:
-                return instrument_key
-        return None
-
-    def _refresh_option_chain_for_symbol(self, db: Session, *, symbol: str, expiry_date: date) -> bool:
-        if not self.settings.has_market_data_access:
-            return False
-        underlying_key = self._resolve_underlying_key(symbol)
-        if underlying_key is None:
-            return False
-        try:
-            UpstoxOptionChainCollector().sync_option_chain(
-                db,
-                underlying_key=underlying_key,
-                underlying_symbol=symbol,
-                expiry_date=expiry_date,
-            )
-            return True
-        except Exception:
-            db.rollback()
-            logger.exception(
-                "Option chain refresh failed for symbol=%s expiry=%s",
-                symbol,
-                expiry_date,
-            )
-            return False
 
     def _append_position_history(self, position: ExecutionPosition, *, now: datetime, premium: float) -> None:
         metadata = dict(position.metadata_json or {})
@@ -184,9 +117,6 @@ class IntradayOptionsExecutionEngine:
         exit_reason: str | None = None,
         realized_pnl: float | None = None,
         unrealized_pnl: float | None = None,
-        ml_confidence: float | None = None,
-        ai_score: float | None = None,
-        pine_signal: str | None = None,
         consensus_reason: str | None = None,
     ) -> ExecutionOrder:
         row = ExecutionOrder(
@@ -211,9 +141,9 @@ class IntradayOptionsExecutionEngine:
             exit_reason=exit_reason,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl,
-            ml_confidence=ml_confidence,
-            ai_score=ai_score,
-            pine_signal=pine_signal,
+            ml_confidence=None,
+            ai_score=None,
+            pine_signal=None,
             consensus_reason=consensus_reason,
             status=str(getattr(response, "status", "NEW")),
             broker_name=str(self.broker.broker_name),
@@ -255,12 +185,6 @@ class IntradayOptionsExecutionEngine:
             "position_status": getattr(position, "status", None),
             "position_opened_at": getattr(position, "opened_at", None),
             "position_closed_at": getattr(position, "closed_at", None),
-            "capital_invested": (
-                float(getattr(position, "entry_premium", 0.0) or getattr(position, "entry_price", 0.0) or 0.0)
-                * float(getattr(position, "quantity", 0) or 0)
-                if position is not None
-                else None
-            ),
         }
         send_order_notification(payload, settings=self.settings)
 
@@ -322,7 +246,10 @@ class IntradayOptionsExecutionEngine:
         position.current_price = float(exit_premium)
         position.current_premium = float(exit_premium)
         position.exit_premium = float(exit_premium)
-        realized = round((float(exit_premium) - float(position.entry_premium or position.entry_price)) * int(position.quantity), 2)
+        realized = round(
+            (float(exit_premium) - float(position.entry_premium or position.entry_price)) * int(position.quantity),
+            2,
+        )
         position.pnl_points = round(float(exit_premium) - float(position.entry_premium or position.entry_price), 2)
         position.pnl_value = float(realized)
         position.realized_pnl = float(realized)
@@ -352,9 +279,6 @@ class IntradayOptionsExecutionEngine:
             exit_reason=reason,
             realized_pnl=position.realized_pnl,
             unrealized_pnl=position.unrealized_pnl,
-            ml_confidence=position.ml_confidence,
-            ai_score=position.ai_score,
-            pine_signal=position.pine_signal,
             consensus_reason=position.consensus_reason,
         )
         self._refresh_daily_summary(db, position.trade_date)
@@ -364,37 +288,27 @@ class IntradayOptionsExecutionEngine:
         updated = 0
         closed = 0
         notifications: list[tuple[ExecutionOrder, ExecutionPosition]] = []
-        refreshed_pairs: set[tuple[str, date]] = set()
         for position in self._open_positions(db):
-            premium = self._latest_option_premium(
+            premium = latest_option_premium(
                 db,
                 symbol=position.symbol,
                 expiry_date=position.expiry_date,
                 strike=float(position.strike),
                 option_type=str(position.option_type),
             )
-            refresh_key = (str(position.symbol), position.expiry_date)
-            if premium is None and refresh_key not in refreshed_pairs:
-                refreshed_pairs.add(refresh_key)
-                self._refresh_option_chain_for_symbol(
-                    db,
-                    symbol=str(position.symbol),
-                    expiry_date=position.expiry_date,
-                )
-                premium = self._latest_option_premium(
-                    db,
-                    symbol=position.symbol,
-                    expiry_date=position.expiry_date,
-                    strike=float(position.strike),
-                    option_type=str(position.option_type),
-                )
             if premium is None:
                 continue
 
             position.current_price = float(premium)
             position.current_premium = float(premium)
-            position.peak_premium = max(float(position.peak_premium or position.entry_premium or position.entry_price), float(premium))
-            position.unrealized_pnl = round((float(premium) - float(position.entry_premium or position.entry_price)) * int(position.quantity), 2)
+            position.peak_premium = max(
+                float(position.peak_premium or position.entry_premium or position.entry_price),
+                float(premium),
+            )
+            position.unrealized_pnl = round(
+                (float(premium) - float(position.entry_premium or position.entry_price)) * int(position.quantity),
+                2,
+            )
             position.pnl_value = float(position.unrealized_pnl)
             position.pnl_points = round(float(premium) - float(position.entry_premium or position.entry_price), 2)
 
@@ -422,7 +336,13 @@ class IntradayOptionsExecutionEngine:
                 exit_reason = str(risk_update.exit_reason)
 
             if exit_reason:
-                order_row = self._close_position(db, position=position, now=now, reason=exit_reason, exit_premium=float(premium))
+                order_row = self._close_position(
+                    db,
+                    position=position,
+                    now=now,
+                    reason=exit_reason,
+                    exit_premium=float(premium),
+                )
                 notifications.append((order_row, position))
                 closed += 1
             updated += 1
@@ -432,97 +352,134 @@ class IntradayOptionsExecutionEngine:
             self._notify_order(order_row, position)
         return {"updated_positions": updated, "closed_positions": closed}
 
-    def _evaluate_symbol(self, db: Session, now: datetime, symbol: str) -> str:
-        interval = "1minute"
-        candle_ts = self._latest_candle_ts(db, symbol=symbol, interval=interval)
-        if candle_ts is None:
-            return "skip:no_candle"
-        if self._last_entry_candle.get(symbol) == candle_ts:
-            return "skip:duplicate_candle"
-        self._last_entry_candle[symbol] = candle_ts
+    def _daily_realized_pnl(self, db: Session, trade_date: date) -> float:
+        positions = db.execute(
+            select(ExecutionPosition).where(
+                and_(
+                    ExecutionPosition.trade_date == trade_date,
+                    ExecutionPosition.status == "CLOSED",
+                )
+            )
+        ).scalars().all()
+        return sum(float(p.realized_pnl or p.pnl_value or 0.0) for p in positions)
 
-        consensus = get_consensus_signal(
-            db,
-            symbol=symbol,
-            interval=interval,
-            now=now,
-            settings=self.settings,
-            persist=False,
-        )
-        consensus.details["candle_ts"] = candle_ts.isoformat()
-        log_row = log_consensus_result(db, consensus)
+    def _evaluate_symbol(self, db: Session, now: datetime, symbol: str) -> str:
+        if not DIRECTIONAL_SIGNALS_ENABLED:
+            return "skip:signals_disabled"
+
+        # Guard: max simultaneous trades across all symbols
+        all_open = self._open_positions(db)
+        max_trades = int(getattr(self.settings, "execution_max_simultaneous_trades", 1))
+        if len(all_open) >= max_trades:
+            return "skip:max_simultaneous_trades_reached"
+
+        # Guard: daily loss limit
+        capital = float(self.settings.execution_capital)
+        max_daily_loss = capital * float(getattr(self.settings, "execution_max_daily_loss_pct", 0.05))
+        daily_pnl = self._daily_realized_pnl(db, now.date())
+        if daily_pnl < -max_daily_loss:
+            return "skip:daily_loss_limit_breached"
+
+        # Guard: max daily trades
+        daily_trade_count = db.scalar(
+            select(func.count()).select_from(ExecutionPosition).where(
+                and_(
+                    ExecutionPosition.trade_date == now.date(),
+                    ExecutionPosition.status == "CLOSED",
+                )
+            )
+        ) or 0
+        max_daily = int(getattr(self.settings, "execution_max_daily_trades", 5))
+        if daily_trade_count >= max_daily:
+            return "skip:max_daily_trades_reached"
+
+        context = load_market_context(db, symbol=symbol, settings=self.settings, now=now)
+        signal = build_technical_signal(db, context=context, settings=self.settings, now=now)
+
+        # Expire stale entry-candle cache entries (older than cooldown window)
+        candle_key = str(signal.details.get("signal_candle_ts") or signal.timestamp.isoformat())
+        cooldown_minutes = int(getattr(self.settings, "signal_cooldown_minutes", 12))
+        cutoff_key = (now - __import__("datetime").timedelta(minutes=cooldown_minutes)).isoformat()
+        self._last_entry_candle = {
+            k: v for k, v in self._last_entry_candle.items() if v >= cutoff_key
+        }
+        if self._last_entry_candle.get(symbol) == candle_key:
+            return "skip:duplicate_candle"
+        self._last_entry_candle[symbol] = candle_key
+
+        log_row = log_signal_decision(db, signal=signal)
 
         if (
             str(self.settings.execution_mode).lower() == "live"
             and normalize_symbol_key(symbol) in set(getattr(self.settings, "live_execution_blocked_symbol_list", []))
         ):
-            log_row.skip_reason = "Live execution blocked for this symbol. Keep it analytics-only until an exchange-supported option contract is configured."
+            log_row.skip_reason = "Live execution blocked for this symbol."
             db.commit()
             return "skip:live_execution_blocked"
 
         if self._open_positions(db, symbol=symbol):
-            log_row.skip_reason = "Open position already active for symbol"
+            log_row.skip_reason = "Open position already active for symbol."
             db.commit()
             return "skip:open_position_active"
 
-        if consensus.consensus not in {"BUY", "SELL"}:
+        if signal.action not in {"BUY", "SELL"}:
             db.commit()
-            return f"skip:{consensus.skip_reason or 'non_trade_signal'}"
+            return f"skip:{log_row.skip_reason or 'non_trade_signal'}"
 
-        options_payload = options_signal(
-            symbol=symbol,
-            interval=interval,
-            prediction_mode="standard",
-            expiry_date=None,
-            strike_mode="auto",
-            strategy_mode="auto",
-            manual_strike=None,
-            allow_option_writing=False,
-            db=db,
-        )
-        chain_rows = [row.model_dump(mode="json") for row in options_payload.chain]
-        pick = select_option_contract(
-            signal_action=consensus.consensus,  # type: ignore[arg-type]
-            spot_price=float(options_payload.underlying_price),
-            strike_step=int(options_payload.strike_step),
-            chain_rows=chain_rows,
-            confidence=float(consensus.ml_confidence),
-            expected_return_pct=float(options_payload.underlying_expected_return_pct or 0.0),
-            premium_min=float(self.settings.execution_premium_min),
-            premium_max=float(self.settings.execution_premium_max),
-            days_to_expiry=(options_payload.expiry_date - now.date()).days,
-            capital_per_trade=float(self.settings.execution_capital) * float(self.settings.execution_per_trade_risk_pct),
-        )
-        if pick is None:
-            log_row.skip_reason = "No liquid strike passed the selection rules"
+        option_selection = build_option_selection(db, context=context, signal=signal, settings=self.settings)
+        option_signal = option_selection.signal
+        if option_signal.get("action") != "BUY":
+            log_row.skip_reason = "No liquid option contract passed the live filter."
             db.commit()
             return "skip:no_liquid_strike"
 
-        risk_plan = build_risk_plan(
-            entry_premium=float(pick.premium),
-            tsl_activation_percent=float(self.settings.tsl_activation_percent),
-            target_profit_percent=float(self.settings.target_profit_percent),
-        )
-        if float(consensus.ai_score) > 55.0:
-            risk_amount = float(pick.premium) - float(risk_plan.initial_sl)
-            risk_plan.target_price = round(float(pick.premium) + (2.5 * risk_amount), 2)
+        if str(self.settings.execution_mode).lower() == "live" and option_selection.chain_source == "synthetic":
+            log_row.skip_reason = "Synthetic option chain is not allowed in live mode."
+            db.commit()
+            return "skip:synthetic_chain_live_blocked"
+
+        entry_price = float(option_signal["entry_price"])
         sizing = compute_quantity(
             capital=float(self.settings.execution_capital),
             capital_per_trade_pct=float(self.settings.execution_per_trade_risk_pct),
-            entry_price=float(pick.premium),
+            entry_price=entry_price,
             lot_size=lot_size_for_symbol(symbol),
             fixed_lots=max(1, int(getattr(self.settings, "execution_lot_size", 1) or 1)),
-            vix_level=consensus.details.get("vix_level"),
         )
+        instrument_key = str(option_signal.get("instrument_key") or symbol)
+        slippage_meta: dict = {}
+        try:
+            slip = estimate_slippage(
+                db,
+                symbol=symbol,
+                instrument_key=instrument_key,
+                quantity=int(sizing.qty),
+                order_type="MARKET",
+                side="BUY",
+                now=now,
+            )
+            slippage_meta = {
+                "estimated_slippage_bps": slip.estimated_slippage_bps,
+                "slippage_confidence": slip.confidence,
+                "slippage_details": slip.details,
+            }
+            # Block if slippage estimate is extreme (>200 bps = 2%)
+            if slip.estimated_slippage_bps > 200 and slip.confidence >= 0.7:
+                log_row.skip_reason = f"Slippage too high: {slip.estimated_slippage_bps:.1f} bps"
+                db.commit()
+                return "skip:slippage_too_high"
+        except Exception:
+            logger.warning("Slippage estimation failed for %s, proceeding anyway", symbol)
+
         request = BrokerOrderRequest(
-            symbol=str(pick.instrument_key or symbol),
-            option_type=str(pick.option_type),
-            strike=float(pick.strike),
-            expiry_date=options_payload.expiry_date.isoformat(),
+            symbol=instrument_key,
+            option_type=str(option_signal["option_type"]),
+            strike=float(option_signal["strike"]),
+            expiry_date=option_selection.expiry_date.isoformat(),
             side="BUY",
             qty=int(sizing.qty),
             order_type="MARKET",
-            tag="consensus_entry",
+            tag="fast_live_entry",
         )
         response = self.broker.place_order(request)
         if not response.success:
@@ -533,56 +490,54 @@ class IntradayOptionsExecutionEngine:
         position = ExecutionPosition(
             trade_date=now.date(),
             symbol=symbol,
-            interval=interval,
-            strategy_name="consensus_ce_pe",
-            option_type=str(pick.option_type),
+            interval="1minute",
+            strategy_name="fast_live_breakout",
+            option_type=str(option_signal["option_type"]),
             side="BUY",
-            expiry_date=options_payload.expiry_date,
-            strike=float(pick.strike),
+            expiry_date=option_selection.expiry_date,
+            strike=float(option_signal["strike"]),
             quantity=int(sizing.qty),
             status="OPEN",
-            entry_price=float(pick.premium),
-            entry_premium=float(pick.premium),
-            stop_loss=float(risk_plan.initial_sl),
-            initial_sl=float(risk_plan.initial_sl),
-            current_sl=float(risk_plan.current_sl),
-            trailing_stop=float(risk_plan.current_sl),
-            peak_premium=float(risk_plan.peak_price),
-            tsl_active=bool(risk_plan.tsl_active),
-            take_profit=float(risk_plan.target_price),
-            target_premium=float(risk_plan.target_price),
-            current_price=float(pick.premium),
-            current_premium=float(pick.premium),
+            entry_price=entry_price,
+            entry_premium=entry_price,
+            stop_loss=float(option_signal["stop_loss"]),
+            initial_sl=float(option_signal["stop_loss"]),
+            current_sl=float(option_signal["stop_loss"]),
+            trailing_stop=float(option_signal["stop_loss"]),
+            peak_premium=entry_price,
+            tsl_active=False,
+            take_profit=float(option_signal["take_profit"]),
+            target_premium=float(option_signal["take_profit"]),
+            current_price=entry_price,
+            current_premium=entry_price,
             pnl_points=0.0,
             pnl_value=0.0,
             realized_pnl=0.0,
             unrealized_pnl=0.0,
-            ml_confidence=float(consensus.ml_confidence),
-            ai_score=float(consensus.ai_score),
-            pine_signal=str(consensus.pine_signal),
-            consensus_reason=str(consensus.skip_reason or f"Combined score {consensus.combined_score:.2f}"),
+            ml_confidence=float(signal.confidence),
+            ai_score=None,
+            pine_signal=None,
+            consensus_reason=f"Score {signal.score:.1f} | {' | '.join(signal.reasons[:2])}",
             entry_order_id=getattr(response, "order_id", None),
             opened_at=now,
             metadata_json={
-                "instrument_key": pick.instrument_key,
-                "combined_score": consensus.combined_score,
-                "strike_selection_reason": pick.reason,
-                "spread_rupees": pick.spread_rupees,
+                "instrument_key": option_signal.get("instrument_key"),
+                "signal_action": signal.action,
+                "signal_bias": signal.bias,
+                "signal_score": signal.score,
+                "signal_reasons": signal.reasons,
+                "chain_source": option_selection.chain_source,
+                **slippage_meta,
                 "premium_history": [
                     {
                         "timestamp": now.isoformat(),
-                        "premium": round(float(pick.premium), 2),
-                        "current_sl": round(float(risk_plan.current_sl), 2),
+                        "premium": round(entry_price, 2),
+                        "current_sl": round(float(option_signal["stop_loss"]), 2),
                         "tsl_active": False,
                         "unrealized_pnl": 0.0,
                     }
                 ],
-                "ml_reasons": consensus.ml_reasons,
-                "ai_reasons": consensus.ai_reasons,
-                "news_sentiment": consensus.news_sentiment,
                 "signal_log_id": log_row.id,
-                "vix_level": consensus.details.get("vix_level"),
-                "liquidity_oi": pick.oi,
             },
         )
         db.add(position)
@@ -610,10 +565,7 @@ class IntradayOptionsExecutionEngine:
             exit_reason=None,
             realized_pnl=position.realized_pnl,
             unrealized_pnl=position.unrealized_pnl,
-            ml_confidence=position.ml_confidence,
-            ai_score=position.ai_score,
-            pine_signal=position.pine_signal,
-            consensus_reason=f"Combined score {consensus.combined_score:.2f} | {pick.reason}",
+            consensus_reason=f"Score {signal.score:.1f} | {' | '.join(option_signal.get('reasons') or [])}",
         )
         log_row.trade_placed = True
         log_row.skip_reason = None
@@ -623,6 +575,7 @@ class IntradayOptionsExecutionEngine:
             "option_type": position.option_type,
             "expiry_date": position.expiry_date.isoformat(),
             "quantity": position.quantity,
+            "chain_source": option_selection.chain_source,
         }
         self._refresh_daily_summary(db, position.trade_date)
         db.commit()
@@ -680,7 +633,7 @@ class IntradayOptionsExecutionEngine:
             return {"status": "not_found", "position_id": position_id}
         if str(position.status).upper() != "OPEN":
             return {"status": "already_closed", "position_id": position_id}
-        premium = self._latest_option_premium(
+        premium = latest_option_premium(
             db,
             symbol=position.symbol,
             expiry_date=position.expiry_date,
@@ -688,36 +641,16 @@ class IntradayOptionsExecutionEngine:
             option_type=str(position.option_type),
         )
         exit_premium = float(premium or position.current_premium or position.entry_premium or position.entry_price)
-        order_row = self._close_position(db, position=position, now=now, reason="MANUAL", exit_premium=exit_premium)
+        order_row = self._close_position(
+            db,
+            position=position,
+            now=now,
+            reason="MANUAL",
+            exit_premium=exit_premium,
+        )
         db.commit()
         self._notify_order(order_row, position)
         return {"status": "closed", "position_id": position_id, "exit_premium": exit_premium}
-
-    def execute_external_signal(
-        self,
-        db: Session,
-        *,
-        symbol: str,
-        signal_action: str,
-        confidence: float = 0.7,
-        source: str = "pine",
-        now: datetime | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        now = now or _now_ist()
-        row = ExecutionExternalSignal(
-            source=str(source),
-            symbol=str(symbol),
-            interval="1minute",
-            signal_action=str(signal_action).upper(),
-            signal_ts=now,
-            confidence=float(confidence),
-            processed=False,
-            metadata_json=metadata or {},
-        )
-        db.add(row)
-        db.commit()
-        return {"status": "accepted", "symbol": symbol, "signal_action": row.signal_action, "source": source}
 
     def daily_report(self, db: Session, trade_date: date | None = None) -> dict[str, Any]:
         trade_date = trade_date or _now_ist().date()
@@ -752,7 +685,9 @@ class IntradayOptionsExecutionEngine:
             if peak > 0:
                 max_drawdown_pct = max(max_drawdown_pct, ((peak - equity) / peak) * 100.0)
 
-        signal_count = db.scalar(select(func.count()).select_from(ExecutionOrder).where(ExecutionOrder.trade_date == trade_date)) or 0
+        signal_count = db.scalar(
+            select(func.count()).select_from(ExecutionOrder).where(ExecutionOrder.trade_date == trade_date)
+        ) or 0
         return {
             "trade_date": trade_date.isoformat(),
             "total_trades": int(summary.total_trades if summary is not None else 0),

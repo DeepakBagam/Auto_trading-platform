@@ -73,9 +73,17 @@ class Settings(BaseSettings):
     execution_interval: str = "1minute"
     execution_strategy_mode: str = "auto"
     execution_allow_option_writing: bool = False
-    execution_poll_seconds: int = 5
+    execution_poll_seconds: int = 1
     execution_symbol_lot_sizes: str = ""
-    option_chain_refresh_seconds: int = 8
+    option_chain_refresh_seconds: int = 4
+    signal_min_score: float = 63.0
+    signal_cooldown_minutes: int = 12
+    signal_max_per_day: int = 3
+    ui_stream_interval_ms: int = 500
+    ui_tick_interval_ms: int = 75
+    history_retention_years: int = 2
+    history_bootstrap_on_start: bool = False
+    market_stream_autostart: bool | None = None
 
     execution_capital: float = 500000.0
     execution_per_trade_risk_pct: float = Field(
@@ -181,6 +189,12 @@ class Settings(BaseSettings):
     @property
     def live_execution_blocked_symbol_list(self) -> List[str]:
         return [normalize_symbol_key(x) for x in self.live_execution_blocked_symbols.split(",") if x.strip()]
+
+    @property
+    def should_autostart_market_stream(self) -> bool:
+        if self.market_stream_autostart is not None:
+            return bool(self.market_stream_autostart)
+        return self.market_data_mode.strip().lower() == "websocket" and self.database_url.startswith("sqlite")
 
 
 @lru_cache(maxsize=1)

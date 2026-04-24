@@ -110,7 +110,7 @@ def build_order_notification_message(
     message["From"] = cfg.smtp_from_email
     message["To"] = ", ".join(cfg.smtp_recipients)
     text_lines = [
-        "Automated AI Trading Platform order update",
+        "Realtime options trading desk order update",
         "",
         strategy_line,
         risk_line,
@@ -175,7 +175,7 @@ def build_order_notification_message(
     message.add_alternative(
         (
             "<html><body>"
-            "<h3>Automated AI Trading Platform Order Update</h3>"
+            "<h3>Realtime Options Trading Desk Order Update</h3>"
             f"<p><strong>{symbol}</strong> {contract} | {order_kind} {side} | P&amp;L {pnl_label}</p>"
             f"<div style='margin:12px 0;padding:12px 14px;border:1px solid #d7d7d7;border-radius:10px;background:#f7f9fc'>"
             f"<div style='font-size:16px;font-weight:700'>{strategy_line}</div>"

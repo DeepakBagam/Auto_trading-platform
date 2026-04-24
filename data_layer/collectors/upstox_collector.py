@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime, timedelta
-from typing import Iterable, List
+from typing import Any, Iterable, List
 
 import requests
 from dateutil import parser
-from sqlalchemy import select
+from dateutil.relativedelta import relativedelta
+from sqlalchemy import and_, delete, func, inspect, select
 from sqlalchemy.orm import Session
 
-from db.models import DataFreshness, RawCandle
+from db.models import (
+    DailySummary,
+    DataFreshness,
+    ExecutionExternalSignal,
+    ExecutionOrder,
+    ExecutionPosition,
+    ExecutionSignalAudit,
+    OptionQuote,
+    OptionTradeSignal,
+    OrderBookSnapshot,
+    RawCandle,
+    SignalLog,
+)
 from data_layer.processors.candle_resampler import resample_candles
+from utils.calendar_utils import is_trading_day, market_session_bounds, next_trading_day, previous_trading_day
 from utils.config import get_settings
 from utils.constants import IST_ZONE, SUPPORTED_INTERVALS
 from utils.logger import get_logger
@@ -268,6 +283,127 @@ class UpstoxCollector:
             )
         return output
 
+    def rebuild_derived_from_one_minute(
+        self,
+        db: Session,
+        *,
+        instrument_key: str,
+        from_date: date,
+        to_date: date,
+    ) -> dict[str, int]:
+        if from_date > to_date:
+            return {"30minute": 0, "day": 0}
+
+        range_start = datetime.combine(from_date, datetime.min.time(), tzinfo=IST_ZONE)
+        range_end = datetime.combine(to_date + timedelta(days=1), datetime.min.time(), tzinfo=IST_ZONE)
+        minute_rows = (
+            db.execute(
+                select(RawCandle)
+                .where(
+                    RawCandle.instrument_key == instrument_key,
+                    RawCandle.interval == "1minute",
+                    RawCandle.ts >= range_start,
+                    RawCandle.ts < range_end,
+                )
+                .order_by(RawCandle.ts.asc())
+            )
+            .scalars()
+            .all()
+        )
+        if not minute_rows:
+            return {"30minute": 0, "day": 0}
+
+        rows_by_day: dict[date, list[RawCandle]] = defaultdict(list)
+        for row in minute_rows:
+            ts_ist = row.ts.astimezone(IST_ZONE) if row.ts.tzinfo is not None else row.ts.replace(tzinfo=IST_ZONE)
+            rows_by_day[ts_ist.date()].append(row)
+
+        derived_30m: list[CandleRecord] = []
+        derived_day: list[CandleRecord] = []
+
+        for session_date, rows in rows_by_day.items():
+            ordered_rows = sorted(
+                rows,
+                key=lambda item: item.ts.astimezone(IST_ZONE) if item.ts.tzinfo is not None else item.ts.replace(tzinfo=IST_ZONE),
+            )
+            if not ordered_rows:
+                continue
+
+            day_open = float(ordered_rows[0].open)
+            day_high = max(float(item.high) for item in ordered_rows)
+            day_low = min(float(item.low) for item in ordered_rows)
+            day_close = float(ordered_rows[-1].close)
+            day_volume = float(sum(float(item.volume or 0.0) for item in ordered_rows))
+            derived_day.append(
+                CandleRecord(
+                    instrument_key=instrument_key,
+                    interval="day",
+                    ts=datetime.combine(session_date, datetime.min.time(), tzinfo=IST_ZONE),
+                    open=day_open,
+                    high=day_high,
+                    low=day_low,
+                    close=day_close,
+                    volume=day_volume,
+                    oi=ordered_rows[-1].oi,
+                    source="derived_intraday",
+                )
+            )
+
+            session_start, session_end = market_session_bounds(session_date)
+            buckets: dict[datetime, list[RawCandle]] = defaultdict(list)
+            for row in ordered_rows:
+                ts_ist = row.ts.astimezone(IST_ZONE) if row.ts.tzinfo is not None else row.ts.replace(tzinfo=IST_ZONE)
+                if ts_ist < session_start or ts_ist >= session_end:
+                    continue
+                minutes_since_open = int((ts_ist - session_start).total_seconds() // 60)
+                bucket_start = session_start + timedelta(minutes=(minutes_since_open // 30) * 30)
+                buckets[bucket_start].append(row)
+
+            for bucket_start in sorted(buckets):
+                bucket_rows = buckets[bucket_start]
+                if not bucket_rows:
+                    continue
+                bucket_rows = sorted(
+                    bucket_rows,
+                    key=lambda item: item.ts.astimezone(IST_ZONE)
+                    if item.ts.tzinfo is not None
+                    else item.ts.replace(tzinfo=IST_ZONE),
+                )
+                derived_30m.append(
+                    CandleRecord(
+                        instrument_key=instrument_key,
+                        interval="30minute",
+                        ts=bucket_start,
+                        open=float(bucket_rows[0].open),
+                        high=max(float(item.high) for item in bucket_rows),
+                        low=min(float(item.low) for item in bucket_rows),
+                        close=float(bucket_rows[-1].close),
+                        volume=float(sum(float(item.volume or 0.0) for item in bucket_rows)),
+                        oi=bucket_rows[-1].oi,
+                        source="derived_intraday",
+                    )
+                )
+
+        db.execute(
+            delete(RawCandle).where(
+                RawCandle.instrument_key == instrument_key,
+                RawCandle.interval == "30minute",
+                RawCandle.ts >= range_start,
+                RawCandle.ts < range_end,
+            )
+        )
+        db.execute(
+            delete(RawCandle).where(
+                RawCandle.instrument_key == instrument_key,
+                RawCandle.interval == "day",
+                RawCandle.ts >= range_start,
+                RawCandle.ts < range_end,
+            )
+        )
+        db.flush()
+        self.persist(db, [*derived_30m, *derived_day], update_existing=True)
+        return {"30minute": len(derived_30m), "day": len(derived_day)}
+
     def _normalize_record(self, record: CandleRecord) -> CandleRecord:
         ts = record.ts.astimezone(IST_ZONE) if record.ts.tzinfo is not None else record.ts.replace(tzinfo=IST_ZONE)
         if record.interval == "day":
@@ -484,6 +620,20 @@ class UpstoxCollector:
                         live_inserted,
                         len(live_records),
                     )
+                    if interval == "1minute":
+                        derived_counts = self.rebuild_derived_from_one_minute(
+                            db,
+                            instrument_key=instrument_key,
+                            from_date=from_date,
+                            to_date=now,
+                        )
+                        logger.info(
+                            "Rebuilt derived candles for %s from %s to %s: %s",
+                            instrument_key,
+                            from_date.isoformat(),
+                            now.isoformat(),
+                            derived_counts,
+                        )
                 except Exception as exc:
                     logger.exception(
                         "Upstox ingestion failed for %s %s: %s", instrument_key, interval, exc
@@ -556,6 +706,246 @@ class UpstoxCollector:
                     )
                     db.commit()
         return summary
+
+    def history_window_start(
+        self,
+        as_of: date | None = None,
+        *,
+        retention_years: int | None = None,
+    ) -> date:
+        anchor = as_of or datetime.now(IST_ZONE).date()
+        years = max(1, int(retention_years or getattr(self.settings, "history_retention_years", 2)))
+        return anchor - relativedelta(years=years)
+
+    def history_window_status(
+        self,
+        db: Session,
+        *,
+        as_of: date | None = None,
+        retention_years: int | None = None,
+    ) -> dict[str, Any]:
+        anchor = as_of or datetime.now(IST_ZONE).date()
+        cutoff_date = self.history_window_start(anchor, retention_years=retention_years)
+        expected_start_date = cutoff_date if is_trading_day(cutoff_date) else next_trading_day(cutoff_date)
+        now_ist = datetime.now(IST_ZONE)
+        session_start, _session_end = market_session_bounds(anchor)
+        if not is_trading_day(anchor):
+            expected_latest_date = previous_trading_day(anchor)
+        elif anchor == now_ist.date() and now_ist < session_start:
+            expected_latest_date = previous_trading_day(anchor)
+        else:
+            expected_latest_date = anchor
+        instrument_keys = self.settings.instrument_keys or db.scalars(
+            select(RawCandle.instrument_key).distinct().order_by(RawCandle.instrument_key.asc())
+        ).all()
+        instruments: list[dict[str, Any]] = []
+        bootstrap_required = False
+
+        for instrument_key in instrument_keys:
+            count, min_ts, max_ts = db.execute(
+                select(
+                    func.count(RawCandle.id),
+                    func.min(RawCandle.ts),
+                    func.max(RawCandle.ts),
+                ).where(
+                    and_(
+                        RawCandle.instrument_key == instrument_key,
+                        RawCandle.interval == "1minute",
+                    )
+                )
+            ).one()
+            oldest = self._coerce_ist(min_ts)
+            latest = self._coerce_ist(max_ts)
+            window_ready = bool(
+                oldest is not None
+                and latest is not None
+                and oldest.date() <= expected_start_date
+                and latest.date() >= expected_latest_date
+            )
+            bootstrap_required = bootstrap_required or not window_ready
+            instruments.append(
+                {
+                    "instrument_key": str(instrument_key),
+                    "count": int(count or 0),
+                    "oldest_ts": oldest.isoformat() if oldest is not None else None,
+                    "latest_ts": latest.isoformat() if latest is not None else None,
+                    "expected_start_date": expected_start_date.isoformat(),
+                    "expected_latest_date": expected_latest_date.isoformat(),
+                    "window_ready": window_ready,
+                }
+            )
+
+        return {
+            "timezone": "Asia/Kolkata",
+            "as_of_date": anchor.isoformat(),
+            "cutoff_date": cutoff_date.isoformat(),
+            "expected_start_date": expected_start_date.isoformat(),
+            "expected_latest_date": expected_latest_date.isoformat(),
+            "bootstrap_required": bootstrap_required,
+            "instruments": instruments,
+        }
+
+    def ensure_history_window(
+        self,
+        db: Session,
+        *,
+        as_of: date | None = None,
+        retention_years: int | None = None,
+    ) -> dict[str, Any]:
+        anchor = as_of or datetime.now(IST_ZONE).date()
+        cutoff_date = self.history_window_start(anchor, retention_years=retention_years)
+        status_before = self.history_window_status(
+            db,
+            as_of=anchor,
+            retention_years=retention_years,
+        )
+        bootstrap_required = bool(status_before["bootstrap_required"])
+        ingest_summary: dict[str, Any] | None = None
+
+        if bootstrap_required:
+            if self.settings.has_market_data_access:
+                window_days = max(1, (anchor - cutoff_date).days)
+                logger.info(
+                    "History window incomplete. Bootstrapping %s calendar days up to %s",
+                    window_days,
+                    anchor.isoformat(),
+                )
+                ingest_summary = self.ingest_historical_full(db, one_minute_days=window_days)
+            else:
+                logger.warning(
+                    "History window is incomplete but market data access is unavailable; skipping bootstrap"
+                )
+
+        retention_summary = self.enforce_retention_window(
+            db,
+            as_of=anchor,
+            retention_years=retention_years,
+        )
+        status_after = self.history_window_status(
+            db,
+            as_of=anchor,
+            retention_years=retention_years,
+        )
+        return {
+            "timezone": "Asia/Kolkata",
+            "as_of_date": anchor.isoformat(),
+            "cutoff_date": cutoff_date.isoformat(),
+            "bootstrap_required": bootstrap_required,
+            "status_before": status_before,
+            "bootstrap_summary": ingest_summary,
+            "retention_summary": retention_summary,
+            "status_after": status_after,
+        }
+
+    def enforce_retention_window(
+        self,
+        db: Session,
+        *,
+        as_of: date | None = None,
+        retention_years: int | None = None,
+    ) -> dict[str, Any]:
+        anchor = as_of or datetime.now(IST_ZONE).date()
+        cutoff_date = self.history_window_start(anchor, retention_years=retention_years)
+        cutoff_dt = datetime.combine(cutoff_date, datetime.min.time(), tzinfo=IST_ZONE)
+        bind = db.get_bind()
+        engine = bind.engine if hasattr(bind, "engine") else bind
+        inspector = inspect(engine)
+        deleted = {
+            "raw_candles": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=RawCandle.__tablename__,
+                statement=delete(RawCandle).where(RawCandle.ts < cutoff_dt),
+            ),
+            "option_quotes": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=OptionQuote.__tablename__,
+                statement=delete(OptionQuote).where(OptionQuote.ts < cutoff_dt),
+            ),
+            "order_book_snapshots": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=OrderBookSnapshot.__tablename__,
+                statement=delete(OrderBookSnapshot).where(OrderBookSnapshot.ts < cutoff_dt),
+            ),
+            "signal_log": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=SignalLog.__tablename__,
+                statement=delete(SignalLog).where(SignalLog.timestamp < cutoff_dt),
+            ),
+            "execution_orders": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=ExecutionOrder.__tablename__,
+                statement=delete(ExecutionOrder).where(ExecutionOrder.created_at < cutoff_dt),
+            ),
+            "execution_positions": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=ExecutionPosition.__tablename__,
+                statement=delete(ExecutionPosition).where(ExecutionPosition.opened_at < cutoff_dt),
+            ),
+            "execution_signal_audit": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=ExecutionSignalAudit.__tablename__,
+                statement=delete(ExecutionSignalAudit).where(ExecutionSignalAudit.candle_ts < cutoff_dt),
+            ),
+            "execution_external_signals": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=ExecutionExternalSignal.__tablename__,
+                statement=delete(ExecutionExternalSignal).where(ExecutionExternalSignal.signal_ts < cutoff_dt),
+            ),
+            "option_trade_signals": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=OptionTradeSignal.__tablename__,
+                statement=delete(OptionTradeSignal).where(OptionTradeSignal.generated_at < cutoff_dt),
+            ),
+            "daily_summary": self._delete_table_rows(
+                engine=engine,
+                inspector=inspector,
+                table_name=DailySummary.__tablename__,
+                statement=delete(DailySummary).where(DailySummary.date < cutoff_date),
+            ),
+        }
+        maintenance_db = Session(engine)
+        try:
+            self._mark_freshness(
+                maintenance_db,
+                "db_retention",
+                "ok",
+                {
+                    "timezone": "Asia/Kolkata",
+                    "as_of_date": anchor.isoformat(),
+                    "cutoff_date": cutoff_date.isoformat(),
+                    "deleted": deleted,
+                },
+            )
+            maintenance_db.commit()
+        finally:
+            maintenance_db.close()
+        db.expire_all()
+        return {
+            "timezone": "Asia/Kolkata",
+            "as_of_date": anchor.isoformat(),
+            "cutoff_date": cutoff_date.isoformat(),
+            "deleted": deleted,
+        }
+
+    def _coerce_ist(self, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value.astimezone(IST_ZONE) if value.tzinfo is not None else value.replace(tzinfo=IST_ZONE)
+
+    def _delete_table_rows(self, *, engine, inspector, table_name: str, statement) -> int:
+        if not inspector.has_table(table_name):
+            return 0
+        with engine.begin() as conn:
+            return int(conn.execute(statement).rowcount or 0)
 
     def _mark_freshness(self, db: Session, source_name: str, status: str, details: dict) -> None:
         row = db.scalar(select(DataFreshness).where(DataFreshness.source_name == source_name))

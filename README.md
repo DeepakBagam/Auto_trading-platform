@@ -1,75 +1,44 @@
-# Automated AI Trading Platform
+# Realtime Options Trading Desk
 
-Production-first greenfield platform for next-day Indian market candle prediction.
+FastAPI backend + React frontend for low-latency index options monitoring and paper/live execution.
 
-## What This V1 Includes
-- Upstox historical/live candle ingestion scaffolding
-- India-focused news ingestion with 3-source blend:
-  - Economic Times RSS + Moneycontrol RSS
-  - NewsAPI
-  - Finnhub (global macro events)
-- Raw + processed data model in Postgres/Timescale
-- Canonical candle/prediction tables plus per-symbol/per-interval SQL views:
-  - `candles_nifty50_1m`, `candles_nifty50_30m`, `candles_nifty50_1d`
-  - `candles_indiavix_1m`, `candles_indiavix_30m`, `candles_indiavix_1d`
-  - `candles_sensex_1m`, `candles_sensex_30m`, `candles_sensex_1d`
-  - matching `predictions_*` views
-- Feature engineering and next-day label generation
-- XGBoost stack for OHLC regression + direction classification
-- V2 stack modules:
-  - `lstm_gru_v2` (sequence model)
-  - `garch_v2` (EWMA-GARCH volatility proxy)
-  - `gap_v2` (next-open gap regressor)
-  - `meta_model_v2` (stacked ridge/logistic combiner)
-- Confidence scoring, API endpoints, scheduler, and basic backtesting utilities
+## What is in this repo now
+- Upstox websocket market stream for live 1-minute candles
+- Lightweight technical signal engine with strict breakout and trend confirmation
+- Fast option contract selection for CE/PE entries
+- Streaming UI served directly from the API
+- Paper or live execution loop with stop, target, and trailing-stop management
 
-## Quick Start
-1. Copy env:
+## Quick start
+1. Copy `.env.example` to `.env`
+2. Install dependencies:
 ```bash
-cp .env.example .env
+pip install -r requirements.txt
 ```
-2. Install deps:
-```bash
-pip install -e ".[dev]"
-```
-3. Initialize DB schema (SQLite default):
+3. Initialize the database:
 ```bash
 python -m db.init_db
 ```
-
-### Optional: PostgreSQL/Timescale Later
-1. Start DB:
+4. Start the API:
 ```bash
-docker compose up -d
+python scripts/start_api.py
 ```
-2. In `.env`, either set `DATABASE_URL=postgresql+psycopg://...` or use `DB_*` values.
-3. Re-run:
+5. Start the execution worker:
 ```bash
-python -m db.init_db
+python scripts/start_execution_loop.py
+```
+6. Start the market stream:
+```bash
+python scripts/start_market_stream.py
 ```
 
-## Run Commands
-- Generate Upstox access token (OAuth code flow): `python scripts/generate_upstox_access_token.py`
-- Ingest news once: `python scripts/ingest_news.py`
-- Ingest candles once: `python scripts/ingest_candles.py`
-- Start live market stream over WebSocket: `python scripts/start_market_stream.py`
-- Build features+labels: `python scripts/build_features.py`
-- Train models: `python scripts/train_models.py`
-- Run inference: `python scripts/run_inference.py`
-- Start API: `python scripts/start_api.py`
-- Start scheduler: `python scripts/start_scheduler.py`
-- Phase-1 runner: `python scripts/run_phase1_upstox_nodocker.py`
-- Generate a one-session trade audit: `python scripts/generate_session_trade_audit.py --date 2026-04-17`
+## Main runtime paths
+- UI: `/`
+- Live snapshot API: `/api/live/snapshot`
+- Live stream API: `/api/live/stream`
+- Execution status: `/execution/status`
 
 ## Notes
-- FinBERT scoring is supported through optional dependency group `.[nlp]`.
-- Celery, Redis, Flower, and Prometheus extras are available through `.[ops]`.
-- `lstm_gru_v2` also uses `torch` from `.[nlp]`.
-- Without NLP extras, the system falls back to lightweight heuristic sentiment.
-- Upstox response shapes can vary by endpoint version; adjust parser in `data_layer/collectors/upstox_collector.py` as needed.
-- Set `MARKET_DATA_MODE=websocket` to disable candle polling in the scheduler and use `python scripts/start_market_stream.py` for live 1-minute ingestion.
-- Default news polling cadence is every 10 minutes (`NEWS_POLL_MINUTES=10`).
-- Finnhub is enabled by default (`ENABLE_FINNHUB=true`) when `FINNHUB_API_KEY` is set.
-- Real live-data paper-trading instructions are in [docs/REAL_MARKET_PAPER_TRADING.md](docs/REAL_MARKET_PAPER_TRADING.md).
-- Trade/CE-PE/strike/deployment notes are in [docs/TRADE_FLOW_AND_DEPLOYMENT.md](docs/TRADE_FLOW_AND_DEPLOYMENT.md).
-- `docker-compose.yml` is the minimal DB stack. `docker-compose-full.yml` is the full local stack and now builds from the repo `Dockerfile`.
+- The old ML, Pine, backtest, and training stack has been removed from the live runtime.
+- `EXECUTION_ENABLED`, `EXECUTION_MODE`, `UPSTOX_ACCESS_TOKEN`, and `UPSTOX_INSTRUMENT_KEYS` are the key env vars for deployment.
+- The UI is static and served from the Python app, so no separate Node build step is required.

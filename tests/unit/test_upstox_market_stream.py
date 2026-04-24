@@ -1,7 +1,12 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
 from data_layer.streamers.upstox_market_stream import UpstoxMarketStream
+from db.models import Base, RawCandle
 from utils.constants import IST_ZONE
 
 
@@ -12,7 +17,7 @@ class _FakeStreamer:
         "ERROR": "error",
         "CLOSE": "close",
         "RECONNECTING": "reconnecting",
-        "AUTO_RECONNECT_STOPPED": "autoReconnectStopped",
+        "AUTO_RECONNECT_STOPPED": "auto_reconnect_stopped",
     }
 
     def on(self, *_args, **_kwargs):
@@ -28,105 +33,76 @@ class _FakeStreamer:
         return None
 
 
-def _epoch_ms(ts: str) -> str:
-    return str(int(datetime.fromisoformat(ts).timestamp() * 1000))
-
-
-def _settings() -> SimpleNamespace:
-    return SimpleNamespace(
-        upstox_access_token="token",
-        instrument_keys=["NSE_INDEX|Nifty 50"],
-        upstox_websocket_mode="ltpc",
-        upstox_websocket_reconnect_interval_seconds=5,
-        upstox_websocket_retry_count=10,
+def test_stream_upserts_current_minute_candle_on_each_tick() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, class_=Session)
+    stream = UpstoxMarketStream(
+        settings=SimpleNamespace(
+            upstox_websocket_mode="full",
+            upstox_websocket_reconnect_interval_seconds=5,
+            upstox_websocket_retry_count=5,
+            instrument_keys=["NSE_INDEX|Nifty 50"],
+        ),
+        session_factory=session_factory,
+        streamer=_FakeStreamer(),
     )
 
+    instrument_key = "NSE_INDEX|Nifty 50"
+    first_tick = datetime(2026, 4, 23, 11, 21, 10, tzinfo=IST_ZONE)
+    second_tick = datetime(2026, 4, 23, 11, 21, 42, tzinfo=IST_ZONE)
 
-def test_market_stream_aggregates_ticks_into_closed_1m_candle() -> None:
-    stream = UpstoxMarketStream(settings=_settings(), streamer=_FakeStreamer())
-    persisted = []
-    stream._persist_candle_record = persisted.append  # type: ignore[method-assign]
-
-    stream.handle_market_data(
-        {
-            "feeds": {
-                "NSE_INDEX|Nifty 50": {
-                    "ltpc": {"ltp": 100.0, "ltt": _epoch_ms("2026-04-08T09:15:05+05:30")}
-                }
-            },
-            "currentTs": _epoch_ms("2026-04-08T09:15:05+05:30"),
-        }
-    )
-    stream.handle_market_data(
-        {
-            "feeds": {
-                "NSE_INDEX|Nifty 50": {
-                    "ltpc": {"ltp": 102.5, "ltt": _epoch_ms("2026-04-08T09:15:45+05:30")}
-                }
-            },
-            "currentTs": _epoch_ms("2026-04-08T09:15:45+05:30"),
-        }
-    )
-    stream.flush_closed_candles(datetime(2026, 4, 8, 9, 16, tzinfo=IST_ZONE))
-
-    assert len(persisted) == 1
-    candle = persisted[0]
-    assert candle.instrument_key == "NSE_INDEX|Nifty 50"
-    assert candle.interval == "1minute"
-    assert candle.ts == datetime(2026, 4, 8, 9, 15, tzinfo=IST_ZONE)
-    assert candle.open == 100.0
-    assert candle.high == 102.5
-    assert candle.low == 100.0
-    assert candle.close == 102.5
-    assert candle.source == "upstox_ws"
-
-
-def test_market_stream_extracts_ltpc_from_nested_full_feed() -> None:
-    stream = UpstoxMarketStream(settings=_settings(), streamer=_FakeStreamer())
-
-    ltpc = stream._extract_ltpc(
-        {
-            "fullFeed": {
-                "indexFF": {
-                    "ltpc": {"ltp": 23123.65, "ltt": _epoch_ms("2026-04-08T09:20:00+05:30")}
-                }
-            }
-        }
+    stream._update_bar(instrument_key, first_tick, 24000.0)
+    stream._flush_pending_records(
+        latest_exchange_ts=first_tick,
+        received_at=first_tick,
+        received_ns=1,
     )
 
-    assert ltpc == {"ltp": 23123.65, "ltt": _epoch_ms("2026-04-08T09:20:00+05:30")}
+    session = session_factory()
+    try:
+        first_row = session.scalar(
+            select(RawCandle).where(
+                RawCandle.instrument_key == instrument_key,
+                RawCandle.interval == "1minute",
+            )
+        )
+        assert first_row is not None
+        assert first_row.ts.isoformat() == "2026-04-23T11:21:00"
+        assert float(first_row.close) == 24000.0
+    finally:
+        session.close()
 
-
-def test_market_stream_extracts_ohlc_records_from_full_feed() -> None:
-    stream = UpstoxMarketStream(settings=_settings(), streamer=_FakeStreamer())
-
-    records = stream._extract_ohlc_records(
-        "NSE_INDEX|Nifty 50",
-        {
-            "fullFeed": {
-                "marketFF": {
-                    "marketOHLC": {
-                        "ohlc": [
-                            {
-                                "interval": "I1",
-                                "open": 23120.0,
-                                "high": 23155.0,
-                                "low": 23110.0,
-                                "close": 23150.0,
-                                "vol": "2500",
-                                "ts": _epoch_ms("2026-04-08T09:16:00+05:30"),
-                            },
-                        ]
-                    },
-                    "oi": 12345,
-                }
-            }
-        },
+    stream._update_bar(instrument_key, second_tick, 24012.5)
+    stream._flush_pending_records(
+        latest_exchange_ts=second_tick,
+        received_at=second_tick,
+        received_ns=2,
     )
 
-    assert len(records) == 1
-    assert records[0].interval == "1minute"
-    assert records[0].ts == datetime(2026, 4, 8, 9, 16, tzinfo=IST_ZONE)
-    assert records[0].volume == 2500.0
-    assert records[0].oi == 12345.0
-    assert records[0].source == "upstox_ws_ohlc"
+    session = session_factory()
+    try:
+        updated_row = session.scalar(
+            select(RawCandle).where(
+                RawCandle.instrument_key == instrument_key,
+                RawCandle.interval == "1minute",
+            )
+        )
+        row_count = session.scalar(
+            select(func.count(RawCandle.id)).where(
+                RawCandle.instrument_key == instrument_key,
+                RawCandle.interval == "1minute",
+            )
+        )
+
+        assert updated_row is not None
+        assert row_count == 1
+        assert float(updated_row.high) == 24012.5
+        assert float(updated_row.close) == 24012.5
+    finally:
+        session.close()

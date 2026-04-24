@@ -30,6 +30,8 @@ class _MinuteBarState:
     high: float
     low: float
     close: float
+    volume: float = 0.0
+    tick_count: int = 0
 
 
 class UpstoxMarketStream:
@@ -116,16 +118,21 @@ class UpstoxMarketStream:
             self.stop()
 
     def handle_market_data(self, message: dict[str, Any]) -> None:
+        received_at = datetime.now(IST_ZONE)
+        received_ns = time.time_ns()
         feeds = message.get("feeds") or {}
         current_ts = self._parse_epoch_ms(message.get("currentTs"))
+        latest_exchange_ts = current_ts
         for instrument_key, payload in feeds.items():
             saw_structured_bar = False
             for record in self._extract_ohlc_records(instrument_key, payload):
                 self._persist_candle_record(record)
                 saw_structured_bar = True
+                latest_exchange_ts = self._latest_timestamp(latest_exchange_ts, record.ts)
             snapshot = self._extract_order_book_snapshot(instrument_key, payload, current_ts)
             if snapshot is not None:
                 self._persist_order_book_snapshot(snapshot)
+                latest_exchange_ts = self._latest_timestamp(latest_exchange_ts, snapshot["ts"])
 
             ltpc = self._extract_ltpc(payload)
             if saw_structured_bar and ltpc is None:
@@ -139,10 +146,15 @@ class UpstoxMarketStream:
             tick_ts = self._parse_epoch_ms(ltpc.get("ltt")) or current_ts
             if tick_ts is None:
                 continue
+            latest_exchange_ts = self._latest_timestamp(latest_exchange_ts, tick_ts)
             self._update_bar(instrument_key, tick_ts, price)
         if current_ts is not None:
             self.flush_closed_candles(current_ts)
-        self._flush_pending_records()
+        self._flush_pending_records(
+            latest_exchange_ts=latest_exchange_ts,
+            received_at=received_at,
+            received_ns=received_ns,
+        )
 
     def flush_closed_candles(self, reference_ts: datetime, force: bool = False) -> None:
         cutoff_minute = reference_ts.astimezone(IST_ZONE).replace(second=0, microsecond=0)
@@ -161,36 +173,48 @@ class UpstoxMarketStream:
     def _update_bar(self, instrument_key: str, tick_ts: datetime, price: float) -> None:
         minute_ts = tick_ts.astimezone(IST_ZONE).replace(second=0, microsecond=0)
         to_persist: CandleRecord | None = None
+        live_record: CandleRecord | None = None
         with self._lock:
             current = self._bars.get(instrument_key)
             if current is None:
-                self._bars[instrument_key] = _MinuteBarState(
+                current = _MinuteBarState(
                     instrument_key=instrument_key,
                     ts=minute_ts,
                     open=price,
                     high=price,
                     low=price,
                     close=price,
+                    volume=0.0,
+                    tick_count=1,
                 )
-                return
+                self._bars[instrument_key] = current
+                live_record = self._to_candle_record(current)
             if minute_ts < current.ts:
                 return
-            if minute_ts > current.ts:
+            elif minute_ts > current.ts:
                 to_persist = self._to_candle_record(current)
-                self._bars[instrument_key] = _MinuteBarState(
+                current = _MinuteBarState(
                     instrument_key=instrument_key,
                     ts=minute_ts,
                     open=price,
                     high=price,
                     low=price,
                     close=price,
+                    volume=0.0,
+                    tick_count=1,
                 )
+                self._bars[instrument_key] = current
+                live_record = self._to_candle_record(current)
             else:
                 current.high = max(current.high, price)
                 current.low = min(current.low, price)
                 current.close = price
+                current.tick_count += 1
+                live_record = self._to_candle_record(current)
         if to_persist is not None:
             self._persist_candle_record(to_persist)
+        if live_record is not None:
+            self._persist_candle_record(live_record)
 
     def _persist_candle_record(self, record: CandleRecord) -> None:
         self._pending_candles.append(record)
@@ -198,7 +222,13 @@ class UpstoxMarketStream:
     def _persist_order_book_snapshot(self, snapshot: dict[str, Any]) -> None:
         self._pending_order_books.append(snapshot)
 
-    def _flush_pending_records(self) -> None:
+    def _flush_pending_records(
+        self,
+        *,
+        latest_exchange_ts: datetime | None = None,
+        received_at: datetime | None = None,
+        received_ns: int | None = None,
+    ) -> None:
         if not self._pending_candles and not self._pending_order_books:
             return
 
@@ -210,7 +240,12 @@ class UpstoxMarketStream:
 
         deduped_candles: dict[tuple[str, str, datetime], CandleRecord] = {}
         for record in candle_buffer:
-            deduped_candles[(record.instrument_key, record.interval, record.ts)] = record
+            key = (record.instrument_key, record.interval, record.ts)
+            existing = deduped_candles.get(key)
+            # Prefer records with actual volume (OHLC-sourced) over LTPC-assembled ones.
+            # When both have volume, keep the higher value (more complete bar).
+            if existing is None or record.volume > existing.volume:
+                deduped_candles[key] = record
         deduped_order_books: dict[tuple[str, datetime], dict[str, Any]] = {}
         for snapshot in order_book_buffer:
             deduped_order_books[(str(snapshot["instrument_key"]), snapshot["ts"])] = snapshot
@@ -218,18 +253,42 @@ class UpstoxMarketStream:
         db = self.session_factory()
         try:
             wrote = 0
+            # Collect unique (instrument_key, ts) pairs needing derived candle sync.
+            # Batch this once per flush rather than per-record to avoid N+1 queries.
+            derive_keys: dict[str, datetime] = {}
             for record in deduped_candles.values():
                 row_written = self._upsert_raw_candle(
                     db,
                     record,
-                    update_existing=record.source in {"upstox_ws_ohlc", "derived_intraday"},
+                    update_existing=record.source in {"upstox_ws", "upstox_ws_ohlc", "derived_intraday"},
                 )
                 wrote += int(bool(row_written))
                 if record.interval == "1minute":
-                    self._sync_derived_candles(db, record.instrument_key, record.ts)
+                    existing_ts = derive_keys.get(record.instrument_key)
+                    if existing_ts is None or record.ts > existing_ts:
+                        derive_keys[record.instrument_key] = record.ts
+            for instrument_key, latest_ts in derive_keys.items():
+                self._sync_derived_candles(db, instrument_key, latest_ts)
             for snapshot in deduped_order_books.values():
                 self._upsert_order_book_snapshot(db, snapshot)
             last_record = next(reversed(list(deduped_candles.values())), None)
+            write_completed_at = datetime.now(IST_ZONE)
+            write_completed_ns = time.time_ns()
+            exchange_to_receive_latency_ns = None
+            receive_to_persist_latency_ns = None
+            exchange_to_persist_latency_ns = None
+            if latest_exchange_ts is not None and received_at is not None:
+                exchange_to_receive_latency_ns = max(
+                    0,
+                    int((received_at - latest_exchange_ts).total_seconds() * 1_000_000_000),
+                )
+            if received_ns is not None:
+                receive_to_persist_latency_ns = max(0, write_completed_ns - received_ns)
+            if latest_exchange_ts is not None:
+                exchange_to_persist_latency_ns = max(
+                    0,
+                    int((write_completed_at - latest_exchange_ts).total_seconds() * 1_000_000_000),
+                )
             self._mark_freshness(
                 db,
                 source_name="upstox_market_stream",
@@ -243,6 +302,13 @@ class UpstoxMarketStream:
                     "ts": last_record.ts.isoformat() if last_record is not None else None,
                     "close": getattr(last_record, "close", None),
                     "source": getattr(last_record, "source", None),
+                    "latest_exchange_ts": latest_exchange_ts.isoformat() if latest_exchange_ts is not None else None,
+                    "message_received_at": received_at.isoformat() if received_at is not None else None,
+                    "write_completed_at": write_completed_at.isoformat(),
+                    "exchange_timestamp_precision": "milliseconds",
+                    "estimated_exchange_to_receive_latency_ns": exchange_to_receive_latency_ns,
+                    "estimated_receive_to_persist_latency_ns": receive_to_persist_latency_ns,
+                    "estimated_exchange_to_persist_latency_ns": exchange_to_persist_latency_ns,
                 },
             )
             db.commit()
@@ -409,7 +475,7 @@ class UpstoxMarketStream:
             high=bar.high,
             low=bar.low,
             close=bar.close,
-            volume=0.0,
+            volume=bar.volume,
             oi=None,
             source="upstox_ws",
         )
@@ -556,6 +622,13 @@ class UpstoxMarketStream:
             return float(raw_value)
         except (TypeError, ValueError):
             return default
+
+    def _latest_timestamp(self, first: datetime | None, second: datetime | None) -> datetime | None:
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return second if second > first else first
 
     def _on_open(self, *_args: Any) -> None:
         logger.info(

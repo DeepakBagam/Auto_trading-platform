@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -17,9 +19,21 @@ INTERVAL_ALIAS = {
 }
 
 
+_SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z0-9_ ]+$")
+_ALLOWED_INTERVALS = {"1minute", "30minute", "day"}
+
+
+def _safe_like_pattern(value: str) -> str:
+    """Escape SQL LIKE special characters and strip anything non-alphanumeric/space."""
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
+    return escaped.upper()
+
+
 def _build_candle_view_sql(view_name: str, patterns: list[str], interval: str) -> str:
+    if interval not in _ALLOWED_INTERVALS:
+        raise ValueError(f"Unsupported interval for view: {interval!r}")
     like_clauses = " OR ".join(
-        [f"UPPER(instrument_key) LIKE '%{p.upper()}%'" for p in patterns]
+        [f"UPPER(instrument_key) LIKE '%{_safe_like_pattern(p)}%' ESCAPE '\\'" for p in patterns]
     )
     return f"""
 CREATE VIEW {view_name} AS

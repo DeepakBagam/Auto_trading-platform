@@ -41,15 +41,18 @@ def _to_float(value) -> float | None:
 
 
 def confidence_to_delta_range(confidence: float) -> tuple[float, float]:
-    """Map confidence to target delta range (probability-based)."""
+    """Map confidence to target delta range for intraday option buying.
+
+    For intraday index options, always stay near ATM (delta 0.40-0.55).
+    Deep OTM loses to theta decay and requires a larger move to profit.
+    High confidence = slight OTM (max 1 strike); low confidence = ATM.
+    """
     score = float(confidence)
     if score >= 0.85:
-        return (0.30, 0.40)  # High confidence → moderate OTM
+        return (0.40, 0.52)  # High confidence → 1 strike OTM at most
     if score >= 0.75:
-        return (0.40, 0.50)  # Medium-high → slight OTM
-    if score >= 0.65:
-        return (0.45, 0.55)  # Medium → near ATM
-    return (0.48, 0.52)  # Low → ATM
+        return (0.43, 0.53)  # Medium-high → near ATM
+    return (0.45, 0.55)  # Default → ATM band
 
 
 def lot_size_for_symbol(symbol: str) -> int:
@@ -177,15 +180,15 @@ def select_option_contract(
     # Get target delta range based on confidence
     delta_min, delta_max = confidence_to_delta_range(confidence)
     
-    # Adjust for time to expiry (0-1 DTE needs different logic)
+    # Adjust for time to expiry — near expiry always tighten toward ATM
     if days_to_expiry <= 1:
-        # Weekly expiry: tighter delta range, closer to ATM
-        delta_min = max(0.45, delta_min + 0.10)
-        delta_max = min(0.55, delta_max + 0.05)
+        delta_min = max(0.45, delta_min)
+        delta_max = min(0.55, delta_max)
     elif days_to_expiry <= 5:
-        # Near expiry: moderate adjustment
-        delta_min = max(0.40, delta_min + 0.05)
-        delta_max = min(0.55, delta_max + 0.03)
+        delta_min = max(0.40, delta_min)
+        delta_max = min(0.55, delta_max)
+    # Hard floor: never buy options with delta below 0.38 intraday
+    delta_min = max(0.38, delta_min)
     
     # Dynamic premium cap based on risk (1-2% of capital)
     max_premium_risk = capital_per_trade * 0.02

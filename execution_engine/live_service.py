@@ -14,6 +14,7 @@ from api.market_stream_runtime import get_market_stream_runtime_status
 from data_layer.collectors.upstox_option_chain import UpstoxOptionChainCollector
 from db.models import DataFreshness, DailySummary, ExecutionOrder, ExecutionPosition, OptionQuote, RawCandle, SignalLog
 from execution_engine.risk_manager import build_risk_plan
+from execution_engine.slippage_tracker import get_vix_level
 from execution_engine.strike_selector import select_option_contract
 from feature_engine.price_features import build_price_features
 from prediction_engine.options_engine import (
@@ -37,9 +38,11 @@ from utils.symbols import (
 )
 
 LIVE_INTERVAL = "1minute"
-DIRECTIONAL_SIGNALS_ENABLED = False
+DIRECTIONAL_SIGNALS_ENABLED = True
 DEFAULT_SIGNAL_COOLDOWN_MINUTES = 12
-DEFAULT_SIGNAL_MIN_SCORE = 78.0
+DEFAULT_SIGNAL_MIN_SCORE = 63.0
+VIX_MAX_THRESHOLD = 22.0   # Skip signals when VIX is too high (options too expensive)
+VIX_MIN_THRESHOLD = 11.0   # Skip signals when VIX is too low (premiums too small)
 DEFAULT_MAX_SIGNALS_PER_DAY = 3
 DEFAULT_CHART_RANGE = "1d"
 CHART_RANGE_SPECS: dict[str, dict[str, Any]] = {
@@ -914,6 +917,11 @@ def build_technical_signal(
         score_buy += 4.0
         score_sell += 4.0
 
+    # VIX filter: skip when volatility makes options too expensive or too cheap
+    vix_level = get_vix_level(db)
+    vix_too_high = vix_level > VIX_MAX_THRESHOLD
+    vix_too_low = vix_level > 0 and vix_level < VIX_MIN_THRESHOLD
+
     bias = "BUY" if score_buy > score_sell else ("SELL" if score_sell > score_buy else "NEUTRAL")
     raw_action = "BUY" if score_buy >= score_sell else "SELL"
     raw_score = score_buy if raw_action == "BUY" else score_sell
@@ -936,6 +944,12 @@ def build_technical_signal(
 
     reasons = list(base_reasons)
     action = raw_action
+    if vix_too_high:
+        action = "HOLD"
+        reasons.append(f"India VIX {vix_level:.1f} above {VIX_MAX_THRESHOLD:.0f} — options overpriced, skipping.")
+    if vix_too_low:
+        action = "HOLD"
+        reasons.append(f"India VIX {vix_level:.1f} below {VIX_MIN_THRESHOLD:.0f} — option premiums too small.")
     if range_bound:
         action = "HOLD"
         reasons.append("Market is too compressed around EMA 21; no clean edge.")
@@ -992,6 +1006,8 @@ def build_technical_signal(
         "confirm_5m_sell": confirm_5m_sell,
         "score_buy": round(score_buy, 1),
         "score_sell": round(score_sell, 1),
+        "vix_level": round(vix_level, 2),
+        "vix_too_high": vix_too_high,
         "expected_move_points": expected_move,
         "expected_move_pct": expected_move_pct,
         "signal_count_today": signal_count_today,
