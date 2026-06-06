@@ -1,0 +1,57 @@
+services:
+  - type: web
+    name: trading-api
+    env: python
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn backend.api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: EXECUTION_ENABLED
+        value: "false"
+    
+  - type: worker
+    name: trading-execution
+    env: python
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python backend/scripts/start_execution_loop.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: EXECUTION_ENABLED
+        value: "true"
+      - key: EXECUTION_MODE
+        value: "paper"
+      - key: EXECUTION_POLL_SECONDS
+        value: "1"
+      - key: SIGNAL_MAX_PER_DAY
+        value: "3"
+      - key: SIGNAL_MIN_SCORE
+        value: "78"
+      - key: UI_STREAM_INTERVAL_MS
+        value: "800"
+      - key: UI_TICK_INTERVAL_MS
+        value: "150"
+      - key: HISTORY_RETENTION_YEARS
+        value: "2"
+    
+  - type: worker
+    name: trading-stream
+    env: python
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python backend/scripts/start_market_stream.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: HISTORY_RETENTION_YEARS
+        value: "2"
+      - key: HISTORY_BOOTSTRAP_ON_START
+        value: "true"
+
+databases:
+  - name: trading-db
+    databaseName: trading
+    user: trading_user
