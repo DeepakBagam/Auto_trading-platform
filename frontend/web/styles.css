@@ -1667,6 +1667,21 @@ tbody tr:hover {
   padding: 12px;
 }
 
+.strike-workspace-panel {
+  padding: 0 12px 12px;
+}
+
+.strike-inline-panel {
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--surface-strong);
+  color: var(--ink);
+  width: 100%;
+  max-height: none;
+  overflow: visible;
+  padding: 12px;
+}
+
 .mini-chart-grid {
   display: grid;
   grid-template-columns: minmax(0, 2.4fr) minmax(320px, 0.9fr);
@@ -1688,8 +1703,8 @@ tbody tr:hover {
 
 .strike-chart-canvas {
   width: 100%;
-  height: clamp(520px, 68vh, 760px);
-  min-height: 520px;
+  height: clamp(620px, 72vh, 820px);
+  min-height: 620px;
   border: 1px solid var(--line-soft);
   background: var(--surface);
 }
@@ -1737,7 +1752,7 @@ tbody tr:hover {
   }
 
   .strike-chart-canvas {
-    height: 520px;
+    height: 560px;
   }
 }
 

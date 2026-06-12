@@ -1876,6 +1876,8 @@ function EngineStrikeCard({ signal, option, onInspect }) {
               entryPrice: optionSignal.entry_price,
               stopLoss: optionSignal.stop_loss,
               takeProfit: optionSignal.take_profit,
+              trailingStopLoss: optionSignal.trailing_stop_loss,
+              source: "engine",
             })}
           >
             View Chart
@@ -1906,6 +1908,10 @@ function EngineStrikeCard({ signal, option, onInspect }) {
         <div className="info-tile">
           <span>Target</span>
           <strong>{formatMoney(optionSignal.take_profit)}</strong>
+        </div>
+        <div className="info-tile">
+          <span>Trail SL</span>
+          <strong>{formatMoney(optionSignal.trailing_stop_loss || optionSignal.stop_loss)}</strong>
         </div>
         <div className="info-tile">
           <span>Premium</span>
@@ -2796,7 +2802,7 @@ function ContractChartModal({ contract, onClose }) {
           strike: String(contract.strike),
           option_type: contract.optionType,
           limit: "5000",
-          include_previous: "true",
+          include_previous: "false",
           refresh: "false",
           include_live: "false",
         });
@@ -2812,6 +2818,9 @@ function ContractChartModal({ contract, onClose }) {
         }
         if (contract.takeProfit) {
           params.append("take_profit", String(contract.takeProfit));
+        }
+        if (contract.trailingStopLoss) {
+          params.append("trailing_stop_loss", String(contract.trailingStopLoss));
         }
         const payload = await apiFetch(`/api/live/option-contract-chart?${params.toString()}`);
         if (active) {
@@ -2840,7 +2849,7 @@ function ContractChartModal({ contract, onClose }) {
     const chartTheme = CHART_THEMES.dark;
     const instance = LightweightCharts.createChart(optionChartRef.current, {
       width: optionChartRef.current.clientWidth,
-      height: 300,
+      height: optionChartRef.current.clientHeight || 640,
       layout: { background: { color: chartTheme.background }, textColor: chartTheme.text },
       rightPriceScale: { borderColor: chartTheme.border },
       timeScale: {
@@ -2869,6 +2878,15 @@ function ContractChartModal({ contract, onClose }) {
     });
     const candles = normalizeChartCandles(data.chart.candles);
     candleSeries.setData(candles);
+    if (candles.length) {
+      const currentLineSeries = instance.addLineSeries({
+        color: "#7dd3fc",
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      currentLineSeries.setData(candles.map((row) => ({ time: row.time, value: row.close })));
+    }
     const markers = (data.chart.markers || [])
       .map((row) => ({
         time: parseChartTime(row.time),
@@ -2952,14 +2970,14 @@ function ContractChartModal({ contract, onClose }) {
   }).join(" ");
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="chart-modal" onClick={(event) => event.stopPropagation()}>
+    <section className="strike-workspace-panel">
+      <article className="strike-inline-panel">
         <div className="panel-head">
           <div>
             <h2>{contract.symbol} {contract.strike} {contract.optionType}</h2>
-            <p>{formatDate(contract.expiry)}</p>
+            <p>{formatDate(contract.expiry)} {contract.source === "engine" ? "| Engine selected strike" : "| Selected strike"}</p>
           </div>
-          <button type="button" className="line-button" onClick={onClose}>Close</button>
+          <button type="button" className="line-button" onClick={onClose}>Clear</button>
         </div>
         {loading ? <InlineLoader label="Loading strike chart..." /> : null}
         {error ? <div className="error-banner">{error}</div> : null}
@@ -2968,9 +2986,13 @@ function ContractChartModal({ contract, onClose }) {
             {data && data.history_available === false ? (
               <div className="error-banner">No stored intraday history yet for this contract; showing current snapshot premium.</div>
             ) : null}
+            {data?.chart?.candles?.length && data.chart.candles.length < 20 ? (
+              <div className="error-banner">Limited stored quote history for this strike: {data.chart.candles.length} points. Refresh option-chain data during market hours to build a full strike chart.</div>
+            ) : null}
             <div className="info-grid">
               <div className="info-tile"><span>Entry</span><strong>{formatMoney(data?.entry_price)}</strong></div>
               <div className="info-tile"><span>Stop Loss</span><strong>{formatMoney(data?.stop_loss)}</strong></div>
+              <div className="info-tile"><span>Trail SL</span><strong>{formatMoney(data?.trailing_stop_loss || data?.stop_loss)}</strong></div>
               <div className="info-tile"><span>Target</span><strong>{formatMoney(data?.take_profit)}</strong></div>
               <div className="info-tile"><span>Last</span><strong>{formatMoney(points[points.length - 1]?.ltp)}</strong></div>
               <div className="info-tile"><span>P&amp;L</span><strong>{formatSignedMoney(points[points.length - 1]?.pnl)}</strong></div>
@@ -2991,8 +3013,8 @@ function ContractChartModal({ contract, onClose }) {
             </div>
           </>
         ) : null}
-      </div>
-    </div>
+      </article>
+    </section>
   );
 }
 
@@ -3362,6 +3384,48 @@ function App() {
   const deferredPositions = useDeferredValue(selectedSnapshot.positions || []);
   const pnlTone = Number(stats.total_pnl_today) >= 0 ? "positive" : "negative";
   const priceTone = Number(price.change) >= 0 ? "positive" : "negative";
+
+  useEffect(() => {
+    const optionSignal = option?.signal || {};
+    const action = String(optionSignal.action || signal?.action || "").toUpperCase();
+    if (action !== "BUY" && action !== "SELL") {
+      return;
+    }
+    if (!option?.expiry_date || !optionSignal.strike || !optionSignal.option_type) {
+      return;
+    }
+    const nextContract = {
+      symbol: option?.symbol || signal?.symbol || symbol || "Nifty 50",
+      expiry: option.expiry_date,
+      strike: optionSignal.strike,
+      optionType: optionSignal.option_type,
+      entryPrice: optionSignal.entry_price,
+      stopLoss: optionSignal.stop_loss,
+      takeProfit: optionSignal.take_profit,
+      trailingStopLoss: optionSignal.trailing_stop_loss || optionSignal.stop_loss,
+      source: "engine",
+    };
+    const nextKey = `${nextContract.symbol}:${nextContract.expiry}:${nextContract.strike}:${nextContract.optionType}:${nextContract.entryPrice}:${nextContract.stopLoss}:${nextContract.takeProfit}:${nextContract.trailingStopLoss}`;
+    setContractModal((current) => {
+      const currentKey = current
+        ? `${current.symbol}:${current.expiry}:${current.strike}:${current.optionType}:${current.entryPrice}:${current.stopLoss}:${current.takeProfit}:${current.trailingStopLoss}`
+        : "";
+      return currentKey === nextKey ? current : nextContract;
+    });
+  }, [
+    option?.expiry_date,
+    option?.symbol,
+    option?.signal?.action,
+    option?.signal?.strike,
+    option?.signal?.option_type,
+    option?.signal?.entry_price,
+    option?.signal?.stop_loss,
+    option?.signal?.take_profit,
+    option?.signal?.trailing_stop_loss,
+    signal?.action,
+    signal?.symbol,
+    symbol,
+  ]);
 
   const activeMeta = NAV_ITEMS.find((item) => item.id === activeView) || NAV_ITEMS[0];
   const summaryLine = selectedSnapshot.generated_at
@@ -4151,6 +4215,8 @@ function App() {
               />
             </section>
 
+            <ContractChartModal contract={contractModal} onClose={() => setContractModal(null)} />
+
             <section>
               <PositionsTable positions={deferredPositions} onClose={closePosition} onDelete={deletePosition} onInspect={setContractModal} />
             </section>
@@ -4183,9 +4249,12 @@ function App() {
         ) : null}
 
         {activeView === "optionchain" ? (
-          <section>
-            <OptionChain symbol={symbol} onInspectContract={setContractModal} />
-          </section>
+          <>
+            <ContractChartModal contract={contractModal} onClose={() => setContractModal(null)} />
+            <section>
+              <OptionChain symbol={symbol} onInspectContract={setContractModal} />
+            </section>
+          </>
         ) : null}
 
         {activeView === "history" ? (
@@ -4223,7 +4292,6 @@ function App() {
           />
         ) : null}
       </main>
-      <ContractChartModal contract={contractModal} onClose={() => setContractModal(null)} />
     </div>
   );
 }

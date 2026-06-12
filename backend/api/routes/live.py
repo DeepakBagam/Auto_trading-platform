@@ -297,6 +297,7 @@ def option_contract_chart(
     entry_price: float | None = Query(None),
     stop_loss: float | None = Query(None),
     take_profit: float | None = Query(None),
+    trailing_stop_loss: float | None = Query(None),
     db: Session = Depends(get_db_session),
 ) -> dict:
     from datetime import date as date_type
@@ -368,6 +369,7 @@ def option_contract_chart(
     entry = float(position.entry_premium or position.entry_price) if position is not None else entry_price
     stop = float(position.stop_loss or position.initial_sl or 0.0) if position is not None else stop_loss
     target = float(position.take_profit or position.target_premium or 0.0) if position is not None else take_profit
+    trailing_stop = float(position.current_sl or position.trailing_stop or 0.0) if position is not None else trailing_stop_loss
     quantity = int(position.quantity) if position is not None else 1
 
     def serialize_points(quote_rows: list[OptionQuote], *, with_pnl: bool) -> list[dict]:
@@ -530,11 +532,13 @@ def option_contract_chart(
         "entry_price": entry,
         "stop_loss": stop if stop and stop > 0 else None,
         "take_profit": target if target and target > 0 else None,
+        "trailing_stop_loss": trailing_stop if trailing_stop and trailing_stop > 0 else None,
         "levels": [
             item
             for item in [
                 {"label": "ENTRY", "price": entry, "color": "#f8fafc"} if entry is not None else None,
                 {"label": "STOP LOSS", "price": stop, "color": "#ef4444"} if stop and stop > 0 else None,
+                {"label": "TRAIL SL", "price": trailing_stop, "color": "#f7c948"} if trailing_stop and trailing_stop > 0 else None,
                 {"label": "TARGET", "price": target, "color": "#22c55e"} if target and target > 0 else None,
             ]
             if item is not None
