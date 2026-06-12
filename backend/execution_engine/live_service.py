@@ -16,7 +16,7 @@ from backend.db.models import DataFreshness, DailySummary, ExecutionOrder, Execu
 from backend.execution_engine.slippage_tracker import get_vix_context
 from backend.execution_engine.strike_selector import get_atm_iv as _strike_get_atm_iv
 from backend.feature_engine.price_features import build_price_features
-from backend.prediction_engine.options_engine import (
+from backend.execution_engine.options_engine import (
     OptionQuoteView,
     build_chain_rows,
     nearest_strike,
@@ -36,6 +36,7 @@ from backend.utils.symbols import (
     canonical_symbol_name,
     display_symbol_from_instrument_key,
     instrument_key_filter,
+    normalize_symbol_key,
     sort_display_symbols,
     symbol_aliases,
     symbol_value_filter,
@@ -49,7 +50,7 @@ DEFAULT_SIGNAL_MIN_SCORE = 63.0
 VIX_MAX_THRESHOLD = 20.0   # Skip signals when VIX is too high (options too expensive)
 VIX_MIN_THRESHOLD = 11.0   # Skip signals when VIX is too low (premiums too small)
 DEFAULT_MAX_SIGNALS_PER_DAY = 2
-DEFAULT_CHART_RANGE = "all"
+DEFAULT_CHART_RANGE = "1d"
 SIGNAL_ENTRY_START = time(9, 45)
 SIGNAL_ENTRY_END = time(15, 0)
 OPTION_STOP_LOSS_PCT = 0.35
@@ -57,10 +58,20 @@ OPTION_TARGET_PCT = 0.60
 OPTION_TRAIL_TRIGGER_PCT = 0.50
 OPTION_TRAIL_STOP_PCT = 0.20
 CHART_RANGE_SPECS: dict[str, dict[str, Any]] = {
+    "1d": {"label": "1D", "interval": "1minute", "days": 1, "supports_live": True},
+    "5d": {"label": "5D", "interval": "5minute", "days": 5, "supports_live": False},
+    "1m": {"label": "1M", "interval": "15minute", "days": 31, "supports_live": False},
+    "6m": {"label": "6M", "interval": "1hour", "days": 183, "supports_live": False},
+    "1y": {"label": "1Y", "interval": "day", "years": 1, "supports_live": False},
     "all": {"label": "ALL", "interval": "1minute", "all_history": True, "supports_live": True},
 }
 CHART_INTERVAL_OPTIONS: list[dict[str, str]] = [
     {"key": "1m", "label": "1m", "interval": "1minute"},
+    {"key": "5m", "label": "5m", "interval": "5minute"},
+    {"key": "15m", "label": "15m", "interval": "15minute"},
+    {"key": "30m", "label": "30m", "interval": "30minute"},
+    {"key": "1h", "label": "1h", "interval": "1hour"},
+    {"key": "1d", "label": "1D", "interval": "day"},
 ]
 CHART_CONFIRMATION_RULES: dict[str, tuple[str, str]] = {
     "1minute": ("3min", "5min"),
@@ -79,6 +90,7 @@ CHART_MARKER_LIMITS: dict[str, int] = {
     "2y": 30,
 }
 _CHART_PAYLOAD_CACHE: dict[tuple[str, str, str, str | None], dict[str, Any]] = {}
+_INSTRUMENT_RESOLVE_CACHE: dict[str, tuple[str, str]] = {}
 
 # ---------------------------------------------------------------------------
 # Market regime constants
@@ -309,6 +321,24 @@ def list_symbols(db: Session, settings: Settings | None = None) -> list[str]:
 def resolve_instrument_key(db: Session, symbol: str) -> tuple[str, str]:
     if "|" in symbol:
         return symbol, canonical_symbol_name(display_symbol_from_instrument_key(symbol))
+    cache_key = normalize_symbol_key(symbol)
+    cached = _INSTRUMENT_RESOLVE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    aliases = symbol_aliases(symbol)
+    exact_candidates: list[str] = []
+    for alias in aliases:
+        exact_candidates.extend((alias, f"NSE_INDEX|{alias}", f"BSE_INDEX|{alias}"))
+    key = db.scalar(
+        select(RawCandle.instrument_key)
+        .where(RawCandle.instrument_key.in_(exact_candidates))
+        .order_by(RawCandle.instrument_key.asc())
+        .limit(1)
+    )
+    if key is not None:
+        resolved = (str(key), canonical_symbol_name(display_symbol_from_instrument_key(str(key))))
+        _INSTRUMENT_RESOLVE_CACHE[cache_key] = resolved
+        return resolved
     key = db.scalar(
         select(RawCandle.instrument_key)
         .where(instrument_key_filter(RawCandle.instrument_key, symbol))
@@ -318,7 +348,9 @@ def resolve_instrument_key(db: Session, symbol: str) -> tuple[str, str]:
     if key is None:
         raise ValueError(f"Symbol not found in candles: {symbol}")
     display = canonical_symbol_name(display_symbol_from_instrument_key(str(key)))
-    return str(key), display
+    resolved = (str(key), display)
+    _INSTRUMENT_RESOLVE_CACHE[cache_key] = resolved
+    return resolved
 
 
 def _load_recent_candles(
@@ -633,27 +665,27 @@ def _latest_complete_intraday_ts(
     instrument_key: str,
     min_rows: int = 50,
 ) -> datetime | None:
-    row = (
-        db.execute(
-            select(
-                func.date(RawCandle.ts).label("session_date"),
-                func.max(RawCandle.ts).label("latest_ts"),
-                func.count().label("row_count"),
+    rows = db.scalars(
+        select(RawCandle.ts)
+        .where(
+            and_(
+                RawCandle.instrument_key == instrument_key,
+                RawCandle.interval == LIVE_INTERVAL,
             )
-            .where(
-                and_(
-                    RawCandle.instrument_key == instrument_key,
-                    RawCandle.interval == LIVE_INTERVAL,
-                )
-            )
-            .group_by(func.date(RawCandle.ts))
-            .having(func.count() >= max(1, int(min_rows)))
-            .order_by(func.date(RawCandle.ts).desc())
-            .limit(1)
         )
-        .first()
-    )
-    return _ensure_ist(row.latest_ts) if row is not None else None
+        .order_by(RawCandle.ts.desc())
+        .limit(max(500, int(min_rows) * 20))
+    ).all()
+    sessions: dict[date, list[datetime]] = {}
+    for raw_ts in rows:
+        ts = _ensure_ist(raw_ts)
+        if ts is None:
+            continue
+        session_rows = sessions.setdefault(ts.date(), [])
+        session_rows.append(ts)
+        if len(session_rows) >= max(1, int(min_rows)):
+            return max(session_rows)
+    return None
 
 
 def _pandas_rule_for_interval(interval: str) -> str:
@@ -742,7 +774,7 @@ def load_candles_payload(
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
-    normalized_interval = LIVE_INTERVAL
+    normalized_interval = normalize_interval(interval)
     max_candle_limit = max(5000, int(getattr(settings, "chart_max_candle_limit", 500_000)))
     limit_value = max(1, min(int(limit or 500), max_candle_limit))
     before_ts = _parse_chart_boundary(before)
@@ -763,6 +795,7 @@ def load_candles_payload(
         return redis_cached
 
     source_limit = limit_value
+    query_interval = normalized_interval
     query = select(
         RawCandle.ts,
         RawCandle.open,
@@ -770,7 +803,7 @@ def load_candles_payload(
         RawCandle.low,
         RawCandle.close,
         RawCandle.volume,
-    ).where(and_(RawCandle.instrument_key == instrument_key, RawCandle.interval == LIVE_INTERVAL))
+    ).where(and_(RawCandle.instrument_key == instrument_key, RawCandle.interval == query_interval))
     if before_ts is not None:
         query = query.where(RawCandle.ts < before_ts).order_by(RawCandle.ts.desc()).limit(source_limit)
         raw_rows = list(reversed(db.execute(query).all()))
@@ -792,6 +825,37 @@ def load_candles_payload(
         }
         for row in raw_rows
     ]
+    if not base_rows and normalized_interval != LIVE_INTERVAL:
+        base_query = select(
+            RawCandle.ts,
+            RawCandle.open,
+            RawCandle.high,
+            RawCandle.low,
+            RawCandle.close,
+            RawCandle.volume,
+        ).where(and_(RawCandle.instrument_key == instrument_key, RawCandle.interval == LIVE_INTERVAL))
+        if before_ts is not None:
+            base_query = base_query.where(RawCandle.ts < before_ts).order_by(RawCandle.ts.desc()).limit(source_limit)
+            raw_rows = list(reversed(db.execute(base_query).all()))
+        elif after_ts is not None:
+            base_query = base_query.where(RawCandle.ts > after_ts).order_by(RawCandle.ts.asc()).limit(source_limit)
+            raw_rows = db.execute(base_query).all()
+        else:
+            base_query = base_query.order_by(RawCandle.ts.desc()).limit(source_limit)
+            raw_rows = list(reversed(db.execute(base_query).all()))
+        raw_frame = _candles_to_frame(raw_rows)
+        resampled = _resample_chart_frame(raw_frame, _pandas_rule_for_interval(normalized_interval))
+        base_rows = [
+            {
+                "ts": _ensure_ist(row.ts.to_pydatetime() if hasattr(row.ts, "to_pydatetime") else row.ts),
+                "open": float(row.open),
+                "high": float(row.high),
+                "low": float(row.low),
+                "close": float(row.close),
+                "volume": float(row.volume or 0.0),
+            }
+            for row in resampled.itertuples(index=False)
+        ]
     rows = base_rows
 
     if before_ts is not None:
@@ -882,6 +946,185 @@ def _earliest_chart_source_ts(
     return None
 
 
+def _build_pine_chart_overlay(
+    rows: list[dict[str, Any]],
+    *,
+    interval: str,
+    settings: Settings,
+    range_key: str,
+) -> dict[str, Any]:
+    if not DIRECTIONAL_SIGNALS_ENABLED:
+        return {"markers": [], "levels": []}
+    if len(rows) < 60:
+        return {"markers": [], "levels": []}
+    if len(rows) > 20_000:
+        rows = rows[-20_000:]
+
+    frame = pd.DataFrame(rows)
+    frame["ts"] = pd.to_datetime(frame["ts"])
+    if frame.empty or len(frame) < 60:
+        return {"markers": [], "levels": []}
+
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    volume = pd.to_numeric(frame.get("volume", 0.0), errors="coerce").fillna(0.0)
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    def rma(series: pd.Series, length: int) -> pd.Series:
+        return series.ewm(alpha=1.0 / max(1, int(length)), adjust=False).mean()
+
+    sensitivity = float(getattr(settings, "pine_signal_sensitivity", 1.0))
+    atr_length = int(getattr(settings, "pine_signal_atr_length", 10))
+    atr_multiplier = float(getattr(settings, "pine_signal_atr_multiplier", 7.0))
+    use_trend_filter = bool(getattr(settings, "pine_signal_use_trend_filter", True))
+    ma_length = int(getattr(settings, "pine_signal_ma_length", 20))
+    use_volume_filter = bool(getattr(settings, "pine_signal_use_volume_filter", False))
+    volume_threshold = float(getattr(settings, "pine_signal_volume_threshold", 1.1))
+    show_signals = bool(getattr(settings, "pine_signal_show_signals", True))
+    signal_cooldown = int(getattr(settings, "pine_signal_cooldown_bars", 2))
+    atr_risk = int(getattr(settings, "pine_signal_atr_risk", 3))
+    risk_atr_length = int(getattr(settings, "pine_signal_risk_atr_length", 14))
+    percent_stop = float(getattr(settings, "pine_signal_percent_stop", 1.0))
+
+    if not show_signals:
+        return {"markers": [], "levels": []}
+
+    atr = rma(true_range, atr_length)
+    factor = sensitivity * atr_multiplier
+    upper_band = close + (factor * atr)
+    lower_band = close - (factor * atr)
+
+    supertrend_line: list[float | None] = [None] * len(frame)
+    direction: list[int | None] = [None] * len(frame)
+    final_upper: list[float | None] = [None] * len(frame)
+    final_lower: list[float | None] = [None] * len(frame)
+
+    for index in range(len(frame)):
+        if pd.isna(atr.iloc[index]) or pd.isna(close.iloc[index]):
+            continue
+
+        current_upper = float(upper_band.iloc[index])
+        current_lower = float(lower_band.iloc[index])
+        if index > 0:
+            prev_lower = final_lower[index - 1]
+            prev_upper = final_upper[index - 1]
+            prev_close_value = close.iloc[index - 1]
+            if prev_lower is not None and not pd.isna(prev_close_value):
+                current_lower = current_lower if current_lower > prev_lower or float(prev_close_value) < prev_lower else prev_lower
+            if prev_upper is not None and not pd.isna(prev_close_value):
+                current_upper = current_upper if current_upper < prev_upper or float(prev_close_value) > prev_upper else prev_upper
+
+        final_upper[index] = current_upper
+        final_lower[index] = current_lower
+
+        if index == 0 or pd.isna(atr.iloc[index - 1]) or supertrend_line[index - 1] is None:
+            current_direction = 1
+        elif supertrend_line[index - 1] == final_upper[index - 1]:
+            current_direction = -1 if float(close.iloc[index]) > current_upper else 1
+        else:
+            current_direction = 1 if float(close.iloc[index]) < current_lower else -1
+
+        direction[index] = current_direction
+        supertrend_line[index] = current_lower if current_direction == -1 else current_upper
+
+    ma = close.rolling(max(1, ma_length), min_periods=max(1, ma_length)).mean()
+    volume_ma = volume.rolling(20, min_periods=20).mean()
+    atr_14 = rma(true_range, 14)
+    atr_band = rma(true_range, risk_atr_length) * atr_risk
+
+    markers: list[dict[str, Any]] = []
+    levels: list[dict[str, Any]] = []
+    last_signal_bar = 0
+    last_signal_type = ""
+
+    for index in range(1, len(frame)):
+        line = supertrend_line[index]
+        prev_line = supertrend_line[index - 1]
+        if line is None or prev_line is None:
+            continue
+
+        current_close = close.iloc[index]
+        previous_close = close.iloc[index - 1]
+        if pd.isna(current_close) or pd.isna(previous_close):
+            continue
+
+        raw_buy = float(previous_close) <= float(prev_line) and float(current_close) > float(line)
+        raw_sell = float(previous_close) >= float(prev_line) and float(current_close) < float(line)
+
+        trend_up = bool(not pd.isna(ma.iloc[index]) and float(current_close) > float(ma.iloc[index]))
+        trend_down = bool(not pd.isna(ma.iloc[index]) and float(current_close) < float(ma.iloc[index]))
+        trend_filter_buy = (not use_trend_filter) or trend_up
+        trend_filter_sell = (not use_trend_filter) or trend_down
+
+        volume_ok = True
+        if use_volume_filter:
+            volume_ok = bool(
+                not pd.isna(volume_ma.iloc[index])
+                and float(volume.iloc[index]) > (float(volume_ma.iloc[index]) * volume_threshold)
+            )
+
+        momentum_ok = bool(
+            not pd.isna(atr_14.iloc[index])
+            and abs(float(current_close) - float(previous_close)) > (float(atr_14.iloc[index]) * 0.1)
+        )
+
+        buy_signal = raw_buy and trend_filter_buy and volume_ok and momentum_ok
+        sell_signal = raw_sell and trend_filter_sell and volume_ok and momentum_ok
+
+        bars_since_last = index - last_signal_bar
+        cooldown_ok = bars_since_last >= signal_cooldown
+        final_buy = buy_signal and cooldown_ok and last_signal_type != "BUY"
+        final_sell = sell_signal and cooldown_ok and last_signal_type != "SELL"
+        if not final_buy and not final_sell:
+            continue
+
+        action = "BUY" if final_buy else "SELL"
+        last_signal_bar = index
+        last_signal_type = action
+        ts = _ensure_ist(frame.iloc[index]["ts"].to_pydatetime() if hasattr(frame.iloc[index]["ts"], "to_pydatetime") else frame.iloc[index]["ts"])
+        if ts is None:
+            continue
+
+        if percent_stop != 0 and not pd.isna(atr_band.iloc[index]):
+            entry = float(current_close)
+            stop = (
+                float(low.iloc[index]) - float(atr_band.iloc[index])
+                if action == "BUY"
+                else float(high.iloc[index]) + float(atr_band.iloc[index])
+            )
+            risk_unit = entry - stop
+            levels = [
+                {"label": "ENTRY", "price": round(entry, 4), "color": "#f8fafc", "lineStyle": "solid"},
+                {"label": "STOP LOSS", "price": round(stop, 4), "color": "#ef4444", "lineStyle": "solid"},
+                {"label": "TP 1", "price": round(entry + (risk_unit * 1), 4), "color": "#22c55e", "lineStyle": "dotted"},
+                {"label": "TP 2", "price": round(entry + (risk_unit * 2), 4), "color": "#22c55e", "lineStyle": "dotted"},
+                {"label": "TP 3", "price": round(entry + (risk_unit * 3), 4), "color": "#22c55e", "lineStyle": "dotted"},
+                {"label": "TP 4", "price": round(entry + (risk_unit * 4), 4), "color": "#22c55e", "lineStyle": "dotted"},
+                {"label": "TP 5", "price": round(entry + (risk_unit * 5), 4), "color": "#22c55e", "lineStyle": "dotted"},
+            ]
+
+        markers.append(
+            {
+                "time": ts.isoformat(),
+                "position": "belowBar" if action == "BUY" else "aboveBar",
+                "color": "#16a34a" if action == "BUY" else "#dc2626",
+                "shape": "arrowUp" if action == "BUY" else "arrowDown",
+                "text": action,
+            }
+        )
+    limit = max(1, CHART_MARKER_LIMITS.get(range_key, 40))
+    return {"markers": markers[-limit:], "levels": levels}
+
+
 def _build_chart_markers(
     rows: list[dict[str, Any]],
     *,
@@ -889,166 +1132,34 @@ def _build_chart_markers(
     settings: Settings,
     range_key: str,
 ) -> list[dict[str, Any]]:
-    if not DIRECTIONAL_SIGNALS_ENABLED:
-        return []
-    if len(rows) < 60:
-        return []
-    if len(rows) > 20_000:
-        return []
+    return list(_build_pine_chart_overlay(rows, interval=interval, settings=settings, range_key=range_key)["markers"])
 
-    frame = pd.DataFrame(rows)
-    frame["ts"] = pd.to_datetime(frame["ts"])
-    features = build_price_features(frame.copy())
-    if features.empty or len(features) < 60:
-        return []
 
-    confirm_rule_3, confirm_rule_5 = CHART_CONFIRMATION_RULES.get(interval, ("3min", "5min"))
-    confirm_3 = _timeframe_confirmation_columns(build_price_features(_resample_chart_frame(frame, confirm_rule_3)))
-    confirm_5 = _timeframe_confirmation_columns(build_price_features(_resample_chart_frame(frame, confirm_rule_5)))
-    merged = pd.merge_asof(features.sort_values("ts"), confirm_3.sort_values("ts"), on="ts", direction="backward")
-    merged = pd.merge_asof(
-        merged.sort_values("ts"),
-        confirm_5.sort_values("ts"),
-        on="ts",
-        direction="backward",
-        suffixes=("_3", "_5"),
+def _latest_fresh_pine_marker(
+    rows: list[RawCandle],
+    *,
+    settings: Settings,
+    candle_ts: datetime,
+) -> dict[str, Any] | None:
+    overlay_rows = _candles_to_frame(rows).to_dict("records")
+    overlay = _build_pine_chart_overlay(
+        overlay_rows,
+        interval=SIGNAL_INTERVAL,
+        settings=settings,
+        range_key="all",
     )
-    for column in ("confirm_buy_3", "confirm_sell_3", "confirm_buy_5", "confirm_sell_5"):
-        if column in merged:
-            normalized = pd.array(merged[column], dtype="boolean")
-            merged[column] = pd.Series(normalized, index=merged.index).fillna(False).astype(bool)
-        else:
-            merged[column] = pd.Series(False, index=merged.index, dtype=bool)
-
-    cooldown_minutes = max(1, int(getattr(settings, "signal_cooldown_minutes", DEFAULT_SIGNAL_COOLDOWN_MINUTES)))
-    max_signals_today = max(1, int(getattr(settings, "signal_max_per_day", DEFAULT_MAX_SIGNALS_PER_DAY)))
-    min_score = float(getattr(settings, "signal_min_score", DEFAULT_SIGNAL_MIN_SCORE))
-    entry_start = _parse_time(settings.entry_window_start, time(9, 20))
-    entry_end = _parse_time(settings.entry_window_end, time(12, 30))
-
-    markers: list[dict[str, Any]] = []
-    signal_count_by_day: dict[date, int] = {}
-    last_signal_ts: datetime | None = None
-
-    for index in range(1, len(merged)):
-        row = merged.iloc[index]
-        prev = merged.iloc[index - 1]
-        ts = _ensure_ist(row.get("ts").to_pydatetime() if hasattr(row.get("ts"), "to_pydatetime") else row.get("ts"))
-        if ts is None:
-            continue
-
-        close = _to_float(row.get("close")) or 0.0
-        high = _to_float(row.get("high")) or close
-        low = _to_float(row.get("low")) or close
-        prev_high = _to_float(prev.get("high")) or high
-        prev_low = _to_float(prev.get("low")) or low
-        ema_21 = _to_float(row.get("ema_21")) or close
-        ema_50 = _to_float(row.get("ema_50")) or close
-        ema_21_slope = _to_float(row.get("ema_21_slope_3")) or 0.0
-        vwap = _to_float(row.get("vwap")) or close
-        rsi = _to_float(row.get("rsi_14")) or 50.0
-        macd_hist = _to_float(row.get("macd_hist")) or 0.0
-        macd_delta = _to_float(row.get("macd_hist_delta_1")) or 0.0
-        body_pct_range = _to_float(row.get("body_pct_range")) or 0.0
-        volume_ratio = _to_float(row.get("volume_ratio_20")) or 1.0
-        breakout_high = _to_float(row.get("breakout_high_20"))
-        breakout_low = _to_float(row.get("breakout_low_20"))
-        atr = max(1e-9, _to_float(row.get("atr_14")) or 0.0)
-        candle_range = max(0.0, high - low)
-
-        trend_buy = close > ema_21 > ema_50 and close >= vwap and ema_21_slope > 0.0
-        trend_sell = close < ema_21 < ema_50 and close <= vwap and ema_21_slope < 0.0
-        breakout_buy = bool(
-            breakout_high is not None
-            and close > breakout_high
-            and body_pct_range >= 0.52
-            and candle_range >= atr * 0.75
-        )
-        breakout_sell = bool(
-            breakout_low is not None
-            and close < breakout_low
-            and body_pct_range >= 0.52
-            and candle_range >= atr * 0.75
-        )
-        continuation_buy = bool(
-            trend_buy
-            and close > prev_high
-            and 56.0 <= rsi <= 72.0
-            and macd_hist > 0.0
-            and macd_delta >= -0.02
-        )
-        continuation_sell = bool(
-            trend_sell
-            and close < prev_low
-            and 28.0 <= rsi <= 44.0
-            and macd_hist < 0.0
-            and macd_delta <= 0.02
-        )
-        range_bound = abs(close - ema_21) <= max(atr * 0.25, close * 0.0008) and 45.0 <= rsi <= 55.0
-
-        score_buy = 0.0
-        score_sell = 0.0
-        if trend_buy:
-            score_buy += 28.0
-        if trend_sell:
-            score_sell += 28.0
-        if breakout_buy:
-            score_buy += 28.0
-        elif continuation_buy:
-            score_buy += 22.0
-        if breakout_sell:
-            score_sell += 28.0
-        elif continuation_sell:
-            score_sell += 22.0
-        if bool(row.get("confirm_buy_3")):
-            score_buy += 18.0
-        if bool(row.get("confirm_sell_3")):
-            score_sell += 18.0
-        if bool(row.get("confirm_buy_5")):
-            score_buy += 14.0
-        if bool(row.get("confirm_sell_5")):
-            score_sell += 14.0
-        if rsi >= 58.0 and macd_hist > 0.0:
-            score_buy += 8.0
-        if rsi <= 42.0 and macd_hist < 0.0:
-            score_sell += 8.0
-        if volume_ratio >= 1.10 or candle_range >= atr:
-            score_buy += 4.0
-            score_sell += 4.0
-
-        action = "BUY" if score_buy >= score_sell else "SELL"
-        score = score_buy if action == "BUY" else score_sell
-        if range_bound or score < min_score:
-            continue
-        if action == "BUY" and not (breakout_buy or continuation_buy):
-            continue
-        if action == "SELL" and not (breakout_sell or continuation_sell):
-            continue
-        if interval != "day":
-            now_time = ts.timetz().replace(tzinfo=None)
-            if not (entry_start <= now_time <= entry_end):
-                continue
-        if last_signal_ts is not None:
-            elapsed = int((ts - last_signal_ts).total_seconds())
-            if elapsed < cooldown_minutes * 60:
-                continue
-        day_count = signal_count_by_day.get(ts.date(), 0)
-        if day_count >= max_signals_today:
-            continue
-
-        signal_count_by_day[ts.date()] = day_count + 1
-        last_signal_ts = ts
-        markers.append(
-            {
-                "time": ts.isoformat(),
-                "position": "belowBar" if action == "BUY" else "aboveBar",
-                "color": "#00b16a" if action == "BUY" else "#ff6b35",
-                "shape": "arrowUp" if action == "BUY" else "arrowDown",
-                "text": f"{action} {int(score)}",
-            }
-        )
-    limit = max(1, CHART_MARKER_LIMITS.get(range_key, 40))
-    return markers[-limit:]
+    markers = list(overlay.get("markers") or [])
+    if not markers:
+        return None
+    latest_marker = markers[-1]
+    marker_ts = _parse_iso_datetime(latest_marker.get("time"))
+    candle_ts = _ensure_ist(candle_ts)
+    if marker_ts is None or candle_ts is None:
+        return None
+    if marker_ts.replace(second=0, microsecond=0) != candle_ts.replace(second=0, microsecond=0):
+        return None
+    action = str(latest_marker.get("text") or "").upper()
+    return latest_marker if action in {"BUY", "SELL"} else None
 
 
 def _closed_signal_rows(rows: list[RawCandle], now: datetime) -> list[RawCandle]:
@@ -1161,19 +1272,30 @@ def _signal_guardrails(
     return int(count or 0), cooldown_seconds
 
 
-def _strategy_window_status(now: datetime) -> tuple[str, bool]:
+def _parse_time_setting(value: str, fallback: time) -> time:
+    try:
+        hour, minute = str(value).split(":", 1)
+        return time(int(hour), int(minute))
+    except Exception:
+        return fallback
+
+
+def _strategy_window_status(now: datetime, settings: Settings | None = None) -> tuple[str, bool]:
+    settings = settings or get_settings()
+    entry_start = _parse_time_setting(getattr(settings, "entry_window_start", ""), SIGNAL_ENTRY_START)
+    entry_end = _parse_time_setting(getattr(settings, "entry_window_end", ""), SIGNAL_ENTRY_END)
     now_time = now.timetz().replace(tzinfo=None)
-    if now_time < time(9, 45):
+    if now_time < entry_start:
         return "avoid_open", False
+    if now_time > entry_end:
+        if now_time < time(15, 30):
+            return "avoid_close", False
+        return "market_closed", False
     if now_time < time(11, 30):
         return "best_window", True
     if now_time < time(13, 30):
         return "slow_window", True
-    if now_time < time(15, 0):
-        return "good_window", True
-    if now_time < time(15, 30):
-        return "avoid_close", False
-    return "market_closed", False
+    return "good_window", True
 
 
 def _resample_five_minute_signal_frame(rows: list[RawCandle]) -> pd.DataFrame:
@@ -1343,20 +1465,30 @@ def build_technical_signal(
     volume_avg = _to_float(row.get("volume_sma_20")) or 0.0
     volume_ratio = _to_float(row.get("volume_ratio_20")) or 1.0
     candle_ts = _parse_iso_datetime(row.get("ts")) or now
-    window_status, entry_window_open = _strategy_window_status(now)
+    window_status, entry_window_open = _strategy_window_status(now, settings)
     vix_level, vix_ma, vix_ratio = get_vix_context(db)
-    vix_too_high = bool(vix_level is not None and vix_level > VIX_MAX_THRESHOLD)
-    vix_too_low = bool(vix_level is not None and vix_level < VIX_MIN_THRESHOLD)
+    vix_min = float(getattr(settings, "signal_vix_min", VIX_MIN_THRESHOLD))
+    vix_max = float(getattr(settings, "signal_vix_max", VIX_MAX_THRESHOLD))
+    vix_too_high = bool(vix_level is not None and vix_level > vix_max)
+    vix_too_low = bool(vix_level is not None and vix_level < vix_min)
 
     ema_cross_up = prev_ema_9 <= prev_ema_21 and ema_9 > ema_21
     ema_cross_down = prev_ema_9 >= prev_ema_21 and ema_9 < ema_21
     bullish_candle = close > open_
     bearish_candle = close < open_
-    rsi_buy_ok = rsi > 55.0
-    rsi_sell_ok = rsi < 45.0
-    volume_ok = volume > volume_avg if volume_avg > 0 else volume_ratio > 1.0
+    rsi_buy_min = float(getattr(settings, "signal_rsi_buy_min", 52.0))
+    rsi_sell_max = float(getattr(settings, "signal_rsi_sell_max", 48.0))
+    rsi_buy_ok = rsi >= rsi_buy_min
+    rsi_sell_ok = rsi <= rsi_sell_max
+    min_volume_ratio = float(getattr(settings, "signal_min_volume_ratio", 1.15))
+    volume_ok = (volume_ratio >= min_volume_ratio) if volume_avg > 0 else volume_ratio >= min_volume_ratio
     break_prev_high = close > prev_high
     break_prev_low = close < prev_low
+    require_volume = bool(getattr(settings, "signal_require_volume_confirmation", True))
+    require_breakout = bool(getattr(settings, "signal_require_breakout", True))
+    atr_min = float(getattr(settings, "signal_atr_min_points", 4.0))
+    atr_max = float(getattr(settings, "signal_atr_max_points", 80.0))
+    atr_ok = atr_min <= atr <= atr_max
 
     # ============================================================================
     # 1-MINUTE SIGNAL SYSTEM
@@ -1380,9 +1512,9 @@ def build_technical_signal(
         score_sell += 20.0
 
     # 3. RSI MOMENTUM (20 points) - More permissive range
-    if rsi > 45:  # Lowered from 55 (was too strict)
+    if rsi_buy_ok:
         score_buy += 20.0
-    if rsi < 55:  # Raised from 45 (was too strict)
+    if rsi_sell_ok:
         score_sell += 20.0
 
     # 4. CANDLE DIRECTION (10 points) - Bonus, not required
@@ -1402,13 +1534,29 @@ def build_technical_signal(
     if break_prev_low:
         score_sell += 10.0
 
-    # THRESHOLD: Need 50+ points out of 110 possible (45% instead of 100%)
-    buy_ready = score_buy >= 50.0
-    sell_ready = score_sell >= 50.0
+    min_score = float(getattr(settings, "signal_min_score", DEFAULT_SIGNAL_MIN_SCORE))
+    buy_ready = (
+        score_buy >= min_score
+        and rsi_buy_ok
+        and (volume_ok or not require_volume)
+        and (break_prev_high or not require_breakout)
+        and atr_ok
+    )
+    sell_ready = (
+        score_sell >= min_score
+        and rsi_sell_ok
+        and (volume_ok or not require_volume)
+        and (break_prev_low or not require_breakout)
+        and atr_ok
+    )
 
-    raw_action = "BUY" if buy_ready else ("SELL" if sell_ready else "HOLD")
-    raw_score = max(score_buy, score_sell)
-    bias = "BUY" if score_buy > score_sell else ("SELL" if score_sell > score_buy else "NEUTRAL")
+    fresh_marker = _latest_fresh_pine_marker(rows, settings=settings, candle_ts=candle_ts)
+    pine_action = str((fresh_marker or {}).get("text") or "").upper()
+    raw_action = pine_action if pine_action in {"BUY", "SELL"} else "HOLD"
+    raw_score = 100.0 if raw_action in {"BUY", "SELL"} else max(score_buy, score_sell)
+    bias = raw_action if raw_action in {"BUY", "SELL"} else (
+        "BUY" if score_buy > score_sell else ("SELL" if score_sell > score_buy else "NEUTRAL")
+    )
 
     max_signals_today = max(1, int(getattr(settings, "signal_max_per_day", DEFAULT_MAX_SIGNALS_PER_DAY)))
     signal_count_today, cooldown_seconds = _signal_guardrails(
@@ -1421,29 +1569,30 @@ def build_technical_signal(
     if raw_action == "BUY":
         reasons.extend(
             [
-                "EMA 9 crossed above EMA 21 on the 1-minute candle.",
-                "RSI is above 45 (bullish momentum).",
-                "Signal candle is bullish.",
-                "Volume confirmation present." if volume_ok else "Volume below average.",
+                "Fresh graph BUY marker printed on the latest closed 1-minute candle.",
+                "Execution is using the same Pine-style signal logic as the chart markers.",
+                "Trend filter passed for the graph marker.",
+                "Momentum filter passed for the graph marker.",
             ]
         )
     elif raw_action == "SELL":
         reasons.extend(
             [
-                "EMA 9 crossed below EMA 21 on the 1-minute candle.",
-                "RSI is below 55 (bearish momentum).",
-                "Signal candle is bearish.",
-                "Volume confirmation present." if volume_ok else "Volume below average.",
+                "Fresh graph SELL marker printed on the latest closed 1-minute candle.",
+                "Execution is using the same Pine-style signal logic as the chart markers.",
+                "Trend filter passed for the graph marker.",
+                "Momentum filter passed for the graph marker.",
             ]
         )
     else:
+        reasons.append("No fresh graph BUY/SELL marker on the latest closed 1-minute candle.")
         if not ema_cross_up and not ema_cross_down:
             reasons.append("EMA 9 and EMA 21 have not crossed on the 1-minute candle.")
-        if 45.0 <= rsi <= 55.0:
-            reasons.append("RSI is in the 45-55 neutral zone.")
-        elif rsi > 55.0:
+        if rsi_sell_max < rsi < rsi_buy_min:
+            reasons.append(f"RSI is in the {rsi_sell_max:.0f}-{rsi_buy_min:.0f} neutral zone.")
+        elif rsi >= rsi_buy_min:
             reasons.append("Momentum is bullish but EMA alignment is missing.")
-        elif rsi < 45.0:
+        elif rsi <= rsi_sell_max:
             reasons.append("Momentum is bearish but EMA alignment is missing.")
         if not volume_ok:
             reasons.append("Signal candle volume is not above the 20-bar average.")
@@ -1451,16 +1600,32 @@ def build_technical_signal(
             reasons.append("Bullish candle did not close above the previous candle high.")
         if bearish_candle and not break_prev_low:
             reasons.append("Bearish candle did not close below the previous candle low.")
+        if raw_score >= min_score:
+            if require_volume and not volume_ok:
+                reasons.append(f"Volume ratio {volume_ratio:.2f} is below required {min_volume_ratio:.2f}.")
+            if require_breakout and score_buy >= score_sell and not break_prev_high:
+                reasons.append("BUY setup rejected because close did not break previous high.")
+            if require_breakout and score_sell > score_buy and not break_prev_low:
+                reasons.append("SELL setup rejected because close did not break previous low.")
+            if score_buy >= score_sell and not rsi_buy_ok:
+                reasons.append(f"BUY setup rejected because RSI is below {rsi_buy_min:.0f}.")
+            if score_sell > score_buy and not rsi_sell_ok:
+                reasons.append(f"SELL setup rejected because RSI is above {rsi_sell_max:.0f}.")
 
     if not entry_window_open:
         action = "HOLD"
-        reasons.append("Outside the strategy entry window of 09:45-15:00 IST.")
+        reasons.append(
+            f"Outside the strategy entry window of {settings.entry_window_start}-{settings.entry_window_end} IST."
+        )
+    if not atr_ok:
+        action = "HOLD"
+        reasons.append(f"ATR {atr:.2f} is outside the configured {atr_min:.2f}-{atr_max:.2f} point range.")
     if vix_too_high:
         action = "HOLD"
-        reasons.append("VIX is too high for fresh option entries.")
+        reasons.append(f"VIX is above {vix_max:.1f}; skipping fresh option entries.")
     if vix_too_low:
         action = "HOLD"
-        reasons.append("VIX is too low for option premium expansion.")
+        reasons.append(f"VIX is below {vix_min:.1f}; skipping weak premium expansion.")
     if cooldown_seconds > 0:
         action = "HOLD"
         reasons.append(f"Cooldown active — {cooldown_seconds}s remaining.")
@@ -1503,26 +1668,42 @@ def build_technical_signal(
         "volume": round(volume, 2),
         "volume_sma_20": round(volume_avg, 2),
         "volume_ratio_20": round(volume_ratio, 2),
+        "min_volume_ratio": round(min_volume_ratio, 2),
         "ema_cross_up": ema_cross_up,
         "ema_cross_down": ema_cross_down,
         "rsi_buy_ok": rsi_buy_ok,
         "rsi_sell_ok": rsi_sell_ok,
+        "rsi_buy_min": rsi_buy_min,
+        "rsi_sell_max": rsi_sell_max,
         "bullish_candle": bullish_candle,
         "bearish_candle": bearish_candle,
         "volume_ok": volume_ok,
+        "volume_required": require_volume,
         "break_prev_high": break_prev_high,
         "break_prev_low": break_prev_low,
+        "breakout_required": require_breakout,
+        "atr_ok": atr_ok,
+        "atr_min_points": atr_min,
+        "atr_max_points": atr_max,
         "buy_ready": buy_ready,
         "sell_ready": sell_ready,
+        "pine_signal": raw_action if raw_action in {"BUY", "SELL"} else "OFF",
+        "pine_marker_time": fresh_marker.get("time") if fresh_marker else None,
+        "pine_marker_text": fresh_marker.get("text") if fresh_marker else None,
+        "execution_signal_source": "graph_marker_pine_overlay",
+        "fresh_graph_marker": bool(fresh_marker),
+        "signal_min_score": min_score,
         "score_buy": round(score_buy, 1),
         "score_sell": round(score_sell, 1),
-        "entry_window_start": SIGNAL_ENTRY_START.strftime("%H:%M"),
-        "entry_window_end": SIGNAL_ENTRY_END.strftime("%H:%M"),
+        "entry_window_start": settings.entry_window_start,
+        "entry_window_end": settings.entry_window_end,
         "window_status": window_status,
         "entry_window_open": entry_window_open,
         "vix_level": vix_level,
         "vix_ma": vix_ma,
         "vix_ratio": round(vix_ratio, 3) if vix_ratio is not None else None,
+        "vix_min": vix_min,
+        "vix_max": vix_max,
         "vix_too_high": vix_too_high,
         "vix_too_low": vix_too_low,
         "option_preference": "ATM_ONLY",
@@ -1572,7 +1753,7 @@ def log_signal_decision(
         ml_signal=signal.bias,
         ml_confidence=signal.confidence,
         ml_expected_move=_to_float(signal.details.get("expected_move_points")),
-        pine_signal="OFF",
+        pine_signal=str(signal.details.get("pine_signal") or "OFF"),
         pine_age_seconds=None,
         ai_score=0.0,
         news_sentiment=0.0,
@@ -1854,6 +2035,23 @@ def compute_paper_portfolio_metrics(
     }
 
 
+def _position_execution_mode(row: ExecutionPosition) -> str:
+    metadata = row.metadata_json or {}
+    return str(metadata.get("execution_mode") or "paper").lower()
+
+
+def _position_matches_mode(row: ExecutionPosition, mode: str) -> bool:
+    return _position_execution_mode(row) == str(mode or "paper").lower()
+
+
+def _order_matches_mode(row: ExecutionOrder, mode: str) -> bool:
+    broker_name = str(row.broker_name or "paper").lower()
+    normalized_mode = str(mode or "paper").lower()
+    if normalized_mode == "live":
+        return broker_name != "paper"
+    return broker_name == "paper"
+
+
 def _compute_iv_rank(
     db: Session,
     symbol: str,
@@ -1994,12 +2192,14 @@ def build_option_selection(
         quote_source = str(quote.get("source") or chain_source)
         premium_min = float(settings.execution_premium_min)
         premium_max = float(settings.execution_premium_max)
-        if entry_price is not None and premium_min <= entry_price <= premium_max:
-            stop_loss = round(entry_price * (1.0 - OPTION_STOP_LOSS_PCT), 2)
-            take_profit = round(entry_price * (1.0 + OPTION_TARGET_PCT), 2)
+        liquidity_failures = _option_liquidity_failures(quote, settings)
+        if entry_price is not None and premium_min <= entry_price <= premium_max and not liquidity_failures:
+            risk_plan = _option_risk_plan(float(entry_price), signal, settings)
+            stop_loss = risk_plan["stop_loss"]
+            take_profit = risk_plan["take_profit"]
             iv_rank = _compute_iv_rank(db, context.symbol, _strike_get_atm_iv(chain_rows, requested_atm))
-            trail_trigger = round(entry_price * (1.0 + OPTION_TRAIL_TRIGGER_PCT), 2)
-            trailing_stop_loss = round(entry_price * (1.0 - OPTION_TRAIL_STOP_PCT), 2)
+            trail_trigger = risk_plan["trail_trigger_price"]
+            trailing_stop_loss = risk_plan["trailing_stop_loss"]
             signal_payload = {
                 "action": "BUY",
                 "option_type": option_type,
@@ -2015,15 +2215,28 @@ def build_option_selection(
                 "trail_trigger_price": float(trail_trigger),
                 "trailing_stop_loss": float(trailing_stop_loss),
                 "trail_step_pct": float(OPTION_TRAIL_STOP_PCT),
+                "stop_loss_pct": float(risk_plan["stop_pct"]),
+                "target_pct": float(risk_plan["target_pct"]),
+                "liquidity": {
+                    "volume": _to_float(quote.get("volume")),
+                    "oi": _to_float(quote.get("oi")),
+                    "bid": _to_float(quote.get("bid")),
+                    "ask": _to_float(quote.get("ask")),
+                    "max_spread_pct": float(getattr(settings, "option_max_spread_pct", 0.08)),
+                },
                 "reasons": [
                     f"{signal.action} signal mapped to ATM {option_type}.",
                     f"Requested ATM strike {requested_atm:.0f}, selected nearest available strike {selected_strike:.0f}.",
-                    f"Option risk plan: fixed SL {int(OPTION_STOP_LOSS_PCT * 100)}% below entry, target {int(OPTION_TARGET_PCT * 100)}% above entry.",
-                    f"TSL activates at {int(OPTION_TRAIL_TRIGGER_PCT * 100)}% profit and trails peak by {int(OPTION_TRAIL_STOP_PCT * 100)}%.",
+                    f"ATR-aware option risk: SL {risk_plan['stop_pct']:.0%} below entry, target {risk_plan['target_pct']:.0%} above entry.",
+                    f"Liquidity passed: volume/OI/spread within configured limits.",
                     f"Quote source: {quote_source}.",
                 ],
             }
         else:
+            reasons = []
+            if entry_price is None or not (premium_min <= float(entry_price or 0.0) <= premium_max):
+                reasons.append("ATM option premium is missing or outside the configured premium range.")
+            reasons.extend(liquidity_failures)
             signal_payload = {
                 "action": "HOLD",
                 "option_type": None,
@@ -2032,7 +2245,7 @@ def build_option_selection(
                 "stop_loss": None,
                 "take_profit": None,
                 "confidence": signal.confidence,
-                "reasons": ["ATM option premium is missing or outside the configured premium range."],
+                "reasons": reasons[:6],
             }
     else:
         signal_payload = {
@@ -2055,6 +2268,50 @@ def build_option_selection(
         chain_rows=chain_rows,
         signal=signal_payload,
     )
+
+
+def _option_liquidity_failures(quote: dict[str, Any], settings: Settings) -> list[str]:
+    failures: list[str] = []
+    entry_price = _to_float(quote.get("ltp")) or 0.0
+    volume = _to_float(quote.get("volume")) or 0.0
+    oi = _to_float(quote.get("oi")) or 0.0
+    bid = _to_float(quote.get("bid"))
+    ask = _to_float(quote.get("ask"))
+    min_volume = float(getattr(settings, "option_min_volume", 500.0))
+    min_oi = float(getattr(settings, "option_min_oi", 1000.0))
+    max_spread_pct = float(getattr(settings, "option_max_spread_pct", 0.08))
+    if not quote.get("instrument_key"):
+        failures.append("Selected option has no broker instrument key.")
+    if volume < min_volume:
+        failures.append(f"Option volume {volume:.0f} is below minimum {min_volume:.0f}.")
+    if oi < min_oi:
+        failures.append(f"Option OI {oi:.0f} is below minimum {min_oi:.0f}.")
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        failures.append("Option bid/ask is missing.")
+    else:
+        spread_pct = abs(ask - bid) / max(entry_price, 1.0)
+        if spread_pct > max_spread_pct:
+            failures.append(f"Option spread {spread_pct:.1%} exceeds maximum {max_spread_pct:.1%}.")
+    return failures
+
+
+def _option_risk_plan(entry_price: float, signal: TechnicalSignal, settings: Settings) -> dict[str, float]:
+    if not bool(getattr(settings, "enhanced_risk_enabled", True)):
+        stop_pct = float(OPTION_STOP_LOSS_PCT)
+        target_pct = float(OPTION_TARGET_PCT)
+    else:
+        atr_points = float(signal.details.get("atr_14") or 0.0)
+        atr_risk_points = atr_points * float(getattr(settings, "atr_sl_multiplier", 1.8))
+        stop_pct = _clip(atr_risk_points / 100.0, 0.18, 0.35)
+        target_pct = _clip(stop_pct * float(getattr(settings, "target_rr_ratio", 2.2)), 0.30, 0.80)
+    return {
+        "stop_pct": float(stop_pct),
+        "target_pct": float(target_pct),
+        "stop_loss": round(entry_price * (1.0 - stop_pct), 2),
+        "take_profit": round(entry_price * (1.0 + target_pct), 2),
+        "trail_trigger_price": round(entry_price * (1.0 + max(0.30, target_pct * 0.6)), 2),
+        "trailing_stop_loss": round(entry_price * (1.0 - min(0.20, stop_pct * 0.65)), 2),
+    }
 
 
 def latest_option_premium(
@@ -2394,12 +2651,15 @@ def build_chart_payload(
     settings = settings or get_settings()
     current = _ensure_ist(now) or datetime.now(IST_ZONE)
     instrument_key, display_symbol = resolve_instrument_key(db, symbol)
-    range_name = DEFAULT_CHART_RANGE
-    selected_interval = None
+    range_name = str(range_key or DEFAULT_CHART_RANGE).strip().lower()
+    selected_interval = normalize_interval(interval_key) if interval_key else None
     plan = _chart_range_plan(range_name, current, interval_override=selected_interval)
     source_interval = str(plan["interval"])
     latest_source_ts = _latest_chart_source_ts(db, instrument_key=instrument_key, interval=source_interval)
     earliest_source_ts = _earliest_chart_source_ts(db, instrument_key=instrument_key, interval=source_interval)
+    if source_interval != LIVE_INTERVAL and latest_source_ts is None:
+        latest_source_ts = _latest_chart_source_ts(db, instrument_key=instrument_key, interval=LIVE_INTERVAL)
+        earliest_source_ts = _earliest_chart_source_ts(db, instrument_key=instrument_key, interval=LIVE_INTERVAL)
     if range_name != "all" and (source_interval.endswith("minute") or source_interval.endswith("hour")):
         latest_source_ts = _latest_complete_intraday_ts(db, instrument_key=instrument_key) or latest_source_ts
     cache_key = (
@@ -2411,7 +2671,7 @@ def build_chart_payload(
     cached = _CHART_PAYLOAD_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    redis_key = f"chart:v3:{instrument_key}:{range_name}:{source_interval}:{cache_key[3] or 'none'}"
+    redis_key = f"chart:v7:{instrument_key}:{range_name}:{source_interval}:{cache_key[3] or 'none'}"
     redis_cached = redis_get_json(redis_key)
     if redis_cached is not None:
         _CHART_PAYLOAD_CACHE[cache_key] = redis_cached
@@ -2445,6 +2705,14 @@ def build_chart_payload(
         ]
 
     candles = serialize_rows(rows)
+    pine_overlay = _build_pine_chart_overlay(
+        rows,
+        interval=str(plan["interval"]),
+        settings=settings,
+        range_key=str(plan["key"]),
+    )
+    markers = list(pine_overlay.get("markers") or [])
+    pine_levels = list(pine_overlay.get("levels") or [])
     interval_payloads: dict[str, Any] = {}
     payload = {
         "symbol": display_symbol,
@@ -2462,7 +2730,8 @@ def build_chart_payload(
         "oldest": candles[0]["x"] if candles else None,
         "latest": candles[-1]["x"] if candles else None,
         "interval_payloads": interval_payloads,
-        "markers": [],
+        "markers": markers,
+        "pine_levels": pine_levels,
         "available_ranges": _chart_range_options(),
         "available_intervals": _chart_interval_options(),
     }
@@ -2650,6 +2919,7 @@ def build_live_snapshot(
     )
 
     open_positions = refresh_open_positions_snapshot(db, settings=settings)
+    runtime_mode = get_runtime_trading_mode(db, settings=settings)
     recent_trades = (
         db.execute(
             select(ExecutionPosition)
@@ -2660,21 +2930,23 @@ def build_live_snapshot(
                 )
             )
             .order_by(ExecutionPosition.closed_at.desc())
-            .limit(15)
+            .limit(100)
         )
         .scalars()
         .all()
     )
+    recent_trades = [row for row in recent_trades if _position_matches_mode(row, runtime_mode)][:15]
     recent_orders = (
         db.execute(
             select(ExecutionOrder)
             .where(symbol_value_filter(ExecutionOrder.symbol, context.symbol))
             .order_by(ExecutionOrder.created_at.desc())
-            .limit(20)
+            .limit(100)
         )
         .scalars()
         .all()
     )
+    recent_orders = [row for row in recent_orders if _order_matches_mode(row, runtime_mode)][:20]
     current_bar = context.current_bar
     change = float(current_bar["close"] or 0.0) - float(current_bar["open"] or 0.0)
     change_pct = (change / float(current_bar["open"] or 1.0)) * 100.0
@@ -2683,7 +2955,7 @@ def build_live_snapshot(
         "symbol": context.symbol,
         "instrument_key": context.instrument_key,
         "execution": {
-            "mode": get_runtime_trading_mode(db, settings=settings),
+            "mode": runtime_mode,
             "max_daily_loss_amount": round(float(settings.execution_capital) * float(getattr(settings, "execution_max_daily_loss_pct", 0.05)), 2),
         },
         "price": {

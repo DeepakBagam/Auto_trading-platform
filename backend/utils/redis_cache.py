@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import socket
 from typing import Any
+from urllib.parse import urlparse
 
 from backend.utils.config import get_settings
 from backend.utils.logger import get_logger
@@ -22,10 +24,18 @@ def _client() -> Any | None:
     if _CLIENT is not None:
         return _CLIENT
     try:
+        redis_url = str(getattr(settings, "redis_url", "redis://127.0.0.1:6379/0"))
+        parsed = urlparse(redis_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 6379
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.02)
+            if probe.connect_ex((host, port)) != 0:
+                raise ConnectionError(f"Redis is not reachable at {host}:{port}")
         import redis
 
         client = redis.Redis.from_url(
-            str(getattr(settings, "redis_url", "redis://127.0.0.1:6379/0")),
+            redis_url,
             socket_connect_timeout=0.03,
             socket_timeout=0.05,
             decode_responses=True,

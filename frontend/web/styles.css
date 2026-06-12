@@ -1661,15 +1661,15 @@ tbody tr:hover {
 }
 
 .chart-modal {
-  width: min(960px, calc(100vw - 28px));
-  max-height: calc(100vh - 28px);
+  width: min(1500px, calc(100vw - 18px));
+  max-height: calc(100vh - 18px);
   overflow: auto;
-  padding: 14px;
+  padding: 12px;
 }
 
 .mini-chart-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 2.4fr) minmax(320px, 0.9fr);
   gap: 8px;
 }
 
@@ -1684,6 +1684,14 @@ tbody tr:hover {
 .mini-chart {
   width: 100%;
   height: 220px;
+}
+
+.strike-chart-canvas {
+  width: 100%;
+  height: clamp(520px, 68vh, 760px);
+  min-height: 520px;
+  border: 1px solid var(--line-soft);
+  background: var(--surface);
 }
 
 @media (max-width: 1280px) {
@@ -1722,6 +1730,14 @@ tbody tr:hover {
   .settings-card,
   .settings-wide {
     grid-column: span 6;
+  }
+
+  .mini-chart-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .strike-chart-canvas {
+    height: 520px;
   }
 }
 

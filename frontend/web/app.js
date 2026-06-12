@@ -14,13 +14,24 @@ const NAV_ITEMS = [
 ];
 const IST_TIME_ZONE = "Asia/Kolkata";
 const CHART_RANGE_FALLBACK = [
+  { key: "1d", label: "1D", interval: "1minute", supports_live: true },
+  { key: "5d", label: "5D", interval: "5minute", supports_live: false },
+  { key: "1m", label: "1M", interval: "15minute", supports_live: false },
+  { key: "6m", label: "6M", interval: "1hour", supports_live: false },
+  { key: "1y", label: "1Y", interval: "day", supports_live: false },
   { key: "all", label: "ALL", interval: "1minute", supports_live: true },
 ];
 const CHART_INTERVAL_FALLBACK = [
   { key: "1m", label: "1m", interval: "1minute" },
+  { key: "5m", label: "5m", interval: "5minute" },
+  { key: "15m", label: "15m", interval: "15minute" },
+  { key: "30m", label: "30m", interval: "30minute" },
+  { key: "1h", label: "1h", interval: "1hour" },
+  { key: "1d", label: "1D", interval: "day" },
 ];
 const LIVE_CHART_WINDOW_LIMITS = {
-  "all": 500000,
+  "1d": 1200,
+  "all": 5000,
 };
 const PREFETCH_CHART_RANGES = [];
 const PREFETCH_SYMBOLS = [];
@@ -303,7 +314,7 @@ function formatChartCrosshairTime(timeValue) {
 }
 
 function chartCacheKey(symbol, rangeKey, intervalKey) {
-  return `${symbol || ""}::all::1minute`;
+  return `${symbol || ""}::${rangeKey || "1d"}::${intervalKey || "1minute"}`;
 }
 
 function normalizeChartCandles(rows = []) {
@@ -342,10 +353,15 @@ function mergeChartCandleRows(existing = [], incoming = [], mode = "append") {
 }
 
 function chartEndpointParams(symbol, rangeKey, intervalKey) {
-  return `symbol=${encodeURIComponent(symbol)}&range=all&interval=1minute`;
+  const params = new URLSearchParams({
+    symbol: symbol || "",
+    range: rangeKey || "1d",
+    interval: intervalKey || "1minute",
+  });
+  return params.toString();
 }
 
-function chartFromCandlePayload(payload, rangeKey = "all") {
+function chartFromCandlePayload(payload, rangeKey = "1d") {
   const oldest = payload?.oldest || payload?.candles?.[0]?.x || null;
   const latest = payload?.latest || payload?.candles?.[payload?.candles?.length - 1]?.x || null;
   return {
@@ -364,16 +380,14 @@ function chartFromCandlePayload(payload, rangeKey = "all") {
     oldest,
     latest,
     markers: [],
+    pine_levels: [],
     available_ranges: CHART_RANGE_FALLBACK,
     available_intervals: payload?.available_intervals || CHART_INTERVAL_FALLBACK,
   };
 }
 
 async function fetchChartPayload(symbol, rangeKey, intervalKey) {
-  const payload = await apiChartFetch(
-    `/api/candles?symbol=${encodeURIComponent(symbol)}&interval=1minute&limit=${FULL_HISTORY_CANDLE_LIMIT}`,
-  );
-  return chartFromCandlePayload(payload, "all");
+  return apiChartFetch(`/api/live/chart?${chartEndpointParams(symbol, rangeKey, intervalKey)}`);
 }
 
 function stableId(prefix) {
@@ -405,7 +419,7 @@ function defaultLayout() {
   return {
     selectedSymbol: "",
     timeframe: "1minute",
-    range: "all",
+    range: "1d",
     theme: getInitialTheme(),
     recentSearches: [],
     favorites: [],
@@ -438,7 +452,7 @@ function mergeLayout(raw) {
 
 function defaultSymbolState() {
   return {
-    range: "all",
+    range: "1d",
     interval: "1minute",
     indicators: DEFAULT_INDICATORS,
     drawings: [],
@@ -839,6 +853,7 @@ function ChartPanel({
   const emaFastRef = useRef(null);
   const emaSlowRef = useRef(null);
   const vwapRef = useRef(null);
+  const pinePriceLinesRef = useRef([]);
   const indicatorSeriesRef = useRef(new Map());
   const drawingDraftRef = useRef(null);
   const dragDrawingRef = useRef(null);
@@ -860,15 +875,34 @@ function ChartPanel({
   const deferredChart = useDeferredValue(chart);
   const ranges = deferredChart?.available_ranges || CHART_RANGE_FALLBACK;
   const intervals = deferredChart?.available_intervals || CHART_INTERVAL_FALLBACK;
-  const rangeKeys = new Set(["all", "1d", "5d", "1mo", "6mo", "1y", "2y", "5y"]);
+  const rangeKeys = new Set(["all", "1d", "5d", "1m", "1mo", "6m", "6mo", "1y", "2y", "5y"]);
   const primaryRanges = ranges.filter((item) => rangeKeys.has(item.key));
   const candles = React.useMemo(() => normalizeChartCandles(deferredChart?.candles || []), [deferredChart]);
   const replayIndex = replay?.active ? Math.max(0, Math.min(Number(replay.index || 0), candles.length - 1)) : null;
   const displayCandles = replay?.active ? candles.slice(0, replayIndex + 1) : candles;
+  const signalMarkers = React.useMemo(() => (deferredChart?.markers || [])
+    .map((row) => ({
+      time: parseChartTime(row.time),
+      position: row.position || "inBar",
+      color: row.color,
+      shape: row.shape || "circle",
+      text: row.text || "",
+    }))
+    .filter((row) => Number.isFinite(row.time)), [deferredChart]);
+  const pineLevels = React.useMemo(() => (deferredChart?.pine_levels || [])
+    .map((row) => ({
+      label: row.label || "",
+      price: Number(row.price),
+      color: row.color || "#adc6ff",
+      lineStyle: row.lineStyle || "solid",
+    }))
+    .filter((row) => row.label && Number.isFinite(row.price)), [deferredChart]);
   const activeCandle = crosshair || displayCandles[displayCandles.length - 1] || null;
   const activeTone = activeCandle && activeCandle.close >= activeCandle.open ? "positive" : "negative";
   const activeRangeLabel = ranges.find((item) => item.key === rangeKey)?.label || deferredChart?.label || "Chart";
   const activeIntervalLabel = intervals.find((item) => item.interval === intervalKey || item.key === intervalKey)?.label || intervalKey || "-";
+  const latestSignal = signalMarkers[signalMarkers.length - 1] || null;
+  const signalFocusKeyRef = useRef("");
 
   useEffect(() => {
     if (!hostRef.current || !LightweightCharts) {
@@ -977,6 +1011,7 @@ function ChartPanel({
       emaFastRef.current = null;
       emaSlowRef.current = null;
       vwapRef.current = null;
+      pinePriceLinesRef.current = [];
       indicatorSeriesRef.current.clear();
     };
   }, [theme]);
@@ -1140,19 +1175,51 @@ function ChartPanel({
       }
     }
     viewportStateRef.current = { key: currentKey, firstTime, lastTime, candleCount: displayCandles.length };
-    const markers = (deferredChart.markers || [])
-      .map((row) => ({
-        time: parseChartTime(row.time),
-        position: row.position || "inBar",
-        color: row.color,
-        shape: row.shape || "circle",
-        text: row.text || "",
-      }))
-      .filter((row) => Number.isFinite(row.time));
     if (typeof seriesRef.current.setMarkers === "function") {
-      seriesRef.current.setMarkers(markers);
+      seriesRef.current.setMarkers(signalMarkers);
     }
-  }, [deferredChart, displayCandles, indicators, theme, chartType, showVolume, showEma, showVwap]);
+    if (typeof seriesRef.current.removePriceLine === "function") {
+      pinePriceLinesRef.current.forEach((line) => {
+        try {
+          seriesRef.current.removePriceLine(line);
+        } catch (_error) {
+          // Ignore stale line handles after chart re-creation.
+        }
+      });
+    }
+    pinePriceLinesRef.current = [];
+    if (typeof seriesRef.current.createPriceLine === "function" && pineLevels.length) {
+      const lineStyle = (value) => {
+        const normalized = String(value || "").toLowerCase();
+        if (normalized === "dashed") {
+          return LightweightCharts.LineStyle.Dashed;
+        }
+        if (normalized === "dotted") {
+          return LightweightCharts.LineStyle.Dotted;
+        }
+        return LightweightCharts.LineStyle.Solid;
+      };
+      pinePriceLinesRef.current = pineLevels.map((level) => seriesRef.current.createPriceLine({
+        price: level.price,
+        color: level.color,
+        lineWidth: level.label === "ENTRY" || level.label === "STOP LOSS" ? 2 : 1,
+        lineStyle: lineStyle(level.lineStyle),
+        axisLabelVisible: true,
+        title: `${level.label} ${formatMoney(level.price)}`,
+      }));
+    }
+    if (signalMarkers.length && displayCandles.length) {
+      const last = signalMarkers[signalMarkers.length - 1];
+      const focusKey = `${deferredChart.instrument_key || symbol}:${last.time}:${signalMarkers.length}`;
+      if (signalFocusKeyRef.current !== focusKey) {
+        signalFocusKeyRef.current = focusKey;
+        chartRef.current?.timeScale?.().setVisibleRange?.({
+          from: Math.max(displayCandles[0].time, last.time - (4 * 60 * 60)),
+          to: last.time + (45 * 60),
+        });
+      }
+    }
+  }, [deferredChart, displayCandles, indicators, theme, chartType, showVolume, showEma, showVwap, signalMarkers, symbol, pineLevels]);
 
   function fitChart() {
     chartRef.current?.timeScale?.().fitContent();
@@ -1160,6 +1227,16 @@ function ChartPanel({
 
   function goLive() {
     chartRef.current?.timeScale?.().scrollToRealTime();
+  }
+
+  function goLatestSignal() {
+    if (!latestSignal || !displayCandles.length) {
+      return;
+    }
+    chartRef.current?.timeScale?.().setVisibleRange?.({
+      from: Math.max(displayCandles[0].time, latestSignal.time - (4 * 60 * 60)),
+      to: latestSignal.time + (45 * 60),
+    });
   }
 
   function zoomChart(multiplier) {
@@ -1540,6 +1617,9 @@ function ChartPanel({
           <span className={`chip ${deferredChart?.supports_live ? "emphasis" : ""}`}>
             {deferredChart?.supports_live ? "Live WS" : "Archive"}
           </span>
+          <span className={`chip ${signalMarkers.length ? "emphasis" : ""}`}>
+            Signals: {formatCount(signalMarkers.length)}
+          </span>
         </div>
       </div>
       <div className="chart-terminal-toolbar simple-chart-toolbar">
@@ -1556,12 +1636,17 @@ function ChartPanel({
           <button type="button" className="tool-button" onClick={toggleFullscreen} title="Fullscreen">
             <span className="material-symbols-outlined" aria-hidden="true">fullscreen</span>
           </button>
+          <button type="button" className="tool-button" onClick={goLatestSignal} title="Go to latest signal" disabled={!latestSignal}>
+            <span className="material-symbols-outlined" aria-hidden="true">flag</span>
+          </button>
         </div>
       </div>
       <div className="status-row chart-status-row">
         <span className="chip">From {formatDate(deferredChart?.start_date)}</span>
         <span className="chip">To {formatDate(deferredChart?.end_date)}</span>
         <span className="chip">Loaded {formatCount(displayCandles?.length)} candles</span>
+        <span className={`chip ${signalMarkers.length ? "emphasis" : ""}`}>Signals {formatCount(signalMarkers.length)}</span>
+        <span className={`chip ${pineLevels.length ? "emphasis" : ""}`}>Levels {formatCount(pineLevels.length)}</span>
         {deferredChart?.available_count ? <span className="chip">Available {formatCount(deferredChart.available_count)}</span> : null}
         {deferredChart?.available_count && displayCandles.length >= deferredChart.available_count
           ? <span className="chip emphasis">Full history loaded</span>
@@ -1757,7 +1842,7 @@ function StrategySignalCard({ signal, option }) {
   );
 }
 
-function EngineStrikeCard({ signal, option }) {
+function EngineStrikeCard({ signal, option, onInspect }) {
   const optionSignal = option?.signal || {};
   const action = optionSignal.action || signal?.action || "HOLD";
   const tone = actionTone(action);
@@ -1765,13 +1850,37 @@ function EngineStrikeCard({ signal, option }) {
   const optionType = optionSignal.option_type || "-";
   const readiness = entryReadiness(signal, optionSignal);
   const rr = riskReward(optionSignal.entry_price, optionSignal.stop_loss, optionSignal.take_profit);
+  const canInspect = (
+    onInspect
+    && option?.expiry_date
+    && optionSignal.strike
+    && optionSignal.option_type
+  );
   return (
     <article className={`panel engine-strike-card ${tone}`}>
       <div className="panel-head">
         <div>
           <h2>Engine Strike</h2>
         </div>
-        <span className={`tag ${readiness.tone}`}>{readiness.label}</span>
+        <div className="inline-actions">
+          <span className={`tag ${readiness.tone}`}>{readiness.label}</span>
+          <button
+            type="button"
+            className="line-button"
+            disabled={!canInspect}
+            onClick={() => canInspect && onInspect({
+              symbol: option?.symbol || signal?.symbol || "Nifty 50",
+              expiry: option.expiry_date,
+              strike: optionSignal.strike,
+              optionType: optionSignal.option_type,
+              entryPrice: optionSignal.entry_price,
+              stopLoss: optionSignal.stop_loss,
+              takeProfit: optionSignal.take_profit,
+            })}
+          >
+            View Chart
+          </button>
+        </div>
       </div>
 
       <div className="engine-strike-main">
@@ -2670,6 +2779,7 @@ function ContractChartModal({ contract, onClose }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const optionChartRef = useRef(null);
 
   useEffect(() => {
     if (!contract) {
@@ -2685,9 +2795,23 @@ function ContractChartModal({ contract, onClose }) {
           expiry: contract.expiry,
           strike: String(contract.strike),
           option_type: contract.optionType,
+          limit: "5000",
+          include_previous: "true",
+          refresh: "false",
+          include_live: "false",
         });
         if (contract.positionId) {
           params.append("position_id", String(contract.positionId));
+        }
+        if (contract.entryPrice) {
+          params.append("entry_price", String(contract.entryPrice));
+          params.append("ltp", String(contract.entryPrice));
+        }
+        if (contract.stopLoss) {
+          params.append("stop_loss", String(contract.stopLoss));
+        }
+        if (contract.takeProfit) {
+          params.append("take_profit", String(contract.takeProfit));
         }
         const payload = await apiFetch(`/api/live/option-contract-chart?${params.toString()}`);
         if (active) {
@@ -2709,20 +2833,116 @@ function ContractChartModal({ contract, onClose }) {
     };
   }, [contract]);
 
+  useEffect(() => {
+    if (!optionChartRef.current || !LightweightCharts || !data?.chart?.candles?.length) {
+      return undefined;
+    }
+    const chartTheme = CHART_THEMES.dark;
+    const instance = LightweightCharts.createChart(optionChartRef.current, {
+      width: optionChartRef.current.clientWidth,
+      height: 300,
+      layout: { background: { color: chartTheme.background }, textColor: chartTheme.text },
+      rightPriceScale: { borderColor: chartTheme.border },
+      timeScale: {
+        borderColor: chartTheme.border,
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 6,
+        barSpacing: 8,
+      },
+      grid: {
+        vertLines: { color: chartTheme.grid },
+        horzLines: { color: chartTheme.grid },
+      },
+      localization: {
+        locale: "en-IN",
+        timeFormatter: formatChartCrosshairTime,
+      },
+    });
+    const candleSeries = instance.addCandlestickSeries({
+      upColor: chartTheme.up,
+      downColor: chartTheme.down,
+      borderUpColor: chartTheme.up,
+      borderDownColor: chartTheme.down,
+      wickUpColor: chartTheme.up,
+      wickDownColor: chartTheme.down,
+    });
+    const candles = normalizeChartCandles(data.chart.candles);
+    candleSeries.setData(candles);
+    const markers = (data.chart.markers || [])
+      .map((row) => ({
+        time: parseChartTime(row.time),
+        position: row.position || "inBar",
+        color: row.color,
+        shape: row.shape || "circle",
+        text: row.text || "",
+      }))
+      .filter((row) => Number.isFinite(row.time));
+    if (typeof candleSeries.setMarkers === "function") {
+      candleSeries.setMarkers(markers);
+    }
+    (data.levels || []).forEach((level) => {
+      const price = Number(level.price);
+      if (Number.isFinite(price) && typeof candleSeries.createPriceLine === "function") {
+        candleSeries.createPriceLine({
+          price,
+          color: level.color || "#adc6ff",
+          lineWidth: 1,
+          lineStyle: level.label === "ENTRY" ? LightweightCharts.LineStyle.Solid : LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: level.label,
+        });
+      }
+    });
+    const previousCandles = normalizeChartCandles(data?.previous?.chart?.candles || []);
+    if (previousCandles.length) {
+      const previousSeries = instance.addLineSeries({
+        color: "#f7c948",
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      previousSeries.setData(previousCandles.map((row) => ({ time: row.time, value: row.close })));
+    }
+    instance.timeScale().fitContent();
+    const resize = () => {
+      if (optionChartRef.current) {
+        instance.applyOptions({ width: optionChartRef.current.clientWidth });
+      }
+    };
+    window.addEventListener("resize", resize);
+    return () => {
+      window.removeEventListener("resize", resize);
+      instance.remove();
+    };
+  }, [data]);
+
   if (!contract) {
     return null;
   }
 
   const points = data?.points || [];
-  const ltps = points.map((item) => Number(item.ltp)).filter((value) => Number.isFinite(value));
+  const previousPoints = data?.previous?.points || [];
+  const ltps = [...points, ...previousPoints].map((item) => Number(item.ltp)).filter((value) => Number.isFinite(value));
   const pnls = points.map((item) => Number(item.pnl)).filter((value) => Number.isFinite(value));
   const min = Math.min(...(ltps.length ? ltps : [0]));
   const max = Math.max(...(ltps.length ? ltps : [1]));
+  const levels = (data?.levels || []).filter((item) => Number.isFinite(Number(item.price)));
+  const levelPrices = levels.map((item) => Number(item.price));
+  const priceMin = Math.min(min, ...(levelPrices.length ? levelPrices : [min]));
+  const priceMax = Math.max(max, ...(levelPrices.length ? levelPrices : [max]));
   const pnlMin = Math.min(...(pnls.length ? pnls : [0]));
   const pnlMax = Math.max(...(pnls.length ? pnls : [1]));
+  const priceY = (value) => 180 - (((Number(value) - priceMin) / ((priceMax - priceMin) || 1)) * 150);
   const linePath = points.map((point, index) => {
     const x = points.length <= 1 ? 10 : (index / (points.length - 1)) * 560 + 10;
-    const y = 180 - (((Number(point.ltp) - min) / ((max - min) || 1)) * 150);
+    const y = priceY(point.ltp);
+    return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+  }).join(" ");
+  const previousLinePath = previousPoints.map((point, index) => {
+    const x = previousPoints.length <= 1 ? 10 : (index / (previousPoints.length - 1)) * 560 + 10;
+    const y = priceY(point.ltp);
     return `${index === 0 ? "M" : "L"} ${x} ${y}`;
   }).join(" ");
   const pnlPath = points.map((point, index) => {
@@ -2745,18 +2965,22 @@ function ContractChartModal({ contract, onClose }) {
         {error ? <div className="error-banner">{error}</div> : null}
         {!loading && !error ? (
           <>
+            {data && data.history_available === false ? (
+              <div className="error-banner">No stored intraday history yet for this contract; showing current snapshot premium.</div>
+            ) : null}
             <div className="info-grid">
               <div className="info-tile"><span>Entry</span><strong>{formatMoney(data?.entry_price)}</strong></div>
+              <div className="info-tile"><span>Stop Loss</span><strong>{formatMoney(data?.stop_loss)}</strong></div>
+              <div className="info-tile"><span>Target</span><strong>{formatMoney(data?.take_profit)}</strong></div>
               <div className="info-tile"><span>Last</span><strong>{formatMoney(points[points.length - 1]?.ltp)}</strong></div>
               <div className="info-tile"><span>P&amp;L</span><strong>{formatSignedMoney(points[points.length - 1]?.pnl)}</strong></div>
               <div className="info-tile"><span>Points</span><strong>{formatCount(points.length)}</strong></div>
+              <div className="info-tile"><span>Previous</span><strong>{formatCount(previousPoints.length)}</strong></div>
             </div>
             <div className="mini-chart-grid">
               <div>
-                <div className="mini-chart-title">LTP</div>
-                <svg viewBox="0 0 580 200" className="mini-chart">
-                  <path d={linePath} fill="none" stroke="#adc6ff" strokeWidth="3" />
-                </svg>
+                <div className="mini-chart-title">Strike Chart</div>
+                <div ref={optionChartRef} className="strike-chart-canvas" />
               </div>
               <div>
                 <div className="mini-chart-title">P&amp;L</div>
@@ -2783,7 +3007,7 @@ function App() {
   const [tradeHistory, setTradeHistory] = useState(null);
   const [strategyPerformance, setStrategyPerformance] = useState([]);
   const [contractModal, setContractModal] = useState(null);
-  const [chartRange, setChartRange] = useState("all");
+  const [chartRange, setChartRange] = useState("1d");
   const [chartInterval, setChartInterval] = useState("1minute");
   const [chartLoading, setChartLoading] = useState(false);
   const [chartHistoryLoading, setChartHistoryLoading] = useState(false);
@@ -2833,17 +3057,17 @@ function App() {
     setLayout((current) => upsertSymbolState({
       ...current,
       selectedSymbol: symbol,
-      range: "all",
+      range: chartRange,
       timeframe: "1minute",
       theme,
-    }, symbol, { range: "all", interval: "1minute" }));
+    }, symbol, { range: chartRange, interval: chartInterval }));
   }, [symbol, chartRange, chartInterval, theme]);
 
   useEffect(() => {
     if (!symbol) {
       return;
     }
-    setChartRange("all");
+    setChartRange("1d");
     setChartInterval("1minute");
   }, [symbol]);
 
@@ -3087,7 +3311,7 @@ function App() {
     async function loadChart() {
       try {
         const cacheKey = chartCacheKey(symbol, chartRange, chartInterval);
-        const hasVisibleChart = Boolean(chartCacheRef.current.get(cacheKey) || chart || snapshot?.chart);
+        const hasVisibleChart = Boolean(chartCacheRef.current.get(cacheKey));
         setChartLoading(!hasVisibleChart);
         const data = await fetchChartPayload(symbol, chartRange, chartInterval);
         if (!active) {
@@ -3111,6 +3335,8 @@ function App() {
     if (cached) {
       setChart(cached);
       setChartLoading(false);
+    } else {
+      setChart(null);
     }
 
     loadChart();
@@ -3661,17 +3887,23 @@ function App() {
   }
 
   function changeChartRange(nextRange) {
-    const cached = chartCacheRef.current.get(chartCacheKey(symbol, "all", "1minute"));
+    const ranges = selectedChart?.available_ranges || CHART_RANGE_FALLBACK;
+    const selectedRange = ranges.find((item) => item.key === nextRange) || null;
+    const nextInterval = selectedRange?.interval || chartInterval || "1minute";
+    const cached = chartCacheRef.current.get(chartCacheKey(symbol, nextRange, nextInterval));
     if (cached) {
       setChart(cached);
     }
-    setChartRange("all");
-    setChartInterval("1minute");
+    setChartRange(nextRange);
+    setChartInterval(nextInterval);
   }
 
   function changeChartInterval(nextInterval) {
-    setChartRange("all");
-    setChartInterval("1minute");
+    const cached = chartCacheRef.current.get(chartCacheKey(symbol, chartRange, nextInterval));
+    if (cached) {
+      setChart(cached);
+    }
+    setChartInterval(nextInterval);
   }
 
   return (
@@ -3909,7 +4141,7 @@ function App() {
 
             <section className="signal-board">
               <StrategySignalCard signal={signal} option={option} />
-              <EngineStrikeCard signal={signal} option={option} />
+              <EngineStrikeCard signal={signal} option={option} onInspect={setContractModal} />
               <LiveDataCard
                 price={price}
                 freshness={freshness}
@@ -3952,7 +4184,7 @@ function App() {
 
         {activeView === "optionchain" ? (
           <section>
-            <OptionChain symbol={symbol} />
+            <OptionChain symbol={symbol} onInspectContract={setContractModal} />
           </section>
         ) : null}
 

@@ -7,8 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSock
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from backend.data_layer.collectors.upstox_collector import UpstoxCollector
 from backend.db.connection import SessionLocal, get_db_session
+from backend.data_layer.collectors.upstox_option_chain import UpstoxOptionChainCollector
 from backend.execution_engine.live_service import (
+    _build_pine_chart_overlay,
     build_chart_payload,
     build_live_price_update,
     build_live_snapshot,
@@ -24,7 +27,7 @@ from backend.execution_engine.live_service import (
 from backend.db.models import ExecutionPosition, OptionQuote
 from sqlalchemy import and_, select
 from backend.utils.app_state import apply_runtime_execution_settings, get_runtime_trading_mode
-from backend.utils.config import get_settings
+from backend.utils.config import get_settings, read_runtime_upstox_access_token
 from backend.utils.symbols import symbol_value_filter
 
 router = APIRouter(prefix="/api/live", tags=["live"])
@@ -124,7 +127,7 @@ def option_chain(
 ) -> dict:
     """Get full option chain with live premiums, Greeks, OI, and volume."""
     from datetime import date as date_type, datetime
-    from backend.prediction_engine.options_engine import (
+    from backend.execution_engine.options_engine import (
         build_chain_rows,
         nearest_strike,
         next_weekly_expiries,
@@ -138,17 +141,27 @@ def option_chain(
         target = symbol or default_symbol(settings)
         context = load_market_context(db, symbol=target, settings=settings)
         
-        # Resolve expiry
+        # Resolve expiry from broker contracts when available. SENSEX weekly
+        # expiries do not always match the generic fallback calendar.
         underlying_key = resolve_underlying_key(db, target, settings=settings)
+        available_expiries = []
+        if underlying_key and settings.has_market_data_access:
+            try:
+                available_expiries = UpstoxOptionChainCollector(settings).list_expiries(underlying_key, max_items=6)
+            except Exception:
+                available_expiries = []
+        if not available_expiries:
+            available_expiries = next_weekly_expiries(symbol=target, count=6)
+
         if expiry:
             try:
                 expiry_date = date_type.fromisoformat(expiry)
             except ValueError:
-                expiry_date = next_weekly_expiries(symbol=target, count=1)[0]
+                expiry_date = available_expiries[0]
+            if expiry_date not in available_expiries:
+                expiry_date = available_expiries[0]
         else:
-            expiry_date = next_weekly_expiries(symbol=target, count=1)[0]
-        
-        available_expiries = next_weekly_expiries(symbol=target, count=6)
+            expiry_date = available_expiries[0]
         
         if refresh:
             _maybe_refresh_option_chain(
@@ -276,6 +289,14 @@ def option_contract_chart(
     strike: float = Query(...),
     option_type: str = Query(...),
     position_id: int | None = Query(None),
+    limit: int = Query(2000, ge=50, le=10000),
+    include_previous: bool = Query(False),
+    refresh: bool = Query(False),
+    include_live: bool = Query(False),
+    ltp: float | None = Query(None),
+    entry_price: float | None = Query(None),
+    stop_loss: float | None = Query(None),
+    take_profit: float | None = Query(None),
     db: Session = Depends(get_db_session),
 ) -> dict:
     from datetime import date as date_type
@@ -285,46 +306,249 @@ def option_contract_chart(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid expiry date") from exc
 
-    rows = (
+    settings = _runtime_settings(db)
+    normalized_type = str(option_type).upper()
+    base_filters = (
+        symbol_value_filter(OptionQuote.underlying_symbol, symbol),
+        OptionQuote.strike == float(strike),
+        OptionQuote.option_type == normalized_type,
+    )
+    underlying_key = resolve_underlying_key(db, symbol, settings=settings)
+    if refresh:
+        _maybe_refresh_option_chain(
+            db,
+            symbol=symbol,
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+            settings=settings,
+        )
+
+    rows = list(
         db.execute(
             select(OptionQuote)
             .where(
                 and_(
-                    symbol_value_filter(OptionQuote.underlying_symbol, symbol),
+                    *base_filters,
                     OptionQuote.expiry_date == expiry_date,
-                    OptionQuote.strike == float(strike),
-                    OptionQuote.option_type == str(option_type).upper(),
                 )
             )
-            .order_by(OptionQuote.ts.asc())
-            .limit(500)
+            .order_by(OptionQuote.ts.desc())
+            .limit(limit)
         )
         .scalars()
         .all()
     )
+    rows.reverse()
+    instrument_key = next((row.instrument_key for row in reversed(rows) if row.instrument_key), None)
+
+    previous_expiry = None
+    previous_rows = []
+    if include_previous:
+        previous_expiry = db.scalar(
+            select(OptionQuote.expiry_date)
+            .where(and_(*base_filters, OptionQuote.expiry_date < expiry_date))
+            .distinct()
+            .order_by(OptionQuote.expiry_date.desc())
+            .limit(1)
+        )
+        if previous_expiry is not None:
+            previous_rows = list(
+                db.execute(
+                    select(OptionQuote)
+                    .where(and_(*base_filters, OptionQuote.expiry_date == previous_expiry))
+                    .order_by(OptionQuote.ts.desc())
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            previous_rows.reverse()
+
     position = db.get(ExecutionPosition, position_id) if position_id is not None else None
-    entry_price = float(position.entry_premium or position.entry_price) if position is not None else None
+    entry = float(position.entry_premium or position.entry_price) if position is not None else entry_price
+    stop = float(position.stop_loss or position.initial_sl or 0.0) if position is not None else stop_loss
+    target = float(position.take_profit or position.target_premium or 0.0) if position is not None else take_profit
     quantity = int(position.quantity) if position is not None else 1
-    points = []
-    for row in rows:
-        ltp = float(row.ltp)
-        pnl = ((ltp - entry_price) * quantity) if entry_price is not None else None
-        points.append(
+
+    def serialize_points(quote_rows: list[OptionQuote], *, with_pnl: bool) -> list[dict]:
+        out = []
+        for row in quote_rows:
+            row_ltp = float(row.ltp)
+            pnl = ((row_ltp - entry) * quantity) if with_pnl and entry is not None else None
+            out.append(
+                {
+                    "x": row.ts.isoformat() if row.ts is not None else None,
+                    "ltp": row_ltp,
+                    "pnl": round(pnl, 2) if pnl is not None else None,
+                    "volume": float(row.volume or 0.0),
+                }
+            )
+        return out
+
+    def quote_chart(quote_rows: list[OptionQuote], *, label: str, expiry_value) -> dict:
+        frame_rows = [
+            {
+                "ts": row.ts,
+                "ltp": float(row.ltp),
+                "volume": float(row.volume or 0.0),
+            }
+            for row in quote_rows
+            if row.ts is not None
+        ]
+        if not frame_rows:
+            return {
+                "label": label,
+                "expiry_date": expiry_value.isoformat() if expiry_value is not None else None,
+                "candles": [],
+                "markers": [],
+                "pine_levels": [],
+            }
+        import pandas as pd
+
+        frame = pd.DataFrame(frame_rows)
+        frame["ts"] = pd.to_datetime(frame["ts"])
+        candles_frame = (
+            frame.set_index("ts")
+            .resample("1min", label="right", closed="right")
+            .agg({"ltp": ["first", "max", "min", "last"], "volume": "sum"})
+            .dropna()
+        )
+        candles_frame.columns = ["open", "high", "low", "close", "volume"]
+        candles_frame = candles_frame.reset_index()
+        candles = [
             {
                 "x": row.ts.isoformat() if row.ts is not None else None,
-                "ltp": ltp,
+                "open": round(float(row.open), 2),
+                "high": round(float(row.high), 2),
+                "low": round(float(row.low), 2),
+                "close": round(float(row.close), 2),
+                "volume": round(float(row.volume or 0.0), 2),
+            }
+            for row in candles_frame.itertuples(index=False)
+        ]
+        overlay = _build_pine_chart_overlay(
+            [
+                {
+                    "ts": item["x"],
+                    "open": item["open"],
+                    "high": item["high"],
+                    "low": item["low"],
+                    "close": item["close"],
+                    "volume": item["volume"],
+                }
+                for item in candles
+            ],
+            interval="1minute",
+            settings=settings,
+            range_key="all",
+        )
+        return {
+            "label": label,
+            "expiry_date": expiry_value.isoformat() if expiry_value is not None else None,
+            "source": "option_quote_snapshots",
+            "candles": candles,
+            "markers": list(overlay.get("markers") or []),
+            "pine_levels": list(overlay.get("levels") or []),
+        }
+
+    def candle_record_chart(records, *, label: str, expiry_value) -> dict:
+        candles = [
+            {
+                "x": row.ts.isoformat() if row.ts is not None else None,
+                "open": round(float(row.open), 2),
+                "high": round(float(row.high), 2),
+                "low": round(float(row.low), 2),
+                "close": round(float(row.close), 2),
+                "volume": round(float(row.volume or 0.0), 2),
+            }
+            for row in sorted(records, key=lambda item: item.ts)[-limit:]
+            if row.ts is not None
+        ]
+        overlay = _build_pine_chart_overlay(
+            [
+                {
+                    "ts": item["x"],
+                    "open": item["open"],
+                    "high": item["high"],
+                    "low": item["low"],
+                    "close": item["close"],
+                    "volume": item["volume"],
+                }
+                for item in candles
+            ],
+            interval="1minute",
+            settings=settings,
+            range_key="all",
+        )
+        return {
+            "label": label,
+            "expiry_date": expiry_value.isoformat() if expiry_value is not None else None,
+            "source": "upstox_intraday_candles",
+            "candles": candles,
+            "markers": list(overlay.get("markers") or []),
+            "pine_levels": list(overlay.get("levels") or []),
+        }
+
+    intraday_candles = []
+    if include_live and instrument_key:
+        try:
+            collector = UpstoxCollector()
+            access_token = read_runtime_upstox_access_token(settings)
+            if access_token:
+                collector.headers["Authorization"] = f"Bearer {access_token}"
+            intraday_candles = collector.fetch_intraday_candles(instrument_key, "1minute")
+        except Exception:
+            intraday_candles = []
+
+    points = serialize_points(rows, with_pnl=True)
+    previous_points = serialize_points(previous_rows, with_pnl=False)
+    current_chart = (
+        candle_record_chart(intraday_candles, label="Current expiry", expiry_value=expiry_date)
+        if intraday_candles
+        else quote_chart(rows, label="Current expiry", expiry_value=expiry_date)
+    )
+    previous_chart = quote_chart(previous_rows, label="Previous expiry", expiry_value=previous_expiry)
+    if not points and ltp is not None:
+        from datetime import datetime
+
+        fallback_ltp = float(ltp)
+        pnl = ((fallback_ltp - entry) * quantity) if entry is not None else None
+        points.append(
+            {
+                "x": datetime.now().astimezone().isoformat(),
+                "ltp": fallback_ltp,
                 "pnl": round(pnl, 2) if pnl is not None else None,
-                "volume": float(row.volume or 0.0),
+                "volume": 0.0,
+                "source": "snapshot",
             }
         )
     return {
         "symbol": symbol,
         "expiry_date": expiry_date.isoformat(),
         "strike": float(strike),
-        "option_type": str(option_type).upper(),
-        "entry_price": entry_price,
+        "option_type": normalized_type,
+        "entry_price": entry,
+        "stop_loss": stop if stop and stop > 0 else None,
+        "take_profit": target if target and target > 0 else None,
+        "levels": [
+            item
+            for item in [
+                {"label": "ENTRY", "price": entry, "color": "#f8fafc"} if entry is not None else None,
+                {"label": "STOP LOSS", "price": stop, "color": "#ef4444"} if stop and stop > 0 else None,
+                {"label": "TARGET", "price": target, "color": "#22c55e"} if target and target > 0 else None,
+            ]
+            if item is not None
+        ],
         "quantity": quantity,
         "points": points,
+        "chart": current_chart,
+        "previous": {
+            "expiry_date": previous_expiry.isoformat() if previous_expiry is not None else None,
+            "points": previous_points,
+            "chart": previous_chart,
+            "history_available": bool(previous_points),
+        },
+        "history_available": bool(rows),
     }
 
 
