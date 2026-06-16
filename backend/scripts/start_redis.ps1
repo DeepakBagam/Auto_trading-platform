@@ -12,7 +12,7 @@ if (-not $redisServer) {
 
 Start-Process `
     -FilePath $redisServer.Source `
-    -ArgumentList @("--port", "6379", "--save", "", "--appendonly", "no") `
+    -ArgumentList '--port 6379 --save "" --appendonly no' `
     -WorkingDirectory (Resolve-Path ".").Path `
     -WindowStyle Hidden
 

@@ -11,7 +11,7 @@ from backend.api.market_stream_runtime import get_market_stream_runtime_status
 from backend.api.schemas import HealthResponse
 from backend.db.connection import get_db_session
 from backend.db.models import RawCandle
-from backend.utils.config import get_settings
+from backend.utils.config import get_settings, read_runtime_upstox_access_token
 from backend.utils.constants import IST_ZONE
 
 router = APIRouter(prefix="/health", tags=["health"])
@@ -63,7 +63,7 @@ def health_detailed(db: Session = Depends(get_db_session)) -> dict:
 
     # 4. Broker API reachability — ping Upstox profile endpoint
     settings = get_settings()
-    token = settings.upstox_access_token.strip()
+    token = read_runtime_upstox_access_token(settings)
     if not token:
         checks["broker"] = {"status": "error", "detail": "UPSTOX_ACCESS_TOKEN not set"}
     else:

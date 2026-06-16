@@ -704,6 +704,19 @@ button:disabled {
   font: 600 11px/16px var(--mono);
 }
 
+.settings-token-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.settings-token-meta {
+  color: var(--muted);
+  font: 700 11px/14px var(--mono);
+}
+
 .secondary-button .material-symbols-outlined {
   margin-right: 6px;
   font-size: 16px;

@@ -4,12 +4,14 @@ from datetime import date, datetime
 from email.message import EmailMessage
 from functools import lru_cache
 
+import requests as _requests
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from backend.api.deps import get_db
+from backend.api.market_stream_runtime import ensure_market_stream_started, get_market_stream_runtime_status
 from backend.api.schemas import ExecutionReportResponse, ExecutionRunResponse
 from backend.db.models import AuditLog, ExecutionOrder, ExecutionPosition
 from backend.execution_engine.engine import IntradayOptionsExecutionEngine
@@ -67,6 +69,18 @@ class RuntimeSettingsRequest(BaseModel):
     force_squareoff_time: str | None = None
     signal_min_score: float | None = None
     signal_cooldown_minutes: int | None = None
+    signal_require_volume_confirmation: bool | None = None
+    signal_min_volume_ratio: float | None = None
+    signal_require_breakout: bool | None = None
+    signal_rsi_buy_min: float | None = None
+    signal_rsi_sell_max: float | None = None
+    signal_vix_min: float | None = None
+    signal_vix_max: float | None = None
+    signal_atr_min_points: float | None = None
+    signal_atr_max_points: float | None = None
+    option_min_volume: float | None = None
+    option_min_oi: float | None = None
+    option_max_spread_pct: float | None = None
     upstox_access_token: str | None = None
     smtp_enabled: bool | None = None
     smtp_host: str | None = None
@@ -113,6 +127,18 @@ def _serializable_settings(settings: Settings, *, runtime: dict | None = None, t
         "force_squareoff_time": str(settings.force_squareoff_time),
         "signal_min_score": float(settings.signal_min_score),
         "signal_cooldown_minutes": int(settings.signal_cooldown_minutes),
+        "signal_require_volume_confirmation": bool(settings.signal_require_volume_confirmation),
+        "signal_min_volume_ratio": float(settings.signal_min_volume_ratio),
+        "signal_require_breakout": bool(settings.signal_require_breakout),
+        "signal_rsi_buy_min": float(settings.signal_rsi_buy_min),
+        "signal_rsi_sell_max": float(settings.signal_rsi_sell_max),
+        "signal_vix_min": float(settings.signal_vix_min),
+        "signal_vix_max": float(settings.signal_vix_max),
+        "signal_atr_min_points": float(settings.signal_atr_min_points),
+        "signal_atr_max_points": float(settings.signal_atr_max_points),
+        "option_min_volume": float(settings.option_min_volume),
+        "option_min_oi": float(settings.option_min_oi),
+        "option_max_spread_pct": float(settings.option_max_spread_pct),
         "upstox_token_present": bool(token),
         "upstox_token_masked": mask_secret(token),
         "smtp_enabled": bool(settings.smtp_enabled),
@@ -166,6 +192,46 @@ def broker_health(engine: IntradayOptionsExecutionEngine) -> dict:
     return out
 
 
+def _check_upstox_profile(settings: Settings, token: str) -> dict:
+    if not token:
+        return {
+            "status": "error",
+            "token_present": False,
+            "detail": "UPSTOX_ACCESS_TOKEN is missing",
+        }
+    try:
+        resp = _requests.get(
+            f"{settings.upstox_base_url}/v2/user/profile",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=5,
+        )
+    except _requests.exceptions.Timeout:
+        return {"status": "warn", "token_present": True, "detail": "Upstox API timed out"}
+    except Exception as exc:
+        return {"status": "error", "token_present": True, "detail": str(exc)}
+
+    if resp.status_code == 200:
+        profile = resp.json().get("data", {})
+        return {
+            "status": "ok",
+            "token_present": True,
+            "user_name": profile.get("user_name", ""),
+            "email": profile.get("email", ""),
+            "broker": profile.get("broker", ""),
+        }
+    if resp.status_code == 401:
+        return {
+            "status": "error",
+            "token_present": True,
+            "detail": "token expired or invalid (HTTP 401)",
+        }
+    return {
+        "status": "warn",
+        "token_present": True,
+        "detail": f"unexpected HTTP {resp.status_code} from Upstox profile API",
+    }
+
+
 @router.get("/settings")
 def get_runtime_settings(db: Session = Depends(get_db)) -> dict:
     engine = get_runtime_engine(db)
@@ -175,6 +241,7 @@ def get_runtime_settings(db: Session = Depends(get_db)) -> dict:
 @router.put("/settings")
 def update_runtime_settings(request: RuntimeSettingsRequest, db: Session = Depends(get_db)) -> dict:
     values = request.model_dump(exclude_unset=True)
+    token_updated = bool(str(values.get("upstox_access_token") or "").strip())
     symbols = values.pop("execution_symbols", None)
     if symbols is not None:
         cleaned = []
@@ -203,9 +270,26 @@ def update_runtime_settings(request: RuntimeSettingsRequest, db: Session = Depen
     for key in ("execution_per_trade_risk_pct", "execution_max_daily_loss_pct", "execution_stop_loss_pct", "tsl_activation_percent", "tsl_trail_percent", "target_profit_percent"):
         if values.get(key) is not None and float(values[key]) < 0:
             raise HTTPException(status_code=400, detail=f"{key} cannot be negative")
+    for key in ("signal_min_score", "signal_min_volume_ratio", "signal_vix_min", "signal_vix_max", "signal_atr_min_points", "signal_atr_max_points", "option_min_volume", "option_min_oi", "option_max_spread_pct"):
+        if values.get(key) is not None and float(values[key]) < 0:
+            raise HTTPException(status_code=400, detail=f"{key} cannot be negative")
+    if (
+        values.get("signal_vix_min") is not None
+        and values.get("signal_vix_max") is not None
+        and float(values["signal_vix_min"]) > float(values["signal_vix_max"])
+    ):
+        raise HTTPException(status_code=400, detail="signal_vix_min cannot exceed signal_vix_max")
+    if (
+        values.get("signal_atr_min_points") is not None
+        and values.get("signal_atr_max_points") is not None
+        and float(values["signal_atr_min_points"]) > float(values["signal_atr_max_points"])
+    ):
+        raise HTTPException(status_code=400, detail="signal_atr_min_points cannot exceed signal_atr_max_points")
     set_runtime_execution_settings(db, values)
     engine = get_runtime_engine(db)
     engine.broker = engine._build_broker()
+    if token_updated:
+        ensure_market_stream_started(engine.settings)
     create_audit_log(
         db,
         action="runtime_settings_updated",
@@ -216,6 +300,50 @@ def update_runtime_settings(request: RuntimeSettingsRequest, db: Session = Depen
     )
     db.commit()
     return {**_settings_payload(db), "mode": get_runtime_trading_mode(db, settings=engine.settings), "broker": broker_health(engine)}
+
+
+@router.post("/settings/test-upstox-token")
+def test_upstox_token_settings(db: Session = Depends(get_db)) -> dict:
+    settings = get_settings().model_copy()
+    apply_runtime_execution_settings(db, settings)
+    token = read_runtime_upstox_access_token(settings)
+    broker_check = _check_upstox_profile(settings, token)
+    stream_started = False
+    if broker_check["status"] == "ok":
+        stream_started = ensure_market_stream_started(settings)
+    stream_status = get_market_stream_runtime_status(settings)
+    websocket_open = bool(stream_status.get("running") or stream_status.get("thread_alive"))
+    test_status = "ok" if broker_check["status"] == "ok" and websocket_open else (
+        "warn" if broker_check["status"] == "ok" else "error"
+    )
+    token_test = {
+        "status": test_status,
+        "broker": broker_check,
+        "market_stream": stream_status,
+        "websocket_open": websocket_open,
+        "start_attempted": broker_check["status"] == "ok",
+        "started_now": stream_started,
+    }
+    create_audit_log(
+        db,
+        action="upstox_token_test",
+        resource="settings",
+        status=test_status.upper(),
+        message="Upstox token tested from settings",
+        details={
+            "broker_status": broker_check["status"],
+            "websocket_open": websocket_open,
+            "started_now": stream_started,
+        },
+    )
+    db.commit()
+    engine = get_runtime_engine(db)
+    return {
+        **_settings_payload(db),
+        "mode": get_runtime_trading_mode(db, settings=engine.settings),
+        "broker": broker_health(engine),
+        "token_test": token_test,
+    }
 
 
 @router.post("/settings/test-smtp")

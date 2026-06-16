@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -34,6 +35,18 @@ RUNTIME_SETTING_KEYS = {
     "force_squareoff_time",
     "signal_min_score",
     "signal_cooldown_minutes",
+    "signal_require_volume_confirmation",
+    "signal_min_volume_ratio",
+    "signal_require_breakout",
+    "signal_rsi_buy_min",
+    "signal_rsi_sell_max",
+    "signal_vix_min",
+    "signal_vix_max",
+    "signal_atr_min_points",
+    "signal_atr_max_points",
+    "option_min_volume",
+    "option_min_oi",
+    "option_max_spread_pct",
     "upstox_access_token",
     "smtp_enabled",
     "smtp_host",
@@ -85,6 +98,22 @@ def get_runtime_execution_settings(db: Session) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+def _set_env_file_key(key: str, value: str, env_path: Path | None = None) -> None:
+    path = env_path or Path(".env")
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    found = False
+    updated: list[str] = []
+    for line in lines:
+        if line.lstrip().startswith(f"{key}="):
+            updated.append(f"{key}={value}")
+            found = True
+        else:
+            updated.append(line)
+    if not found:
+        updated.append(f"{key}={value}")
+    path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+
 def set_runtime_execution_settings(db: Session, values: dict[str, Any]) -> dict[str, Any]:
     current = get_runtime_execution_settings(db)
     for key, value in values.items():
@@ -92,9 +121,13 @@ def set_runtime_execution_settings(db: Session, values: dict[str, Any]) -> dict[
             continue
         if key in SENSITIVE_RUNTIME_KEYS and (value is None or str(value).strip() == ""):
             continue
-        current[key] = value
         if key == "upstox_access_token" and value:
-            os.environ["UPSTOX_ACCESS_TOKEN"] = str(value).strip()
+            token = str(value).strip()
+            current[key] = token
+            os.environ["UPSTOX_ACCESS_TOKEN"] = token
+            _set_env_file_key("UPSTOX_ACCESS_TOKEN", token)
+        else:
+            current[key] = value
     set_setting_value(db, RUNTIME_SETTINGS_KEY, current)
     return current
 

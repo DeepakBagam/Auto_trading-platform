@@ -2467,12 +2467,14 @@ function SettingsWindow({
   draft,
   loading,
   saving,
+  testingToken,
   testingSmtp,
   notice,
   onDraftChange,
   onToggleSymbol,
   onSave,
   onReload,
+  onTestToken,
   onTestSmtp,
 }) {
   if (loading && !draft) {
@@ -2482,6 +2484,10 @@ function SettingsWindow({
   const defaults = data?.defaults || {};
   const availableSymbols = Array.from(new Set([...(data?.available_symbols || []), ...((draft?.execution_symbols || []))]));
   const brokerStatus = data?.broker?.status || "-";
+  const tokenTest = data?.token_test || null;
+  const tokenTestBrokerStatus = tokenTest?.broker?.status || "-";
+  const tokenTestStreamOpen = Boolean(tokenTest?.websocket_open);
+  const tokenTestDetail = tokenTest?.broker?.detail || tokenTest?.market_stream?.last_error || "";
   const update = (key, value) => onDraftChange?.(key, value);
 
   return (
@@ -2612,13 +2618,31 @@ function SettingsWindow({
             <div>
               <h2>Broker Token</h2>
             </div>
-            <span className={`tag ${settings.upstox_token_present ? "buy" : "sell"}`}>
-              {settings.upstox_token_present ? "Token saved" : "Token missing"}
-            </span>
+            <div className="button-row">
+              <span className={`tag ${settings.upstox_token_present ? "buy" : "sell"}`}>
+                {settings.upstox_token_present ? "Token saved" : "Token missing"}
+              </span>
+              <button type="button" className="secondary-button" disabled={testingToken || saving || !settings.upstox_token_present} onClick={onTestToken}>
+                <span className="material-symbols-outlined" aria-hidden="true">wifi_tethering</span>
+                {testingToken ? "Testing" : "Test & Connect"}
+              </button>
+            </div>
           </div>
           <SettingsField label="Daily Upstox Token">
             <textarea className="settings-textarea" value={settingsInputValue(draft, "upstox_access_token")} onChange={(event) => update("upstox_access_token", event.target.value)} placeholder={settings.upstox_token_masked || "Paste token"} />
           </SettingsField>
+          {tokenTest ? (
+            <div className="settings-token-status">
+              <span className={`tag ${tokenTestBrokerStatus === "ok" ? "buy" : tokenTestBrokerStatus === "warn" ? "hold" : "sell"}`}>
+                Health {tokenTestBrokerStatus}
+              </span>
+              <span className={`tag ${tokenTestStreamOpen ? "buy" : "sell"}`}>
+                Websocket {tokenTestStreamOpen ? "Open" : "Not open"}
+              </span>
+              {tokenTest?.broker?.user_name ? <span className="settings-token-meta">{tokenTest.broker.user_name}</span> : null}
+              {tokenTestDetail ? <small className="settings-default">{tokenTestDetail}</small> : null}
+            </div>
+          ) : null}
         </article>
 
         <article className="panel settings-card settings-wide">
@@ -3054,6 +3078,7 @@ function App() {
   const [settingsDraft, setSettingsDraft] = useState(null);
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [upstoxTesting, setUpstoxTesting] = useState(false);
   const [smtpTesting, setSmtpTesting] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
   const chartCacheRef = useRef(new Map());
@@ -3563,6 +3588,27 @@ function App() {
       setError(testError.message || "Unable to send SMTP test.");
     } finally {
       setSmtpTesting(false);
+    }
+  }
+
+  async function testUpstoxTokenSettings() {
+    setUpstoxTesting(true);
+    try {
+      const data = await apiFetch("/execution/settings/test-upstox-token", { method: "POST" });
+      applySettingsPayload(data);
+      const tokenTest = data?.token_test || {};
+      const brokerStatus = tokenTest?.broker?.status || "unknown";
+      const websocketOpen = Boolean(tokenTest?.websocket_open);
+      setSettingsNotice(`Upstox health ${brokerStatus}; websocket ${websocketOpen ? "open" : "not open"}.`);
+      try {
+        await refreshSnapshot();
+      } catch (_refreshError) {
+        // The token test result is still valid even if the live snapshot is not ready yet.
+      }
+    } catch (testError) {
+      setError(testError.message || "Unable to test Upstox token.");
+    } finally {
+      setUpstoxTesting(false);
     }
   }
 
@@ -4282,12 +4328,14 @@ function App() {
             draft={settingsDraft}
             loading={settingsLoading}
             saving={settingsSaving}
+            testingToken={upstoxTesting}
             testingSmtp={smtpTesting}
             notice={settingsNotice}
             onDraftChange={updateSettingsDraft}
             onToggleSymbol={toggleSettingsSymbol}
             onSave={saveRuntimeSettings}
             onReload={() => loadRuntimeSettings(true)}
+            onTestToken={testUpstoxTokenSettings}
             onTestSmtp={testSmtpSettings}
           />
         ) : null}

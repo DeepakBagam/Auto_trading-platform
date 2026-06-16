@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 from sqlalchemy import create_engine
@@ -6,7 +7,13 @@ from sqlalchemy.pool import StaticPool
 
 from backend.db.models import Base, ExecutionPosition
 from backend.execution_engine.live_service import compute_paper_portfolio_metrics
-from backend.utils.app_state import get_runtime_trading_mode, reset_paper_account, set_runtime_trading_mode
+from backend.utils.app_state import (
+    get_runtime_execution_settings,
+    get_runtime_trading_mode,
+    reset_paper_account,
+    set_runtime_execution_settings,
+    set_runtime_trading_mode,
+)
 from backend.utils.config import Settings
 from backend.utils.constants import IST_ZONE
 
@@ -25,6 +32,33 @@ def test_runtime_trading_mode_persists_in_app_settings() -> None:
         set_runtime_trading_mode(session, "live")
         session.commit()
         assert get_runtime_trading_mode(session, settings=Settings(execution_mode="paper")) == "live"
+    finally:
+        session.close()
+
+
+def test_upstox_token_persists_to_runtime_env_and_env_file(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("UPSTOX_ACCESS_TOKEN", raising=False)
+    (tmp_path / ".env").write_text("OTHER_KEY=value\nUPSTOX_ACCESS_TOKEN=old-token\n", encoding="utf-8")
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        set_runtime_execution_settings(session, {"upstox_access_token": "  fresh-token  "})
+        session.commit()
+
+        runtime = get_runtime_execution_settings(session)
+
+        assert runtime["upstox_access_token"] == "fresh-token"
+        assert os.environ["UPSTOX_ACCESS_TOKEN"] == "fresh-token"
+        assert (tmp_path / ".env").read_text(encoding="utf-8") == (
+            "OTHER_KEY=value\nUPSTOX_ACCESS_TOKEN=fresh-token\n"
+        )
     finally:
         session.close()
 
