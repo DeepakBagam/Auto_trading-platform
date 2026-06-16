@@ -641,7 +641,19 @@ async function apiFetch(url, options = {}) {
     ...options,
   });
   if (!response.ok) {
-    const detail = await response.text();
+    const body = await response.text();
+    let detail = body || "Request failed";
+    try {
+      const parsed = JSON.parse(body);
+      detail = parsed?.detail || parsed?.message || detail;
+      if (Array.isArray(detail)) {
+        detail = detail.map((item) => item?.msg || item?.message || JSON.stringify(item)).join("; ");
+      } else if (detail && typeof detail === "object") {
+        detail = JSON.stringify(detail);
+      }
+    } catch (_error) {
+      // Keep the raw response body when the server did not return JSON.
+    }
     throw new Error(detail || "Request failed");
   }
   return response.json();
