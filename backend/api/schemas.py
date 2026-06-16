@@ -3,67 +3,6 @@ from datetime import date, datetime
 from pydantic import BaseModel
 
 
-class QuantileBand(BaseModel):
-    p10: float
-    p50: float
-    p90: float
-
-
-class PredictionIntervals(BaseModel):
-    open: QuantileBand | None = None
-    high: QuantileBand | None = None
-    low: QuantileBand | None = None
-    close: QuantileBand | None = None
-
-
-class PredictResponse(BaseModel):
-    symbol: str
-    interval: str
-    prediction_mode: str = "standard"
-    source_interval: str | None = None
-    target_session_date: date
-    target_ts: datetime | None = None
-    pred_open: float
-    pred_high: float
-    pred_low: float
-    pred_close: float
-    direction: str
-    confidence: float
-    direction_prob_calibrated: float | None = None
-    confidence_score: float | None = None
-    confidence_bucket: str | None = None
-    pred_interval: PredictionIntervals | None = None
-    model_family: str | None = None
-    calibration_version: str | None = None
-    confidence_components: dict | None = None
-    model_version: str
-    feature_cutoff_ist: datetime
-    generated_at: datetime
-
-
-class SignalResponse(BaseModel):
-    symbol: str
-    interval: str
-    prediction_mode: str
-    action: str
-    conviction: str
-    latest_price: float
-    predicted_price: float
-    expected_return_pct: float
-    expected_move_points: float
-    confidence: float
-    confidence_bucket: str | None = None
-    stop_loss: float | None = None
-    take_profit: float | None = None
-    risk_reward_ratio: float | None = None
-    technical_score: float | None = None
-    target_session_date: date
-    target_ts: datetime | None = None
-    generated_at: datetime
-    model_version: str
-    reasons: list[str]
-
-
 class HealthResponse(BaseModel):
     status: str
     timestamp: datetime

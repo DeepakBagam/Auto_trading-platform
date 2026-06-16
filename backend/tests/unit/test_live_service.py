@@ -176,7 +176,7 @@ def test_build_chart_payload_forces_one_minute_all_range() -> None:
         assert payload["is_resampled"] is False
         assert payload["start_date"] == "2026-04-21"
         assert payload["end_date"] == "2026-04-21"
-        assert payload["markers"] == []
+        assert {marker["text"] for marker in payload["markers"]}.issubset({"BUY", "SELL"})
         assert range_keys == ["all"]
         assert interval_keys == ["1minute"]
         assert len(payload["candles"]) == 80

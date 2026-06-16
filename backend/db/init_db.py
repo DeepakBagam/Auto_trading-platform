@@ -14,7 +14,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_app_settings_table()
     _migrate_audit_logs_table()
-    _migrate_predictions_interval_column()
+    _drop_legacy_prediction_storage()
     _migrate_option_quotes_columns()
     _migrate_execution_position_columns()
     _migrate_execution_order_columns()
@@ -69,16 +69,36 @@ def _ensure_timescale_hypertables() -> None:
             )
 
 
-def _migrate_predictions_interval_column() -> None:
+def _drop_legacy_prediction_storage() -> None:
     inspector = inspect(engine)
-    if not inspector.has_table("predictions_daily"):
-        return
-    cols = {c["name"] for c in inspector.get_columns("predictions_daily")}
-    if "interval" in cols:
-        return
+    legacy_tables = ("predictions_daily", "predictions_intraday", "oof_predictions")
+    legacy_views = (
+        "predictions_nifty50_1d",
+        "predictions_nifty50_1m",
+        "predictions_nifty50_30m",
+        "predictions_banknifty_1d",
+        "predictions_banknifty_1m",
+        "predictions_banknifty_30m",
+        "predictions_indiavix_1d",
+        "predictions_indiavix_1m",
+        "predictions_indiavix_30m",
+        "predictions_sensex_1d",
+        "predictions_sensex_1m",
+        "predictions_sensex_30m",
+    )
+    existing_tables = set(inspector.get_table_names())
+    existing_views = set(inspector.get_view_names())
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE predictions_daily ADD COLUMN interval VARCHAR(32) DEFAULT 'day'"))
-        conn.execute(text("UPDATE predictions_daily SET interval = 'day' WHERE interval IS NULL"))
+        for view_name in legacy_views:
+            if view_name in existing_views:
+                conn.execute(text(f"DROP VIEW IF EXISTS {view_name}"))
+        for table_name in legacy_tables:
+            if table_name not in existing_tables:
+                continue
+            if engine.dialect.name == "postgresql":
+                conn.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE"))
+            else:
+                conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
 
 
 def _migrate_option_quotes_columns() -> None:
@@ -178,24 +198,6 @@ def _ensure_indexes() -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_raw_candles_instrument_interval_ts "
                 "ON raw_candles (instrument_key, interval, ts)"
-            )
-        )
-        conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_predictions_symbol_interval_target "
-                "ON predictions_daily (symbol, interval, target_session_date)"
-            )
-        )
-        conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_predictions_intraday_symbol_interval_ts "
-                "ON predictions_intraday (symbol, interval, target_ts)"
-            )
-        )
-        conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_oof_run_symbol_date "
-                "ON oof_predictions (run_id, symbol, session_date)"
             )
         )
         conn.execute(

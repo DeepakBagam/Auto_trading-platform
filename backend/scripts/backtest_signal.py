@@ -35,6 +35,7 @@ from backend.execution_engine.intraday_rules import (
     time_exit_reason,
 )
 from backend.feature_engine.price_features import build_price_features
+from backend.utils.config import Settings, get_settings
 from backend.utils.constants import IST_ZONE
 from backend.utils.logger import setup_logging
 
@@ -219,6 +220,14 @@ MAX_SIGNALS_PER_DAY = 2
 MIN_CANDLES = 60
 
 
+def _parse_hhmm(value: str, fallback: time) -> time:
+    try:
+        hh, mm = str(value).strip().split(":", 1)
+        return time(int(hh), int(mm))
+    except Exception:
+        return fallback
+
+
 def _detect_regime(adx: float, plus_di: float, minus_di: float, atr: float, atr_mean: float) -> str:
     atr_ratio = atr / max(atr_mean, 1e-9)
     if atr_ratio > 1.6:
@@ -312,14 +321,17 @@ def detect_signal(
     last_signal_ts: datetime | None,
     signals_today: int,
     constraints: ExecutionConstraints = EXECUTION_RULES,
+    settings: Settings | None = None,
 ) -> _SignalResult:
     """Run signal detection on the last row of `features`. Returns action and levels."""
     del vix_candles
+    settings = settings or get_settings()
     if len(features) < MIN_CANDLES:
         return _SignalResult("HOLD", 0, _REGIME_RANGE, 63, 0, 0, 0, 0, 0, 0, "warmup")
-    signal_frame = _resample_five_minute_signal_frame(features)
+
+    signal_frame = features
     if len(signal_frame) < 25:
-        return _SignalResult("HOLD", 0, _REGIME_RANGE, 100, 0, 0, 0, 0, 0, 0, "warmup_5m")
+        return _SignalResult("HOLD", 0, _REGIME_RANGE, 100, 0, 0, 0, 0, 0, 0, "warmup_1m")
 
     row = signal_frame.iloc[-1]
     prev = signal_frame.iloc[-2]
@@ -341,13 +353,21 @@ def detect_signal(
     ema_cross_down = prev_ema_9 >= prev_ema_21 and ema_9 < ema_21
     bullish_candle = close > open_
     bearish_candle = close < open_
-    rsi_buy_ok = rsi > 45.0  # Lowered from 55 to be more permissive
-    rsi_sell_ok = rsi < 55.0  # Raised from 45 to be more permissive
-    volume_ok = volume > volume_avg if volume_avg > 0 else volume_ratio > 1.0
+    rsi_buy_min = float(getattr(settings, "signal_rsi_buy_min", 52.0))
+    rsi_sell_max = float(getattr(settings, "signal_rsi_sell_max", 48.0))
+    rsi_buy_ok = rsi >= rsi_buy_min
+    rsi_sell_ok = rsi <= rsi_sell_max
+    min_volume_ratio = float(getattr(settings, "signal_min_volume_ratio", 1.15))
+    volume_ok = (volume_ratio >= min_volume_ratio) if volume_avg > 0 else volume_ratio >= min_volume_ratio
     break_prev_high = close > prev_high
     break_prev_low = close < prev_low
+    require_volume = bool(getattr(settings, "signal_require_volume_confirmation", True))
+    require_breakout = bool(getattr(settings, "signal_require_breakout", True))
+    atr_min = float(getattr(settings, "signal_atr_min_points", 4.0))
+    atr_max = float(getattr(settings, "signal_atr_max_points", 80.0))
+    atr_ok = atr_min <= atr <= atr_max
 
-    # BALANCED SCORING SYSTEM (matches live_service.py)
+    # Balanced scoring system, aligned with live_service.build_technical_signal.
     score_buy = 0.0
     score_sell = 0.0
 
@@ -386,19 +406,34 @@ def detect_signal(
     if break_prev_low:
         score_sell += 10.0
 
-    # THRESHOLD: 50+ points out of 110 possible (45%)
-    buy_ready = score_buy >= 50.0
-    sell_ready = score_sell >= 50.0
+    min_score = float(getattr(settings, "signal_min_score", 63.0))
+    buy_ready = (
+        score_buy >= min_score
+        and rsi_buy_ok
+        and (volume_ok or not require_volume)
+        and (break_prev_high or not require_breakout)
+        and atr_ok
+    )
+    sell_ready = (
+        score_sell >= min_score
+        and rsi_sell_ok
+        and (volume_ok or not require_volume)
+        and (break_prev_low or not require_breakout)
+        and atr_ok
+    )
     raw_action = "BUY" if buy_ready else ("SELL" if sell_ready else "HOLD")
     raw_score = max(score_buy, score_sell)
-    threshold = 50.0
+    threshold = min_score
 
     now_time = now.time().replace(tzinfo=None)
+    entry_start = _parse_hhmm(getattr(settings, "entry_window_start", ""), ENTRY_START)
+    entry_end = _parse_hhmm(getattr(settings, "entry_window_end", ""), ENTRY_END)
     action = raw_action
     hold_reason = ""
-    if not (ENTRY_START <= now_time < ENTRY_END):
+    max_signals_per_day = max(1, int(getattr(settings, "signal_max_per_day", MAX_SIGNALS_PER_DAY)))
+    if not (entry_start <= now_time <= entry_end):
         action, hold_reason = "HOLD", "outside_window"
-    elif signals_today >= MAX_SIGNALS_PER_DAY:
+    elif signals_today >= max_signals_per_day:
         action, hold_reason = "HOLD", "daily_cap"
     elif last_signal_ts is not None:
         elapsed = (now - last_signal_ts).total_seconds()
@@ -456,9 +491,9 @@ class Trade:
 
 def _as_ist_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=IST_ZONE)
-    out = pd.Timestamp(value).to_pydatetime()
-    return out if out.tzinfo else out.replace(tzinfo=IST_ZONE)
+        return value.astimezone(IST_ZONE) if value.tzinfo else value.replace(tzinfo=IST_ZONE)
+    out = pd.Timestamp(value).to_pydatetime(warn=False)
+    return out.astimezone(IST_ZONE) if out.tzinfo else out.replace(tzinfo=IST_ZONE)
 
 
 def _directional_price(action: str, entry_price: float, offset_points: float) -> float:
@@ -470,8 +505,11 @@ def simulate_trades(
     features_full: pd.DataFrame,
     vix_df: pd.DataFrame,
     constraints: ExecutionConstraints = EXECUTION_RULES,
+    entry_dates: set[date] | None = None,
+    settings: Settings | None = None,
 ) -> list[Trade]:
     """Walk forward through `df`, generate signals, and manage one trade at a time."""
+    settings = settings or get_settings()
     trades: list[Trade] = []
     trade_id = 0
     signals_today: dict[date, int] = {}
@@ -485,6 +523,9 @@ def simulate_trades(
             i += 1
             continue
         today = row_ts.date()
+        if entry_dates is not None and today not in entry_dates:
+            i += 1
+            continue
         features_window = features_full.iloc[max(0, i - 250): i]
 
         sig = detect_signal(
@@ -494,6 +535,7 @@ def simulate_trades(
             last_signal_ts=last_signal_ts,
             signals_today=signals_today.get(today, 0),
             constraints=constraints,
+            settings=settings,
         )
 
         if sig.action not in ("BUY", "SELL"):
@@ -747,7 +789,7 @@ def _print_report(symbol: str, days: int, trades: list[Trade], stats: dict) -> N
     print("  SIGNAL BACKTEST REPORT")
     print(f"  Symbol : {symbol}")
     print(f"  Period : last {days} calendar days")
-    print("  Exec   : 5m EMA 9/21 crossover + RSI + volume + prev high/low breakout | 09:45-15:00 | max 2/day")
+    print("  Exec   : 1m EMA 9/21 + RSI + volume/breakout gates | configured entry window | max signals/day")
     print(sep)
 
     if not stats:
@@ -846,11 +888,34 @@ def main() -> None:
     parser.add_argument("--symbol", default="Nifty 50", help="Underlying symbol")
     parser.add_argument("--days", type=int, default=30, help="Calendar days to backtest")
     parser.add_argument("--output-dir", default="logs/backtests", help="Output directory")
+    parser.add_argument("--entry-start", default=None, help="Override strategy entry start, HH:MM")
+    parser.add_argument("--entry-end", default=None, help="Override strategy entry end, HH:MM")
+    parser.add_argument("--max-signals-per-day", type=int, default=None, help="Override max signals per day")
     args = parser.parse_args()
 
-    print(f"\nLoading candles for '{args.symbol}' (last {args.days} days)...")
+    settings = get_settings()
+    overrides: dict[str, Any] = {}
+    if args.entry_start:
+        overrides["entry_window_start"] = args.entry_start
+    if args.entry_end:
+        overrides["entry_window_end"] = args.entry_end
+    if args.max_signals_per_day is not None:
+        overrides["signal_max_per_day"] = max(1, int(args.max_signals_per_day))
+    if overrides:
+        settings = settings.model_copy(update=overrides)
+
+    print(f"\nLoading candles for '{args.symbol}' (last {args.days} calendar days plus warmup)...")
     df_raw = _load_candles(args.symbol, args.days)
     print(f"Loaded {len(df_raw):,} bars  ({df_raw.index[0].date()} -> {df_raw.index[-1].date()})")
+    sessions = sorted({ts.date() for ts in df_raw.index})
+    entry_dates = set(sessions[-max(1, int(args.days)):])
+    entry_window_start = min(entry_dates)
+    entry_window_end = max(entry_dates)
+    print(
+        "Testing entries on latest "
+        f"{len(entry_dates)} trading sessions ({entry_window_start} -> {entry_window_end}); "
+        "earlier loaded bars are warmup only."
+    )
 
     vix_df = _load_vix(args.days)
 
@@ -858,9 +923,11 @@ def main() -> None:
     df_reset = df_raw.reset_index().rename(columns={"ts": "ts"})
     df_reset["ts"] = pd.to_datetime(df_reset["ts"])
     features_full = build_price_features(df_reset)
+    features_full["ts"] = pd.to_datetime(features_full["ts"])
+    features_full.set_index("ts", inplace=True)
 
     print("Running walk-forward simulation...")
-    trades = simulate_trades(df_raw, features_full, vix_df)
+    trades = simulate_trades(df_raw, features_full, vix_df, entry_dates=entry_dates, settings=settings)
     print(f"Simulation complete - {len(trades)} trades generated.")
 
     stats = _compute_stats(trades)

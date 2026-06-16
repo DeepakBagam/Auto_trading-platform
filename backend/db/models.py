@@ -73,52 +73,6 @@ class LabelsDaily(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class PredictionsDaily(Base):
-    __tablename__ = "predictions_daily"
-    __table_args__ = (
-        UniqueConstraint("symbol", "interval", "target_session_date", "model_version", name="uq_pred_daily"),
-        Index("ix_predictions_symbol_interval_target", "symbol", "interval", "target_session_date"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    symbol: Mapped[str] = mapped_column(String(128), index=True)
-    interval: Mapped[str] = mapped_column(String(32), index=True, default="day")
-    target_session_date: Mapped[datetime] = mapped_column(Date, index=True)
-    pred_open: Mapped[float] = mapped_column(Float)
-    pred_high: Mapped[float] = mapped_column(Float)
-    pred_low: Mapped[float] = mapped_column(Float)
-    pred_close: Mapped[float] = mapped_column(Float)
-    direction: Mapped[str] = mapped_column(String(8))
-    confidence: Mapped[float] = mapped_column(Float)
-    model_version: Mapped[str] = mapped_column(String(128), index=True)
-    feature_cutoff_ist: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-
-
-class PredictionsIntraday(Base):
-    __tablename__ = "predictions_intraday"
-    __table_args__ = (
-        UniqueConstraint("symbol", "interval", "target_ts", "model_version", name="uq_pred_intraday"),
-        Index("ix_predictions_intraday_symbol_interval_ts", "symbol", "interval", "target_ts"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    symbol: Mapped[str] = mapped_column(String(128), index=True)
-    interval: Mapped[str] = mapped_column(String(32), index=True)  # 1minute / 30minute
-    target_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    pred_open: Mapped[float] = mapped_column(Float)
-    pred_high: Mapped[float] = mapped_column(Float)
-    pred_low: Mapped[float] = mapped_column(Float)
-    pred_close: Mapped[float] = mapped_column(Float)
-    direction: Mapped[str] = mapped_column(String(8))
-    confidence: Mapped[float] = mapped_column(Float)
-    model_version: Mapped[str] = mapped_column(String(128), index=True)
-    feature_cutoff_ist: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-
-
 class ModelRegistry(Base):
     __tablename__ = "model_registry"
     __table_args__ = (
@@ -135,35 +89,6 @@ class ModelRegistry(Base):
     trained_from: Mapped[datetime] = mapped_column(Date)
     trained_to: Mapped[datetime] = mapped_column(Date)
     is_active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-class OOFPrediction(Base):
-    __tablename__ = "oof_predictions"
-    __table_args__ = (
-        UniqueConstraint(
-            "run_id",
-            "symbol",
-            "session_date",
-            "model_name",
-            name="uq_oof_predictions",
-        ),
-        Index("ix_oof_run_symbol_date", "run_id", "symbol", "session_date"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    run_id: Mapped[str] = mapped_column(String(128), index=True)
-    symbol: Mapped[str] = mapped_column(String(128), index=True)
-    session_date: Mapped[datetime] = mapped_column(Date, index=True)
-    model_name: Mapped[str] = mapped_column(String(128), index=True)
-    fold: Mapped[int] = mapped_column(Integer, default=0)
-    pred_open: Mapped[float | None] = mapped_column(Float, nullable=True)
-    pred_high: Mapped[float | None] = mapped_column(Float, nullable=True)
-    pred_low: Mapped[float | None] = mapped_column(Float, nullable=True)
-    pred_close: Mapped[float | None] = mapped_column(Float, nullable=True)
-    direction_prob: Mapped[float | None] = mapped_column(Float, nullable=True)
-    actual_close: Mapped[float | None] = mapped_column(Float, nullable=True)
-    actual_direction: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

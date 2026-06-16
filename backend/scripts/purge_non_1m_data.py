@@ -20,16 +20,9 @@ def _count_by_interval(conn: sqlite3.Connection, table: str) -> list[tuple[str, 
     return [(str(r[0]), int(r[1])) for r in rows]
 
 
-def _count_total(conn: sqlite3.Connection, table: str) -> int:
-    row = conn.execute("SELECT COUNT(*) FROM " + table).fetchone()
-    return int((row or [0])[0] or 0)
-
-
 def _snapshot_counts(conn: sqlite3.Connection) -> dict:
     out: dict[str, object] = {}
     out["raw_candles"] = _count_by_interval(conn, "raw_candles")
-    out["predictions_intraday"] = _count_by_interval(conn, "predictions_intraday")
-    out["predictions_daily_total"] = _count_total(conn, "predictions_daily")
     out["option_trade_signals"] = _count_by_interval(conn, "option_trade_signals")
     return out
 
@@ -64,8 +57,6 @@ def main() -> None:
                         "before": before,
                         "planned_deletes": {
                             "raw_candles_non_1m": "DELETE interval != '1minute'",
-                            "predictions_intraday_non_1m": "DELETE interval != '1minute'",
-                            "predictions_daily_all": "DELETE all rows",
                             "option_trade_signals_non_1m": "DELETE interval != '1minute'",
                         },
                     },
@@ -86,10 +77,6 @@ def main() -> None:
         deleted["raw_candles_non_1m"] = conn.execute(
             "DELETE FROM raw_candles WHERE interval <> '1minute'"
         ).rowcount
-        deleted["predictions_intraday_non_1m"] = conn.execute(
-            "DELETE FROM predictions_intraday WHERE interval <> '1minute'"
-        ).rowcount
-        deleted["predictions_daily_all"] = conn.execute("DELETE FROM predictions_daily").rowcount
         deleted["option_trade_signals_non_1m"] = conn.execute(
             "DELETE FROM option_trade_signals WHERE interval <> '1minute'"
         ).rowcount

@@ -292,6 +292,163 @@ class IntradayOptionsExecutionEngine:
             time_module.sleep(backoff_ms / 1000.0)
         return last_response
 
+    def _is_live_mode(self) -> bool:
+        return str(self.settings.execution_mode).lower() == "live"
+
+    def _place_live_protective_stop(
+        self,
+        db: Session,
+        *,
+        position: ExecutionPosition,
+    ) -> ExecutionOrder | None:
+        if not self._is_live_mode():
+            return None
+        instrument_key = str((position.metadata_json or {}).get("instrument_key") or "")
+        if not instrument_key:
+            logger.error("Cannot place live protective SL for position=%s without instrument_key", position.id)
+            return None
+        trigger_price = round(float(position.current_sl or position.stop_loss or 0.0), 2)
+        request = BrokerOrderRequest(
+            instrument_key=instrument_key,
+            option_type=str(position.option_type),
+            strike=float(position.strike),
+            expiry_date=position.expiry_date.isoformat(),
+            side="SELL",
+            qty=int(position.quantity),
+            order_type="SL-M",
+            trigger_price=trigger_price,
+            tag=f"protective_sl_{position.id}",
+        )
+        response = self._place_order_with_retry(
+            db,
+            request=request,
+            action="protective_sl_place",
+            resource_id=str(position.id),
+        )
+        order_row = self._log_order(
+            db,
+            position_id=position.id,
+            trade_date=position.trade_date,
+            symbol=position.symbol,
+            order_kind="SL",
+            side="SELL",
+            quantity=position.quantity,
+            response=response,
+            strike_price=position.strike,
+            option_type=position.option_type,
+            expiry_date=position.expiry_date,
+            entry_premium=position.entry_premium,
+            initial_sl=position.initial_sl,
+            current_sl=trigger_price,
+            target_premium=position.target_premium,
+            peak_premium=position.peak_premium,
+            tsl_active=bool(position.tsl_active),
+            unrealized_pnl=position.unrealized_pnl,
+            consensus_reason="Broker-side protective stop loss",
+        )
+        metadata = dict(position.metadata_json or {})
+        metadata["broker_sl_order_id"] = getattr(response, "order_id", None)
+        metadata["broker_sl_order_status"] = getattr(response, "status", None)
+        metadata["broker_sl_trigger_price"] = trigger_price
+        metadata["broker_sl_updated_at"] = _now_ist().isoformat()
+        metadata["broker_sl_active"] = bool(response.success and getattr(response, "order_id", None))
+        position.metadata_json = metadata
+        if not response.success:
+            create_audit_log(
+                db,
+                action="protective_sl_place_failed",
+                resource="position",
+                resource_id=str(position.id),
+                status="ERROR",
+                message=response.message,
+                details={"status": response.status, "trigger_price": trigger_price},
+            )
+        return order_row
+
+    def _modify_live_protective_stop(
+        self,
+        db: Session,
+        *,
+        position: ExecutionPosition,
+        trigger_price: float,
+    ) -> None:
+        if not self._is_live_mode():
+            return
+        metadata = dict(position.metadata_json or {})
+        order_id = str(metadata.get("broker_sl_order_id") or "")
+        if not order_id:
+            self._place_live_protective_stop(db, position=position)
+            return
+        previous_trigger = float(metadata.get("broker_sl_trigger_price") or 0.0)
+        trigger_price = round(float(trigger_price), 2)
+        if trigger_price <= previous_trigger:
+            return
+        response = self.broker.modify_order(order_id, trigger_price=trigger_price)
+        create_audit_log(
+            db,
+            action="protective_sl_modify",
+            resource="order",
+            resource_id=order_id,
+            status="SUCCESS" if response.success else "ERROR",
+            message=response.message,
+            details={
+                "position_id": position.id,
+                "old_trigger_price": previous_trigger,
+                "new_trigger_price": trigger_price,
+                "status": response.status,
+            },
+        )
+        self._log_order(
+            db,
+            position_id=position.id,
+            trade_date=position.trade_date,
+            symbol=position.symbol,
+            order_kind="MODIFY",
+            side="SELL",
+            quantity=position.quantity,
+            response=response,
+            strike_price=position.strike,
+            option_type=position.option_type,
+            expiry_date=position.expiry_date,
+            entry_premium=position.entry_premium,
+            initial_sl=position.initial_sl,
+            current_sl=trigger_price,
+            target_premium=position.target_premium,
+            peak_premium=position.peak_premium,
+            tsl_active=bool(position.tsl_active),
+            unrealized_pnl=position.unrealized_pnl,
+            consensus_reason="Broker-side protective stop modified",
+        )
+        metadata["broker_sl_order_status"] = response.status
+        metadata["broker_sl_updated_at"] = _now_ist().isoformat()
+        if response.success:
+            metadata["broker_sl_trigger_price"] = trigger_price
+            metadata["broker_sl_active"] = True
+        position.metadata_json = metadata
+
+    def _cancel_live_protective_stop(self, db: Session, *, position: ExecutionPosition, reason: str) -> None:
+        if not self._is_live_mode():
+            return
+        metadata = dict(position.metadata_json or {})
+        order_id = str(metadata.get("broker_sl_order_id") or "")
+        if not order_id or not bool(metadata.get("broker_sl_active")):
+            return
+        response = self.broker.cancel_order(order_id)
+        create_audit_log(
+            db,
+            action="protective_sl_cancel",
+            resource="order",
+            resource_id=order_id,
+            status="SUCCESS" if response.success else "ERROR",
+            message=response.message,
+            details={"position_id": position.id, "reason": reason, "status": response.status},
+        )
+        if response.success:
+            metadata["broker_sl_active"] = False
+            metadata["broker_sl_order_status"] = response.status
+            metadata["broker_sl_cancelled_at"] = _now_ist().isoformat()
+            position.metadata_json = metadata
+
     def _max_daily_loss_amount(self) -> float:
         capital = float(self.settings.execution_capital)
         return capital * float(getattr(self.settings, "execution_max_daily_loss_pct", 0.05))
@@ -345,6 +502,7 @@ class IntradayOptionsExecutionEngine:
             order_type="MARKET",
             tag=f"exit_{reason.lower()}",
         )
+        self._cancel_live_protective_stop(db, position=position, reason=reason)
         response = self._place_order_with_retry(
             db,
             request=request,
@@ -474,10 +632,17 @@ class IntradayOptionsExecutionEngine:
                 tsl_trail_percent=float(self.settings.tsl_trail_percent),
                 tsl_immediate=bool(getattr(self.settings, "tsl_immediate", True)),
             )
+            previous_sl = float(position.current_sl or position.stop_loss or 0.0)
             position.current_sl = float(risk_update.current_sl)
             position.trailing_stop = float(risk_update.trailing_sl or position.trailing_stop or 0.0)
             position.tsl_active = bool(risk_update.tsl_active)
             position.peak_premium = float(risk_update.peak_price)
+            if risk_update.current_sl > previous_sl:
+                self._modify_live_protective_stop(
+                    db,
+                    position=position,
+                    trigger_price=float(risk_update.current_sl),
+                )
             
             exit_reason = None
             if self._is_force_squareoff(now):
@@ -784,6 +949,23 @@ class IntradayOptionsExecutionEngine:
             unrealized_pnl=position.unrealized_pnl,
             consensus_reason=f"Score {signal.score:.1f} | {' | '.join(option_signal.get('reasons') or [])}",
         )
+        protective_order = self._place_live_protective_stop(db, position=position)
+        if self._is_live_mode() and not bool((position.metadata_json or {}).get("broker_sl_active")):
+            exit_order = self._close_position(
+                db,
+                position=position,
+                now=now,
+                reason="PROTECTIVE_SL_FAILED",
+                exit_premium=float(position.current_premium or position.entry_premium or position.entry_price),
+            )
+            log_row.trade_placed = False
+            log_row.skip_reason = "protective_sl_failed"
+            db.commit()
+            self._notify_order(entry_order, position)
+            if protective_order is not None:
+                self._notify_order(protective_order, position)
+            self._notify_order(exit_order, position)
+            return "skip:protective_sl_failed"
         log_row.trade_placed = True
         log_row.skip_reason = None
         log_row.details = {
@@ -818,6 +1000,8 @@ class IntradayOptionsExecutionEngine:
         )
         db.commit()
         self._notify_order(entry_order, position)
+        if protective_order is not None:
+            self._notify_order(protective_order, position)
         return "entered"
 
     def _force_square_off(self, db: Session, now: datetime, reason: str) -> dict[str, Any]:

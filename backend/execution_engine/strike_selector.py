@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Literal
 
-from backend.prediction_engine.options_engine import nearest_strike
+from backend.execution_engine.options_engine import nearest_strike
 from backend.utils.config import get_settings
 from backend.utils.symbols import normalize_symbol_key
 

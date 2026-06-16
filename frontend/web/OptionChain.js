@@ -1,7 +1,7 @@
 // OptionChain.js - Professional Option Chain Component
 // Upstox-style layout with CE/PE side-by-side
 
-const OptionChain = ({ symbol }) => {
+const OptionChain = ({ symbol, onInspectContract }) => {
   const [chainData, setChainData] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
@@ -105,6 +105,20 @@ const OptionChain = ({ symbol }) => {
     setSelectedStrike(strike);
   };
 
+  const openContractChart = (event, strike, optionType, quote) => {
+    event.stopPropagation();
+    if (!onInspectContract || !quote?.ltp) {
+      return;
+    }
+    onInspectContract({
+      symbol: chainData.symbol || symbol || 'Nifty 50',
+      expiry: chainData.expiry_date,
+      strike,
+      optionType,
+      entryPrice: quote.ltp,
+    });
+  };
+
   return (
     <div className="option-chain-container">
       {/* Header */}
@@ -186,7 +200,17 @@ const OptionChain = ({ symbol }) => {
                   <td className="oi-cell">{formatLargeNumber(ce?.oi)}</td>
                   <td className="vol-cell">{formatLargeNumber(ce?.volume)}</td>
                   <td className="iv-cell">{formatIV(ce?.iv)}</td>
-                  <td className="ltp-cell call-ltp">{formatNumber(ce?.ltp)}</td>
+                  <td className="ltp-cell call-ltp">
+                    <button
+                      type="button"
+                      className="strike-chart-button call"
+                      disabled={!ce?.ltp}
+                      onClick={(event) => openContractChart(event, strike, 'CE', ce)}
+                      title={`Open ${strike} CE chart`}
+                    >
+                      {formatNumber(ce?.ltp)}
+                    </button>
+                  </td>
                   <td className="chg-cell">{ce?.ltp && ce?.close_price ? formatNumber(ce.ltp - ce.close_price) : '-'}</td>
                   <td className="chg-pct-cell">
                     {ce?.ltp && ce?.close_price ? 
@@ -205,7 +229,17 @@ const OptionChain = ({ symbol }) => {
                       `${((pe.ltp - pe.close_price) / pe.close_price * 100).toFixed(2)}%` : '-'}
                   </td>
                   <td className="chg-cell">{pe?.ltp && pe?.close_price ? formatNumber(pe.ltp - pe.close_price) : '-'}</td>
-                  <td className="ltp-cell put-ltp">{formatNumber(pe?.ltp)}</td>
+                  <td className="ltp-cell put-ltp">
+                    <button
+                      type="button"
+                      className="strike-chart-button put"
+                      disabled={!pe?.ltp}
+                      onClick={(event) => openContractChart(event, strike, 'PE', pe)}
+                      title={`Open ${strike} PE chart`}
+                    >
+                      {formatNumber(pe?.ltp)}
+                    </button>
+                  </td>
                   <td className="iv-cell">{formatIV(pe?.iv)}</td>
                   <td className="vol-cell">{formatLargeNumber(pe?.volume)}</td>
                   <td className="oi-cell">{formatLargeNumber(pe?.oi)}</td>
@@ -221,6 +255,7 @@ const OptionChain = ({ symbol }) => {
         <StrikeDetailModal 
           strike={selectedStrike}
           chainData={chainData}
+          onInspectContract={onInspectContract}
           onClose={() => setSelectedStrike(null)}
         />
       )}
@@ -241,13 +276,26 @@ const OptionChain = ({ symbol }) => {
 };
 
 // Strike Detail Modal Component
-const StrikeDetailModal = ({ strike, chainData, onClose }) => {
+const StrikeDetailModal = ({ strike, chainData, onInspectContract, onClose }) => {
   const strikeData = chainData.chain.find(row => row.strike === strike);
   
   if (!strikeData) return null;
 
   const ce = strikeData.ce || {};
   const pe = strikeData.pe || {};
+  const openChart = (optionType, quote) => {
+    if (!onInspectContract || !quote?.ltp) {
+      return;
+    }
+    onClose();
+    onInspectContract({
+      symbol: chainData.symbol || 'Nifty 50',
+      expiry: chainData.expiry_date,
+      strike,
+      optionType,
+      entryPrice: quote.ltp,
+    });
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -258,6 +306,24 @@ const StrikeDetailModal = ({ strike, chainData, onClose }) => {
         </div>
         
         <div className="modal-body">
+          <div className="strike-chart-actions">
+            <button
+              type="button"
+              className="chain-refresh-button"
+              disabled={!ce?.ltp}
+              onClick={() => openChart('CE', ce)}
+            >
+              CE Chart
+            </button>
+            <button
+              type="button"
+              className="chain-refresh-button"
+              disabled={!pe?.ltp}
+              onClick={() => openChart('PE', pe)}
+            >
+              PE Chart
+            </button>
+          </div>
           <div className="strike-detail-grid">
             {/* CALL Details */}
             <div className="option-detail call-detail">

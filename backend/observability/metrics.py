@@ -58,12 +58,6 @@ model_inference_duration_seconds = Histogram(
     buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
 )
 
-predictions_generated_total = Counter(
-    "predictions_generated_total",
-    "Total predictions generated",
-    ["symbol", "interval", "model_version"],
-)
-
 model_accuracy = Gauge(
     "model_accuracy",
     "Model accuracy score",

@@ -45,15 +45,3 @@ class FeatureRow:
     session_date: str
     features: Dict[str, float]
 
-
-@dataclass(slots=True)
-class PredictionRecord:
-    symbol: str
-    target_session_date: str
-    pred_open: float
-    pred_high: float
-    pred_low: float
-    pred_close: float
-    direction: str
-    confidence: float
-    model_version: str

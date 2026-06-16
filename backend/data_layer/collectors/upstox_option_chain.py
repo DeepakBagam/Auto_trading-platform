@@ -8,7 +8,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from backend.db.models import DataFreshness, OptionQuote
-from backend.utils.config import get_settings
+from backend.utils.config import get_settings, read_runtime_upstox_access_token
 from backend.utils.constants import IST_ZONE
 from backend.utils.logger import get_logger
 
@@ -24,17 +24,27 @@ def _to_float(value: Any) -> float | None:
 
 
 class UpstoxOptionChainCollector:
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, settings: Any | None = None) -> None:
+        self.settings = settings or get_settings()
         self.base_url = self.settings.upstox_base_url.rstrip("/")
-        access_token = getattr(self.settings, "market_data_access_token", "") or getattr(
-            self.settings, "upstox_access_token", ""
-        )
+        access_token = self._resolve_access_token()
         self.headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+
+    def _resolve_access_token(self) -> str:
+        runtime_token = read_runtime_upstox_access_token()
+        if runtime_token:
+            return runtime_token
+        access_token = getattr(self.settings, "upstox_access_token", "").strip()
+        if access_token:
+            return access_token
+        analytics_token = getattr(self.settings, "upstox_analytics_token", "").strip()
+        if analytics_token:
+            return analytics_token
+        return getattr(self.settings, "market_data_access_token", "").strip()
 
     def fetch_option_contracts(self, underlying_key: str, expiry_date: date | None = None) -> list[dict[str, Any]]:
         params: dict[str, str] = {"instrument_key": underlying_key}

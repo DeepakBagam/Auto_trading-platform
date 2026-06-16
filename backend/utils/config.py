@@ -157,6 +157,18 @@ class Settings(BaseSettings):
     entry_window_end: str = Field(default="12:30", validation_alias="ENTRY_WINDOW_END")
     second_trade_entry_end: str = Field(default="11:00", validation_alias="SECOND_TRADE_ENTRY_END")
     live_execution_blocked_symbols: str = "India VIX"
+    signal_require_volume_confirmation: bool = Field(default=False, validation_alias="SIGNAL_REQUIRE_VOLUME_CONFIRMATION")
+    signal_min_volume_ratio: float = Field(default=1.15, validation_alias="SIGNAL_MIN_VOLUME_RATIO")
+    signal_require_breakout: bool = Field(default=True, validation_alias="SIGNAL_REQUIRE_BREAKOUT")
+    signal_rsi_buy_min: float = Field(default=52.0, validation_alias="SIGNAL_RSI_BUY_MIN")
+    signal_rsi_sell_max: float = Field(default=48.0, validation_alias="SIGNAL_RSI_SELL_MAX")
+    signal_vix_min: float = Field(default=11.0, validation_alias="SIGNAL_VIX_MIN")
+    signal_vix_max: float = Field(default=20.0, validation_alias="SIGNAL_VIX_MAX")
+    signal_atr_min_points: float = Field(default=4.0, validation_alias="SIGNAL_ATR_MIN_POINTS")
+    signal_atr_max_points: float = Field(default=80.0, validation_alias="SIGNAL_ATR_MAX_POINTS")
+    option_min_volume: float = Field(default=500.0, validation_alias="OPTION_MIN_VOLUME")
+    option_min_oi: float = Field(default=1000.0, validation_alias="OPTION_MIN_OI")
+    option_max_spread_pct: float = Field(default=0.08, validation_alias="OPTION_MAX_SPREAD_PCT")
 
     # Redis configuration for Celery
     redis_host: str = "localhost"
@@ -189,10 +201,10 @@ class Settings(BaseSettings):
 
     @property
     def market_data_access_token(self) -> str:
-        analytics = self.upstox_analytics_token.strip()
-        if analytics:
-            return analytics
-        return self.upstox_access_token.strip()
+        access_token = self.upstox_access_token.strip()
+        if access_token:
+            return access_token
+        return self.upstox_analytics_token.strip()
 
     @property
     def has_market_data_access(self) -> bool:
@@ -271,8 +283,6 @@ def get_settings() -> Settings:
 
 def read_runtime_upstox_access_token(settings: Settings | None = None) -> str:
     """Read the freshest Upstox token available to the running process."""
-    if settings and settings.upstox_access_token.strip():
-        return settings.upstox_access_token.strip()
     token_file = os.environ.get("UPSTOX_TOKEN_FILE", "").strip()
     if token_file:
         try:
@@ -292,4 +302,6 @@ def read_runtime_upstox_access_token(settings: Settings | None = None) -> str:
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
         except OSError:
             pass
+    if settings and settings.upstox_access_token.strip():
+        return settings.upstox_access_token.strip()
     return ""

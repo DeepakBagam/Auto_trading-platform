@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta
@@ -13,7 +15,7 @@ from upstox_client import ApiClient, Configuration, MarketDataStreamerV3
 
 from backend.db.connection import SessionLocal
 from backend.db.models import DataFreshness, OrderBookSnapshot, RawCandle
-from backend.utils.config import Settings, get_settings
+from backend.utils.config import Settings, get_settings, read_runtime_upstox_access_token
 from backend.utils.constants import IST_ZONE
 from backend.utils.logger import get_logger
 from backend.utils.types import CandleRecord
@@ -34,6 +36,19 @@ class _MinuteBarState:
     tick_count: int = 0
 
 
+def _is_expired_jwt(token: str) -> bool:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return False
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, TypeError):
+        return False
+    exp = claims.get("exp")
+    return isinstance(exp, int | float) and exp <= time.time()
+
+
 class UpstoxMarketStream:
     def __init__(
         self,
@@ -52,11 +67,15 @@ class UpstoxMarketStream:
         self._bind_streamer_events()
 
     def _build_streamer(self) -> MarketDataStreamerV3:
-        access_token = getattr(self.settings, "market_data_access_token", "") or getattr(
-            self.settings, "upstox_access_token", ""
+        access_token = read_runtime_upstox_access_token(self.settings) or getattr(
+            self.settings, "market_data_access_token", ""
         )
         if not access_token:
             raise RuntimeError("UPSTOX_ACCESS_TOKEN is required for websocket streaming.")
+        if _is_expired_jwt(access_token):
+            raise RuntimeError(
+                "UPSTOX_ACCESS_TOKEN is expired; generate a fresh token before starting websocket streaming."
+            )
         if not self.settings.instrument_keys:
             raise RuntimeError("UPSTOX_INSTRUMENT_KEYS is required for websocket streaming.")
 
