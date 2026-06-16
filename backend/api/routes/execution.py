@@ -28,7 +28,7 @@ from backend.utils.app_state import (
 )
 from backend.utils.config import Settings, get_settings, read_runtime_upstox_access_token
 from backend.utils.constants import IST_ZONE
-from backend.utils.notifications import send_email_message, smtp_ready
+from backend.utils.notifications import send_email_message, send_email_message_result, smtp_ready
 
 router = APIRouter(prefix="/execution", tags=["execution"])
 
@@ -357,9 +357,10 @@ def test_smtp_settings(db: Session = Depends(get_db)) -> dict:
     message["From"] = settings.smtp_from_email
     message["To"] = ", ".join(settings.smtp_recipients)
     message.set_content("SMTP test from Alpha Terminal settings.")
-    sent = send_email_message(message, settings=settings)
-    if not sent:
-        raise HTTPException(status_code=502, detail="SMTP test failed")
+    result = send_email_message_result(message, settings=settings)
+    if not result.sent:
+        detail = f"SMTP test failed: {result.detail}" if result.detail else "SMTP test failed"
+        raise HTTPException(status_code=502, detail=detail)
     create_audit_log(
         db,
         action="smtp_test_sent",

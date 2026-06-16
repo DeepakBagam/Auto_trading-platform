@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import smtplib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from email.message import EmailMessage
 from typing import Any
@@ -11,6 +12,12 @@ from backend.utils.constants import IST_ZONE
 from backend.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class SmtpSendResult:
+    sent: bool
+    detail: str = ""
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -72,6 +79,15 @@ def smtp_ready(settings: Settings | None = None) -> bool:
         and cfg.smtp_from_email.strip()
         and cfg.smtp_recipients
     )
+
+
+def _sanitize_smtp_error(exc: Exception, settings: Settings) -> str:
+    detail = f"{exc.__class__.__name__}: {exc}"
+    for secret in (settings.smtp_password, settings.smtp_username):
+        secret_text = str(secret or "").strip()
+        if secret_text:
+            detail = detail.replace(secret_text, "***")
+    return detail
 
 
 def build_order_notification_message(
@@ -196,7 +212,7 @@ def build_order_notification_message(
     return message
 
 
-def send_email_message(message: EmailMessage, settings: Settings | None = None) -> bool:
+def send_email_message_result(message: EmailMessage, settings: Settings | None = None) -> SmtpSendResult:
     cfg = settings or get_settings()
     smtp_class = smtplib.SMTP_SSL if cfg.smtp_use_ssl else smtplib.SMTP
     try:
@@ -208,10 +224,14 @@ def send_email_message(message: EmailMessage, settings: Settings | None = None) 
             if cfg.smtp_username.strip():
                 client.login(cfg.smtp_username, cfg.smtp_password)
             client.send_message(message)
-        return True
-    except Exception:
+        return SmtpSendResult(sent=True)
+    except Exception as exc:
         logger.exception("SMTP notification failed")
-        return False
+        return SmtpSendResult(sent=False, detail=_sanitize_smtp_error(exc, cfg))
+
+
+def send_email_message(message: EmailMessage, settings: Settings | None = None) -> bool:
+    return send_email_message_result(message, settings=settings).sent
 
 
 def send_order_notification(

@@ -1,7 +1,8 @@
 from datetime import date, datetime
+from email.message import EmailMessage
 from types import SimpleNamespace
 
-from backend.utils.notifications import build_order_notification_message, smtp_ready
+from backend.utils.notifications import build_order_notification_message, send_email_message_result, smtp_ready
 
 
 def _settings(**overrides):
@@ -68,3 +69,41 @@ def test_build_order_notification_message_contains_pnl_and_contract() -> None:
     assert "Contract: 24000.00 CE" in body
     assert "Realized P&L: +1397.50" in body
     assert "Order Time (IST): 2026-04-16 10:15:00 IST" in body
+
+
+def test_send_email_message_result_redacts_credentials(monkeypatch) -> None:
+    settings = _settings(smtp_username="user@example.com", smtp_password="app-secret")
+
+    class FailingSmtp:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def ehlo(self):
+            return None
+
+        def starttls(self):
+            return None
+
+        def login(self, username, password):
+            raise RuntimeError(f"bad credentials {username} {password}")
+
+    monkeypatch.setattr("backend.utils.notifications.smtplib.SMTP", FailingSmtp)
+
+    message = EmailMessage()
+    message["From"] = settings.smtp_from_email
+    message["To"] = ", ".join(settings.smtp_recipients)
+    message["Subject"] = "test"
+    message.set_content("test")
+
+    result = send_email_message_result(message, settings=settings)
+
+    assert result.sent is False
+    assert "RuntimeError" in result.detail
+    assert "user@example.com" not in result.detail
+    assert "app-secret" not in result.detail
