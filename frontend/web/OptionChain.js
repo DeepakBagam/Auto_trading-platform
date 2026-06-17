@@ -152,7 +152,8 @@ const OptionChain = ({ symbol, onInspectContract }) => {
                 {new Date(exp).toLocaleDateString('en-IN', { 
                   day: '2-digit', 
                   month: 'short', 
-                  year: 'numeric' 
+                  year: 'numeric',
+                  timeZone: 'Asia/Kolkata',
                 })}
               </option>
             ))}
@@ -264,7 +265,13 @@ const OptionChain = ({ symbol, onInspectContract }) => {
       <div className="chain-footer">
         <span className="last-updated">
           Last updated: {chainData.chain_generated_at ? 
-            new Date(chainData.chain_generated_at).toLocaleTimeString('en-IN') : 
+            new Date(chainData.chain_generated_at).toLocaleTimeString('en-IN', {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+              hour12: false,
+              timeZone: 'Asia/Kolkata',
+            }) :
             'N/A'}
         </span>
         <span className="total-strikes">

@@ -277,7 +277,7 @@ const PositionTracker = ({ symbol, mode = "paper" }) => {
                         <span className="strike-label">{pos.strike}</span>
                       </div>
                       <div className="contract-meta">
-                        {new Date(pos.expiry).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}
+                        {new Date(pos.expiry).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', timeZone: 'Asia/Kolkata' })}
                       </div>
                     </td>
                     
@@ -330,7 +330,9 @@ const PositionTracker = ({ symbol, mode = "paper" }) => {
                     <td className="time-cell">
                       {pos.entry_time ? new Date(pos.entry_time).toLocaleTimeString('en-IN', { 
                         hour: '2-digit', 
-                        minute: '2-digit' 
+                        minute: '2-digit',
+                        hour12: false,
+                        timeZone: 'Asia/Kolkata',
                       }) : '-'}
                     </td>
                     
@@ -374,7 +376,9 @@ const PositionDetailModal = ({ position, onClose }) => {
     return new Date(timestamp).toLocaleTimeString('en-IN', { 
       hour: '2-digit', 
       minute: '2-digit',
-      second: '2-digit'
+      second: '2-digit',
+      hour12: false,
+      timeZone: 'Asia/Kolkata',
     });
   };
 
@@ -417,7 +421,7 @@ const PositionDetailModal = ({ position, onClose }) => {
               </div>
               <div className="detail-row">
                 <span>Entry Time:</span>
-                <span>{position.entry_time ? new Date(position.entry_time).toLocaleString('en-IN') : '-'}</span>
+                <span>{position.entry_time ? new Date(position.entry_time).toLocaleString('en-IN', { hour12: false, timeZone: 'Asia/Kolkata' }) : '-'}</span>
               </div>
               <div className="detail-row">
                 <span>Quantity:</span>

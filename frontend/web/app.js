@@ -258,7 +258,30 @@ function parseChartTime(value) {
     return null;
   }
   const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : Math.floor(parsed.getTime() / 1000);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZone: IST_TIME_ZONE,
+  }).formatToParts(parsed);
+  const valueFor = (type) => Number(parts.find((part) => part.type === type)?.value);
+  const year = valueFor("year");
+  const month = valueFor("month");
+  const day = valueFor("day");
+  const hour = valueFor("hour");
+  const minute = valueFor("minute");
+  const second = valueFor("second") || 0;
+  if (![year, month, day, hour, minute, second].every(Number.isFinite)) {
+    return Math.floor(parsed.getTime() / 1000);
+  }
+  return Math.floor(Date.UTC(year, month - 1, day, hour, minute, second) / 1000);
 }
 
 function chartTimeToDate(timeValue) {
@@ -276,26 +299,26 @@ function formatChartTickMark(timeValue) {
   if (!parsed) {
     return "";
   }
-  const istParts = new Intl.DateTimeFormat("en-IN", {
+  const chartParts = new Intl.DateTimeFormat("en-IN", {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-    timeZone: IST_TIME_ZONE,
+    timeZone: "UTC",
   }).formatToParts(parsed);
-  const hour = Number(istParts.find((part) => part.type === "hour")?.value);
-  const minute = Number(istParts.find((part) => part.type === "minute")?.value);
+  const hour = Number(chartParts.find((part) => part.type === "hour")?.value);
+  const minute = Number(chartParts.find((part) => part.type === "minute")?.value);
   if (hour === 0 && minute === 0) {
     return parsed.toLocaleDateString("en-IN", {
       day: "2-digit",
       month: "short",
-      timeZone: IST_TIME_ZONE,
+      timeZone: "UTC",
     });
   }
   return parsed.toLocaleTimeString("en-IN", {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-    timeZone: IST_TIME_ZONE,
+    timeZone: "UTC",
   });
 }
 
@@ -308,7 +331,7 @@ function formatChartCrosshairTime(timeValue) {
         hour: "2-digit",
         minute: "2-digit",
         hour12: false,
-        timeZone: IST_TIME_ZONE,
+        timeZone: "UTC",
       })
     : "";
 }
