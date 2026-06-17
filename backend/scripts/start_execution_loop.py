@@ -10,6 +10,7 @@ import time
 from backend.db.connection import SessionLocal
 from backend.db.init_db import init_db
 from backend.execution_engine.engine import IntradayOptionsExecutionEngine
+from backend.utils.app_state import apply_runtime_execution_settings
 from backend.utils.config import get_settings
 from backend.utils.logger import get_logger, setup_logging
 
@@ -32,6 +33,7 @@ def main() -> None:
     while True:
         db = SessionLocal()
         try:
+            apply_runtime_execution_settings(db, settings)
             out = engine.run_once(db)
             logger.info("Execution loop tick: %s", out)
         except Exception as exc:

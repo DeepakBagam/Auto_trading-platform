@@ -20,6 +20,7 @@ from backend.data_layer.collectors.upstox_collector import UpstoxCollector
 from backend.db.connection import SessionLocal
 from backend.db.init_db import init_db
 from backend.observability.middleware import PrometheusMiddleware
+from backend.utils.app_state import apply_runtime_execution_settings
 from backend.utils.config import get_settings
 from backend.utils.constants import IST_ZONE
 from backend.utils.logger import get_logger, setup_logging
@@ -100,8 +101,7 @@ async def _refresh_option_chains_loop() -> None:
     from backend.data_layer.collectors.upstox_option_chain import UpstoxOptionChainCollector
     from backend.execution_engine.live_service import resolve_underlying_key, _resolve_expiry
 
-    settings = get_settings()
-    refresh_interval = int(getattr(settings, "option_chain_refresh_seconds", 300))
+    refresh_interval = int(getattr(get_settings(), "option_chain_refresh_seconds", 300))
 
     while True:
         await asyncio.sleep(refresh_interval)
@@ -110,9 +110,11 @@ async def _refresh_option_chains_loop() -> None:
         if not (9 <= now.hour < 15 or (now.hour == 15 and now.minute <= 35)):
             continue
         try:
-            collector = UpstoxOptionChainCollector(settings=settings)
             db = SessionLocal()
             try:
+                settings = get_settings().model_copy()
+                apply_runtime_execution_settings(db, settings)
+                collector = UpstoxOptionChainCollector(settings=settings)
                 for symbol in settings.execution_symbol_list:
                     underlying_key = resolve_underlying_key(db, symbol, settings=settings)
                     expiry_date, _ = _resolve_expiry(
