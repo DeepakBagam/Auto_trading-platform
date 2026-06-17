@@ -94,6 +94,22 @@ app.include_router(execution_router)
 # ── Option chain periodic refresh ─────────────────────────────────────────────
 _option_chain_refresh_task: asyncio.Task | None = None
 _daily_ingestion_task: asyncio.Task | None = None
+_market_stream_watchdog_task: asyncio.Task | None = None
+
+
+async def _market_stream_watchdog_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            db = SessionLocal()
+            try:
+                settings = get_settings().model_copy()
+                apply_runtime_execution_settings(db, settings)
+            finally:
+                db.close()
+            ensure_market_stream_started(settings)
+        except Exception:
+            logger.exception("Market stream watchdog failed; next scheduled cycle will retry.")
 
 
 async def _refresh_option_chains_loop() -> None:
@@ -164,9 +180,10 @@ def startup_market_stream() -> None:
 
 @app.on_event("startup")
 async def startup_option_chain_refresh() -> None:
-    global _option_chain_refresh_task, _daily_ingestion_task
+    global _option_chain_refresh_task, _daily_ingestion_task, _market_stream_watchdog_task
     _option_chain_refresh_task = asyncio.create_task(_refresh_option_chains_loop())
     _daily_ingestion_task = asyncio.create_task(_daily_ingestion_loop())
+    _market_stream_watchdog_task = asyncio.create_task(_market_stream_watchdog_loop())
 
 
 @app.on_event("shutdown")
@@ -176,6 +193,8 @@ def shutdown_market_stream() -> None:
         _option_chain_refresh_task.cancel()
     if _daily_ingestion_task is not None:
         _daily_ingestion_task.cancel()
+    if _market_stream_watchdog_task is not None:
+        _market_stream_watchdog_task.cancel()
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "frontend" / "web"
 if WEB_DIR.exists():
