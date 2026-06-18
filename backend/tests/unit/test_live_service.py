@@ -231,6 +231,64 @@ def test_build_chart_payload_ignores_one_day_request() -> None:
         session.close()
 
 
+def test_chart_payload_uses_partial_current_session_before_fifty_candles() -> None:
+    from backend.execution_engine.live_service import build_chart_payload
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        instrument_key = "NSE_INDEX|Nifty 50"
+        previous_start = datetime(2026, 6, 17, 9, 15, tzinfo=IST_ZONE)
+        current_start = datetime(2026, 6, 18, 9, 15, tzinfo=IST_ZONE)
+        for index in range(60):
+            session.add(
+                RawCandle(
+                    instrument_key=instrument_key,
+                    interval="1minute",
+                    ts=previous_start + timedelta(minutes=index),
+                    open=24000.0,
+                    high=24002.0,
+                    low=23998.0,
+                    close=24001.0,
+                    volume=100.0,
+                    source="test",
+                )
+            )
+        for index in range(22):
+            session.add(
+                RawCandle(
+                    instrument_key=instrument_key,
+                    interval="1minute",
+                    ts=current_start + timedelta(minutes=index),
+                    open=24100.0,
+                    high=24102.0,
+                    low=24098.0,
+                    close=24101.0,
+                    volume=100.0,
+                    source="test",
+                )
+            )
+        session.commit()
+
+        payload = build_chart_payload(
+            session,
+            symbol="Nifty 50",
+            range_key="all",
+            now=datetime(2026, 6, 18, 9, 36, tzinfo=IST_ZONE),
+        )
+
+        assert payload["latest"] == "2026-06-18T09:36:00+05:30"
+        assert len(payload["candles"]) == 82
+    finally:
+        session.close()
+
+
 def test_build_live_price_update_includes_stream_diagnostics(monkeypatch) -> None:
     monkeypatch.setattr(
         "backend.execution_engine.live_service.get_market_stream_runtime_status",

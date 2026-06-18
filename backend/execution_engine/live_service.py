@@ -664,6 +664,7 @@ def _latest_complete_intraday_ts(
     *,
     instrument_key: str,
     min_rows: int = 50,
+    now: datetime | None = None,
 ) -> datetime | None:
     rows = db.scalars(
         select(RawCandle.ts)
@@ -676,6 +677,17 @@ def _latest_complete_intraday_ts(
         .order_by(RawCandle.ts.desc())
         .limit(max(500, int(min_rows) * 20))
     ).all()
+    latest_ts = _ensure_ist(rows[0]) if rows else None
+    current = _ensure_ist(now) or datetime.now(IST_ZONE)
+    session_start, session_end = market_session_bounds(current.date())
+    if (
+        latest_ts is not None
+        and latest_ts.date() == current.date()
+        and is_trading_day(current.date())
+        and session_start <= current <= session_end
+    ):
+        return latest_ts
+
     sessions: dict[date, list[datetime]] = {}
     for raw_ts in rows:
         ts = _ensure_ist(raw_ts)
@@ -2661,7 +2673,10 @@ def build_chart_payload(
         latest_source_ts = _latest_chart_source_ts(db, instrument_key=instrument_key, interval=LIVE_INTERVAL)
         earliest_source_ts = _earliest_chart_source_ts(db, instrument_key=instrument_key, interval=LIVE_INTERVAL)
     if range_name != "all" and (source_interval.endswith("minute") or source_interval.endswith("hour")):
-        latest_source_ts = _latest_complete_intraday_ts(db, instrument_key=instrument_key) or latest_source_ts
+        latest_source_ts = (
+            _latest_complete_intraday_ts(db, instrument_key=instrument_key, now=current)
+            or latest_source_ts
+        )
     cache_key = (
         instrument_key,
         range_name,
