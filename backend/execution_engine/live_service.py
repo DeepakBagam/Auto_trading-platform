@@ -1156,10 +1156,14 @@ def _latest_fresh_pine_marker(
     candle_ts = _ensure_ist(candle_ts)
     if candle_ts is None:
         return None
+    session_start, session_end = market_session_bounds(candle_ts.date())
     session_rows = [
         row
         for row in rows
-        if (_ensure_ist(row.ts) is not None and _ensure_ist(row.ts).date() == candle_ts.date())
+        if (
+            _ensure_ist(row.ts) is not None
+            and session_start <= _ensure_ist(row.ts) < session_end
+        )
     ]
     overlay_rows = _candles_to_frame(session_rows).to_dict("records")
     overlay = _build_pine_chart_overlay(
@@ -2676,6 +2680,67 @@ def _calendar_payload(*, option_selection: OptionSelection | None = None) -> dic
     }
 
 
+def _attach_execution_signal_markers(
+    db: Session,
+    payload: dict[str, Any],
+    *,
+    symbol: str,
+) -> dict[str, Any]:
+    candles = list(payload.get("candles") or [])
+    if not candles:
+        return payload
+    start_ts = _parse_iso_datetime(candles[0].get("x"))
+    end_ts = _parse_iso_datetime(candles[-1].get("x"))
+    if start_ts is None or end_ts is None:
+        return payload
+
+    rows = (
+        db.execute(
+            select(SignalLog)
+            .where(
+                and_(
+                    symbol_value_filter(SignalLog.symbol, symbol),
+                    SignalLog.timestamp >= start_ts,
+                    SignalLog.timestamp <= end_ts,
+                    SignalLog.pine_signal.in_(["BUY", "SELL"]),
+                )
+            )
+            .order_by(SignalLog.timestamp.asc(), SignalLog.id.asc())
+            .limit(500)
+        )
+        .scalars()
+        .all()
+    )
+    markers_by_key = {
+        (str(marker.get("time") or ""), str(marker.get("text") or "").upper()): dict(marker)
+        for marker in payload.get("markers") or []
+        if marker.get("time") and marker.get("text")
+    }
+    for row in rows:
+        action = str(row.pine_signal or "").upper()
+        timestamp = _ensure_ist(row.timestamp)
+        if timestamp is None or action not in {"BUY", "SELL"}:
+            continue
+        marker = {
+            "time": timestamp.isoformat(),
+            "position": "belowBar" if action == "BUY" else "aboveBar",
+            "color": "#16a34a" if action == "BUY" else "#dc2626",
+            "shape": "arrowUp" if action == "BUY" else "arrowDown",
+            "text": action,
+            "trade_placed": bool(row.trade_placed),
+        }
+        markers_by_key[(marker["time"], action)] = marker
+
+    markers = sorted(
+        markers_by_key.values(),
+        key=lambda marker: _parse_iso_datetime(marker.get("time")) or start_ts,
+    )
+    return {
+        **payload,
+        "markers": markers,
+    }
+
+
 def build_chart_payload(
     db: Session,
     *,
@@ -2710,12 +2775,12 @@ def build_chart_payload(
     )
     cached = _CHART_PAYLOAD_CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        return _attach_execution_signal_markers(db, cached, symbol=display_symbol)
     redis_key = f"chart:v7:{instrument_key}:{range_name}:{source_interval}:{cache_key[3] or 'none'}"
     redis_cached = redis_get_json(redis_key)
     if redis_cached is not None:
         _CHART_PAYLOAD_CACHE[cache_key] = redis_cached
-        return redis_cached
+        return _attach_execution_signal_markers(db, redis_cached, symbol=display_symbol)
 
     plan = _chart_range_plan(
         range_name,
@@ -2790,7 +2855,7 @@ def build_chart_payload(
         payload,
         ttl_seconds=max(1, int(getattr(settings, "redis_chart_cache_ttl_seconds", 900))),
     )
-    return payload
+    return _attach_execution_signal_markers(db, payload, symbol=display_symbol)
 
 
 def _history_payload(

@@ -87,6 +87,7 @@ def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> Non
     from backend.execution_engine.live_service import _latest_fresh_pine_marker
 
     previous_start = datetime(2026, 6, 17, 14, 0, tzinfo=IST_ZONE)
+    pre_open_start = datetime(2026, 6, 18, 9, 0, tzinfo=IST_ZONE)
     current_start = datetime(2026, 6, 18, 9, 15, tzinfo=IST_ZONE)
     rows = []
     for index in range(60):
@@ -97,6 +98,17 @@ def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> Non
                 high=24002.0,
                 low=23998.0,
                 close=24001.0,
+                volume=100.0,
+            )
+        )
+    for index in range(15):
+        rows.append(
+            SimpleNamespace(
+                ts=pre_open_start + timedelta(minutes=index),
+                open=24050.0,
+                high=24052.0,
+                low=24048.0,
+                close=24051.0,
                 volume=100.0,
             )
         )
@@ -141,6 +153,7 @@ def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> Non
     assert marker["text"] == "BUY"
     assert len(captured_rows) == 60
     assert {row["ts"].date() for row in captured_rows} == {current_start.date()}
+    assert min(row["ts"] for row in captured_rows).time().isoformat() == "09:15:00"
 
 
 def test_serialize_signal_log_exposes_execution_decision() -> None:
@@ -176,6 +189,63 @@ def test_serialize_signal_log_exposes_execution_decision() -> None:
     assert payload["fresh_graph_marker"] is True
     assert payload["pine_marker_text"] == "BUY"
     assert payload["skip_reason"] == "No liquid option contract passed the live filter."
+
+
+def test_chart_payload_attaches_persisted_execution_signal_marker() -> None:
+    from backend.execution_engine.live_service import _attach_execution_signal_markers
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        signal_ts = datetime(2026, 6, 18, 10, 40, tzinfo=IST_ZONE)
+        session.add(
+            SignalLog(
+                timestamp=signal_ts,
+                trade_date=signal_ts.date(),
+                symbol="Nifty 50",
+                interval="1minute",
+                ml_signal="SELL",
+                ml_confidence=1.0,
+                pine_signal="SELL",
+                ai_score=0.0,
+                combined_score=1.0,
+                consensus="SELL",
+                trade_placed=True,
+                details={"fresh_graph_marker": True},
+            )
+        )
+        session.commit()
+
+        payload = _attach_execution_signal_markers(
+            session,
+            {
+                "candles": [
+                    {"x": "2026-06-18T09:15:00+05:30"},
+                    {"x": "2026-06-18T10:50:00+05:30"},
+                ],
+                "markers": [],
+            },
+            symbol="Nifty 50",
+        )
+
+        assert payload["markers"] == [
+            {
+                "time": "2026-06-18T10:40:00+05:30",
+                "position": "aboveBar",
+                "color": "#dc2626",
+                "shape": "arrowDown",
+                "text": "SELL",
+                "trade_placed": True,
+            }
+        ]
+    finally:
+        session.close()
 
 
 def test_build_technical_signal_holds_when_vix_too_high(monkeypatch) -> None:

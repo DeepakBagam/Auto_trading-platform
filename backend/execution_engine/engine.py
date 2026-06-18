@@ -5,9 +5,10 @@ import time as time_module
 from typing import Any
 
 from sqlalchemy import and_, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.db.models import DailySummary, ExecutionOrder, ExecutionPosition
+from backend.db.models import DailySummary, ExecutionOrder, ExecutionPosition, ExecutionSignalAudit
 from backend.execution_engine.broker import BaseBroker, BrokerOrderRequest, PaperBroker, UpstoxBroker
 from backend.execution_engine.live_service import (
     DIRECTIONAL_SIGNALS_ENABLED,
@@ -99,6 +100,25 @@ class IntradayOptionsExecutionEngine:
     def _is_force_squareoff(self, now: datetime) -> bool:
         current = now.timetz().replace(tzinfo=None)
         return current >= self._force_squareoff_time()
+
+    def _claim_signal_candle(self, db: Session, *, signal) -> bool:
+        candle_ts = signal.timestamp
+        claim = ExecutionSignalAudit(
+            trade_date=candle_ts.date(),
+            symbol=signal.symbol,
+            interval=signal.interval,
+            candle_ts=candle_ts,
+            signal_action=signal.action,
+            strategy_name=str(signal.details.get("strategy_name") or "auto"),
+            executed=False,
+        )
+        db.add(claim)
+        try:
+            db.commit()
+            return True
+        except IntegrityError:
+            db.rollback()
+            return False
 
     def _open_positions(self, db: Session, symbol: str | None = None) -> list[ExecutionPosition]:
         query = select(ExecutionPosition).where(ExecutionPosition.status == "OPEN")
@@ -723,6 +743,8 @@ class IntradayOptionsExecutionEngine:
         if self._last_entry_candle.get(symbol) == candle_key:
             return "skip:duplicate_candle"
         self._last_entry_candle[symbol] = candle_key
+        if not self._claim_signal_candle(db, signal=signal):
+            return "skip:duplicate_candle"
 
         log_row = log_signal_decision(db, signal=signal)
 

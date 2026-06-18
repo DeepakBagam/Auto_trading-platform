@@ -8,6 +8,7 @@ from backend.db.models import Base
 from backend.db.models import ExecutionPosition
 from backend.execution_engine.broker import BrokerOrderRequest, BrokerOrderResponse
 from backend.execution_engine.engine import IntradayOptionsExecutionEngine
+from backend.execution_engine.live_service import TechnicalSignal
 from backend.utils.app_state import set_runtime_trading_mode
 from backend.utils.config import Settings
 from backend.utils.constants import IST_ZONE
@@ -124,6 +125,34 @@ def test_live_run_once_blocks_when_broker_is_not_ready() -> None:
         assert result["status"] == "live_broker_not_ready"
         assert result["mode"] == "live"
         assert "invalid token" in result["reason"]
+    finally:
+        session.close()
+
+
+def test_signal_candle_claim_blocks_duplicate_workers() -> None:
+    session = _memory_session()
+    signal = TechnicalSignal(
+        symbol="Nifty 50",
+        interval="1minute",
+        timestamp=datetime(2026, 6, 18, 10, 40, tzinfo=IST_ZONE),
+        action="SELL",
+        bias="SELL",
+        score=100.0,
+        confidence=0.95,
+        conviction="high",
+        entry_price=24070.0,
+        stop_loss=24090.0,
+        take_profit=24040.0,
+        cooldown_seconds=0,
+        max_signals_reached=False,
+        reasons=["test"],
+        details={"strategy_name": "test"},
+    )
+    first_worker = IntradayOptionsExecutionEngine(settings=Settings())
+    second_worker = IntradayOptionsExecutionEngine(settings=Settings())
+    try:
+        assert first_worker._claim_signal_candle(session, signal=signal) is True
+        assert second_worker._claim_signal_candle(session, signal=signal) is False
     finally:
         session.close()
 
