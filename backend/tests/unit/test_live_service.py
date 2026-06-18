@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from backend.db.models import Base, DataFreshness, ExecutionPosition, OptionQuote, RawCandle
+from backend.db.models import Base, DataFreshness, ExecutionPosition, OptionQuote, RawCandle, SignalLog
 from backend.execution_engine.live_service import (
     MarketContext,
     build_live_price_update,
@@ -141,6 +141,41 @@ def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> Non
     assert marker["text"] == "BUY"
     assert len(captured_rows) == 60
     assert {row["ts"].date() for row in captured_rows} == {current_start.date()}
+
+
+def test_serialize_signal_log_exposes_execution_decision() -> None:
+    from backend.execution_engine.live_service import _serialize_signal_log
+
+    candle_ts = datetime(2026, 6, 18, 10, 37, tzinfo=IST_ZONE)
+    row = SignalLog(
+        id=42,
+        timestamp=candle_ts,
+        trade_date=candle_ts.date(),
+        symbol="Nifty 50",
+        interval="1minute",
+        ml_signal="BUY",
+        ml_confidence=0.8,
+        pine_signal="BUY",
+        ai_score=0.0,
+        combined_score=1.0,
+        consensus="BUY",
+        trade_placed=False,
+        skip_reason="No liquid option contract passed the live filter.",
+        details={
+            "fresh_graph_marker": True,
+            "pine_marker_time": candle_ts.isoformat(),
+            "pine_marker_text": "BUY",
+        },
+    )
+
+    payload = _serialize_signal_log(row)
+
+    assert payload["id"] == 42
+    assert payload["consensus"] == "BUY"
+    assert payload["trade_placed"] is False
+    assert payload["fresh_graph_marker"] is True
+    assert payload["pine_marker_text"] == "BUY"
+    assert payload["skip_reason"] == "No liquid option contract passed the live filter."
 
 
 def test_build_technical_signal_holds_when_vix_too_high(monkeypatch) -> None:

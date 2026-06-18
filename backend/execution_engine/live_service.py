@@ -2471,6 +2471,24 @@ def _serialize_order(row: ExecutionOrder) -> dict[str, Any]:
     }
 
 
+def _serialize_signal_log(row: SignalLog) -> dict[str, Any]:
+    details = row.details or {}
+    return {
+        "id": row.id,
+        "timestamp": _ensure_ist(row.timestamp).isoformat() if row.timestamp else None,
+        "symbol": row.symbol,
+        "interval": row.interval,
+        "consensus": row.consensus,
+        "combined_score": row.combined_score,
+        "pine_signal": row.pine_signal,
+        "trade_placed": bool(row.trade_placed),
+        "skip_reason": row.skip_reason,
+        "fresh_graph_marker": bool(details.get("fresh_graph_marker")),
+        "pine_marker_time": details.get("pine_marker_time"),
+        "pine_marker_text": details.get("pine_marker_text"),
+    }
+
+
 def _freshness_payload(
     db: Session,
     *,
@@ -2969,6 +2987,21 @@ def build_live_snapshot(
         .all()
     )
     recent_orders = [row for row in recent_orders if _order_matches_mode(row, runtime_mode)][:20]
+    recent_signals = (
+        db.execute(
+            select(SignalLog)
+            .where(
+                and_(
+                    SignalLog.trade_date == datetime.now(IST_ZONE).date(),
+                    symbol_value_filter(SignalLog.symbol, context.symbol),
+                )
+            )
+            .order_by(SignalLog.id.desc())
+            .limit(10)
+        )
+        .scalars()
+        .all()
+    )
     current_bar = context.current_bar
     change = float(current_bar["close"] or 0.0) - float(current_bar["open"] or 0.0)
     change_pct = (change / float(current_bar["open"] or 1.0)) * 100.0
@@ -3041,7 +3074,7 @@ def build_live_snapshot(
         "positions": [_serialize_position(row) for row in open_positions],
         "recent_trades": [_serialize_position(row) for row in recent_trades],
         "recent_orders": [_serialize_order(row) for row in recent_orders],
-        "recent_signals": [],
+        "recent_signals": [_serialize_signal_log(row) for row in recent_signals],
     }
     if include_chart:
         payload["chart"] = _chart_payload(context, db)

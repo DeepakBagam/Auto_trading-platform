@@ -744,6 +744,43 @@ function mergeLiveChart(currentChart, update) {
   };
 }
 
+function markerFromSignal(signal) {
+  const details = signal?.details || {};
+  const action = String(details.pine_marker_text || "").toUpperCase();
+  const time = details.pine_marker_time;
+  if (!details.fresh_graph_marker || !time || !["BUY", "SELL"].includes(action)) {
+    return null;
+  }
+  return {
+    time,
+    position: action === "BUY" ? "belowBar" : "aboveBar",
+    color: action === "BUY" ? "#16a34a" : "#dc2626",
+    shape: action === "BUY" ? "arrowUp" : "arrowDown",
+    text: action,
+  };
+}
+
+function mergeSignalMarker(currentChart, signal) {
+  if (!currentChart) {
+    return currentChart;
+  }
+  const current = currentChart;
+  const marker = markerFromSignal(signal);
+  if (!marker || !current.supports_live) {
+    return current;
+  }
+  const markers = [...(current.markers || [])];
+  const markerKey = `${marker.time}:${marker.text}`;
+  if (!markers.some((row) => `${row.time}:${row.text}` === markerKey)) {
+    markers.push(marker);
+  }
+  markers.sort((a, b) => parseChartTime(a.time) - parseChartTime(b.time));
+  return {
+    ...current,
+    markers,
+  };
+}
+
 function MetricCard({ label, value, meta, tone }) {
   return (
     <article className="metric-card">
@@ -1767,10 +1804,16 @@ function LiveDataCard({ price, freshness, history, chart, stream }) {
   );
 }
 
-function StrategySignalCard({ signal, option }) {
+function StrategySignalCard({ signal, option, recentSignals }) {
   const [showDetails, setShowDetails] = useState(false);
   const details = signal?.details || {};
   const optionSignal = option?.signal || {};
+  const latestExecutionSignal = recentSignals?.[0] || null;
+  const executionDecision = latestExecutionSignal?.trade_placed
+    ? { label: "Order placed", tone: "positive" }
+    : latestExecutionSignal
+      ? { label: "Evaluated / skipped", tone: "neutral" }
+      : { label: "Waiting for worker", tone: "warn" };
   const tone = signalTone(signal);
   const readiness = entryReadiness(signal, optionSignal);
   const checks = [
@@ -1848,6 +1891,14 @@ function StrategySignalCard({ signal, option }) {
         <span className="chip">Option {details.option_preference || "ATM_ONLY"}</span>
         <span className="chip">CE score {details.score_buy ?? "-"}</span>
         <span className="chip">PE score {details.score_sell ?? "-"}</span>
+      </div>
+
+      <div className="stack-list">
+        <div className="note-row compact">
+          <strong className={executionDecision.tone}>{executionDecision.label}</strong>
+          <span>{latestExecutionSignal ? formatDateTime(latestExecutionSignal.timestamp) : "-"}</span>
+          <span>{latestExecutionSignal?.skip_reason || latestExecutionSignal?.consensus || "No execution decision recorded yet."}</span>
+        </div>
       </div>
 
       {showDetails ? (
@@ -3331,6 +3382,15 @@ function App() {
               calendar: message.payload?.calendar || current?.calendar || {},
               history: message.payload?.history || current?.history || {},
             })));
+            if (chartSelectionRef.current.interval === "1minute") {
+              setChart((current) => {
+                const next = mergeSignalMarker(current, message.payload?.signal);
+                if (next?.range && next?.interval) {
+                  chartCacheRef.current.set(chartCacheKey(symbol, next.range, next.interval), next);
+                }
+                return next;
+              });
+            }
             setStreamState("live");
             return;
           }
@@ -4285,7 +4345,11 @@ function App() {
             </section>
 
             <section className="signal-board">
-              <StrategySignalCard signal={signal} option={option} />
+              <StrategySignalCard
+                signal={signal}
+                option={option}
+                recentSignals={selectedSnapshot.recent_signals || []}
+              />
               <EngineStrikeCard signal={signal} option={option} onInspect={setContractModal} />
               <LiveDataCard
                 price={price}
