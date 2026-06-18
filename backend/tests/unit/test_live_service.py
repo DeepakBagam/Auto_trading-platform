@@ -83,6 +83,66 @@ def _context() -> MarketContext:
     )
 
 
+def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> None:
+    from backend.execution_engine.live_service import _latest_fresh_pine_marker
+
+    previous_start = datetime(2026, 6, 17, 14, 0, tzinfo=IST_ZONE)
+    current_start = datetime(2026, 6, 18, 9, 15, tzinfo=IST_ZONE)
+    rows = []
+    for index in range(60):
+        rows.append(
+            SimpleNamespace(
+                ts=previous_start + timedelta(minutes=index),
+                open=24000.0,
+                high=24002.0,
+                low=23998.0,
+                close=24001.0,
+                volume=100.0,
+            )
+        )
+    for index in range(60):
+        rows.append(
+            SimpleNamespace(
+                ts=current_start + timedelta(minutes=index),
+                open=24100.0,
+                high=24102.0,
+                low=24098.0,
+                close=24101.0,
+                volume=100.0,
+            )
+        )
+
+    captured_rows = []
+
+    def fake_overlay(overlay_rows, **_kwargs):
+        captured_rows.extend(overlay_rows)
+        return {
+            "markers": [
+                {
+                    "time": (current_start + timedelta(minutes=59)).isoformat(),
+                    "text": "BUY",
+                }
+            ],
+            "levels": [],
+        }
+
+    monkeypatch.setattr(
+        "backend.execution_engine.live_service._build_pine_chart_overlay",
+        fake_overlay,
+    )
+
+    marker = _latest_fresh_pine_marker(
+        rows,
+        settings=Settings(),
+        candle_ts=current_start + timedelta(minutes=59),
+    )
+
+    assert marker is not None
+    assert marker["text"] == "BUY"
+    assert len(captured_rows) == 60
+    assert {row["ts"].date() for row in captured_rows} == {current_start.date()}
+
+
 def test_build_technical_signal_holds_when_vix_too_high(monkeypatch) -> None:
     """VIX ratio >1.40 above its MA must force HOLD regardless of technicals."""
     # VIX=25, MA=17 → ratio≈1.47 (>1.40 threshold)

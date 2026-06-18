@@ -1153,7 +1153,15 @@ def _latest_fresh_pine_marker(
     settings: Settings,
     candle_ts: datetime,
 ) -> dict[str, Any] | None:
-    overlay_rows = _candles_to_frame(rows).to_dict("records")
+    candle_ts = _ensure_ist(candle_ts)
+    if candle_ts is None:
+        return None
+    session_rows = [
+        row
+        for row in rows
+        if (_ensure_ist(row.ts) is not None and _ensure_ist(row.ts).date() == candle_ts.date())
+    ]
+    overlay_rows = _candles_to_frame(session_rows).to_dict("records")
     overlay = _build_pine_chart_overlay(
         overlay_rows,
         interval=SIGNAL_INTERVAL,
@@ -1165,8 +1173,7 @@ def _latest_fresh_pine_marker(
         return None
     latest_marker = markers[-1]
     marker_ts = _parse_iso_datetime(latest_marker.get("time"))
-    candle_ts = _ensure_ist(candle_ts)
-    if marker_ts is None or candle_ts is None:
+    if marker_ts is None:
         return None
     if marker_ts.replace(second=0, microsecond=0) != candle_ts.replace(second=0, microsecond=0):
         return None
