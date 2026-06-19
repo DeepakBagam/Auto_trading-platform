@@ -28,7 +28,7 @@ from backend.utils.app_state import (
 )
 from backend.utils.config import Settings, get_settings, read_runtime_upstox_access_token
 from backend.utils.constants import IST_ZONE
-from backend.utils.notifications import send_email_message, send_email_message_result, smtp_ready
+from backend.utils.notifications import send_email_message_result, smtp_ready
 
 router = APIRouter(prefix="/execution", tags=["execution"])
 
@@ -69,6 +69,7 @@ class RuntimeSettingsRequest(BaseModel):
     force_squareoff_time: str | None = None
     signal_min_score: float | None = None
     signal_cooldown_minutes: int | None = None
+    signal_max_per_day: int | None = None
     signal_require_volume_confirmation: bool | None = None
     signal_min_volume_ratio: float | None = None
     signal_require_breakout: bool | None = None
@@ -127,6 +128,7 @@ def _serializable_settings(settings: Settings, *, runtime: dict | None = None, t
         "force_squareoff_time": str(settings.force_squareoff_time),
         "signal_min_score": float(settings.signal_min_score),
         "signal_cooldown_minutes": int(settings.signal_cooldown_minutes),
+        "signal_max_per_day": int(settings.signal_max_per_day),
         "signal_require_volume_confirmation": bool(settings.signal_require_volume_confirmation),
         "signal_min_volume_ratio": float(settings.signal_min_volume_ratio),
         "signal_require_breakout": bool(settings.signal_require_breakout),
@@ -273,6 +275,8 @@ def update_runtime_settings(request: RuntimeSettingsRequest, db: Session = Depen
     for key in ("signal_min_score", "signal_min_volume_ratio", "signal_vix_min", "signal_vix_max", "signal_atr_min_points", "signal_atr_max_points", "option_min_volume", "option_min_oi", "option_max_spread_pct"):
         if values.get(key) is not None and float(values[key]) < 0:
             raise HTTPException(status_code=400, detail=f"{key} cannot be negative")
+    if values.get("signal_max_per_day") is not None and int(values["signal_max_per_day"]) < 1:
+        raise HTTPException(status_code=400, detail="Successful trades per symbol must be at least 1")
     if (
         values.get("signal_vix_min") is not None
         and values.get("signal_vix_max") is not None
@@ -399,6 +403,11 @@ def delete_position(position_id: int, db: Session = Depends(get_db)) -> dict:
     position = db.get(ExecutionPosition, position_id)
     if position is None:
         raise HTTPException(status_code=404, detail="Position not found")
+    if str(position.status).upper() in {"ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete a position while broker reconciliation is pending",
+        )
     orders = (
         db.execute(select(ExecutionOrder).where(ExecutionOrder.position_id == position_id))
         .scalars()
@@ -502,7 +511,11 @@ def status(db: Session = Depends(get_db)) -> dict:
     engine.settings.execution_mode = runtime_mode
     engine.broker = engine._build_broker()
     open_positions = (
-        db.execute(select(ExecutionPosition).where(ExecutionPosition.status == "OPEN"))
+        db.execute(
+            select(ExecutionPosition).where(
+                ExecutionPosition.status.in_(["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"])
+            )
+        )
         .scalars()
         .all()
     )
@@ -548,7 +561,11 @@ def portfolio(db: Session = Depends(get_db)) -> dict:
         return {"mode": mode, **data}
     paper = compute_paper_portfolio_metrics(db, settings=engine.settings)
     positions = (
-        db.execute(select(ExecutionPosition).where(ExecutionPosition.status == "OPEN"))
+        db.execute(
+            select(ExecutionPosition).where(
+                ExecutionPosition.status.in_(["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"])
+            )
+        )
         .scalars()
         .all()
     )

@@ -1,4 +1,19 @@
-from backend.api.routes.execution import _check_upstox_profile
+from datetime import date
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
+from backend.api.routes.execution import (
+    RuntimeSettingsRequest,
+    _check_upstox_profile,
+    _serializable_settings,
+    delete_position,
+    update_runtime_settings,
+)
+from backend.db.models import Base, ExecutionPosition
 from backend.utils.config import Settings
 
 
@@ -44,3 +59,64 @@ def test_check_upstox_profile_reports_expired_token(monkeypatch) -> None:
 
     assert out["status"] == "error"
     assert "expired" in out["detail"]
+
+
+def test_serializable_settings_exposes_signal_max_per_day() -> None:
+    out = _serializable_settings(Settings(_env_file=None, signal_max_per_day=4))
+
+    assert out["signal_max_per_day"] == 4
+
+
+def test_runtime_settings_rejects_zero_signal_max_per_day() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        with pytest.raises(HTTPException, match="Successful trades per symbol must be at least 1"):
+            update_runtime_settings(RuntimeSettingsRequest(signal_max_per_day=0), session)
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("status", ["ENTRY_PENDING", "EXIT_PENDING"])
+def test_delete_position_rejects_pending_reconciliation(status: str) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        position = ExecutionPosition(
+            trade_date=date(2026, 6, 18),
+            symbol="Nifty 50",
+            interval="1minute",
+            strategy_name="test",
+            option_type="CE",
+            expiry_date=date(2026, 6, 25),
+            strike=25000.0,
+            quantity=75,
+            status=status,
+            entry_price=100.0,
+            stop_loss=75.0,
+            trailing_stop=75.0,
+            metadata_json={"reconciliation_needed": True},
+        )
+        session.add(position)
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            delete_position(position.id, session)
+
+        assert exc_info.value.status_code == 409
+        assert "broker reconciliation is pending" in exc_info.value.detail
+        assert session.get(ExecutionPosition, position.id) is position
+    finally:
+        session.close()

@@ -168,6 +168,9 @@ function formatNs(value) {
 }
 
 function formatAge(seconds) {
+  if (seconds === null || seconds === undefined || seconds === "") {
+    return "-";
+  }
   const amount = Number(seconds);
   if (!Number.isFinite(amount)) {
     return "-";
@@ -178,6 +181,123 @@ function formatAge(seconds) {
   const mins = Math.floor(amount / 60);
   const secs = Math.round(amount % 60);
   return `${mins}m ${secs}s`;
+}
+
+function nullableNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function diagnosticObjects(...items) {
+  const output = [];
+  const seen = new Set();
+  const nestedKeys = [
+    "details",
+    "option_selection",
+    "option_selection_diagnostics",
+    "candidate_diagnostics",
+    "selection",
+    "diagnostics",
+    "selected_contract",
+    "contract",
+    "quote",
+    "liquidity",
+    "signal",
+  ];
+  function visit(value, depth = 0) {
+    if (!value || typeof value !== "object" || seen.has(value) || depth > 4) {
+      return;
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, depth + 1));
+      return;
+    }
+    output.push(value);
+    nestedKeys.forEach((key) => visit(value[key], depth + 1));
+  }
+  items.forEach((item) => visit(item));
+  return output;
+}
+
+function diagnosticValue(items, keys) {
+  const objects = diagnosticObjects(...items);
+  for (const item of objects) {
+    for (const key of keys) {
+      const value = item[key];
+      if (value !== null && value !== undefined && value !== "") {
+        return value;
+      }
+    }
+  }
+  return null;
+}
+
+function diagnosticReasons(...items) {
+  const reasonKeys = [
+    "rejection_reasons",
+    "failure_reasons",
+    "liquidity_failures",
+    "filter_failures",
+    "rejections",
+    "reasons",
+  ];
+  const values = [];
+  diagnosticObjects(...items).forEach((item) => {
+    reasonKeys.forEach((key) => {
+      const raw = item[key];
+      const entries = Array.isArray(raw) ? raw : raw ? [raw] : [];
+      entries.forEach((entry) => {
+        const text = typeof entry === "string"
+          ? entry
+          : entry?.message || entry?.reason || entry?.detail || entry?.code;
+        if (text && !values.includes(String(text))) {
+          values.push(String(text));
+        }
+      });
+    });
+  });
+  return values;
+}
+
+function quoteProvenance(...items) {
+  const source = diagnosticValue(items, ["latest_quote_source", "quote_source", "price_source"]);
+  const timestamp = diagnosticValue(items, [
+    "latest_quote_ts",
+    "quote_timestamp",
+    "quote_ts",
+    "chain_generated_at",
+  ]);
+  const explicitAgeRaw = diagnosticValue(items, [
+    "latest_quote_age_seconds",
+    "quote_age_seconds",
+    "age_seconds",
+  ]);
+  let ageSeconds = nullableNumber(explicitAgeRaw);
+  if (ageSeconds === null && timestamp) {
+    const parsed = new Date(timestamp);
+    if (!Number.isNaN(parsed.getTime())) {
+      ageSeconds = Math.max(0, (Date.now() - parsed.getTime()) / 1000);
+    }
+  }
+  return {
+    source: source ? String(source) : "",
+    timestamp: timestamp || null,
+    ageSeconds,
+  };
+}
+
+function quoteSummary(...items) {
+  const quote = quoteProvenance(...items);
+  if (!quote.source && !quote.timestamp) {
+    return "-";
+  }
+  const source = quote.source || "unknown";
+  const age = Number.isFinite(quote.ageSeconds) ? formatAge(quote.ageSeconds) : "";
+  return age ? `${source} / ${age}` : source;
 }
 
 function formatFlag(value) {
@@ -1809,6 +1929,45 @@ function StrategySignalCard({ signal, option, recentSignals }) {
   const details = signal?.details || {};
   const optionSignal = option?.signal || {};
   const latestExecutionSignal = recentSignals?.[0] || null;
+  const executionDetails = latestExecutionSignal?.details || {};
+  const executionConsensus = String(latestExecutionSignal?.consensus || "").toUpperCase();
+  const markerDetected = Boolean(
+    latestExecutionSignal?.fresh_graph_marker
+    || executionDetails.fresh_graph_marker
+    || executionConsensus === "BUY"
+    || executionConsensus === "SELL"
+  );
+  const selectedStrike = diagnosticValue(
+    [latestExecutionSignal, executionDetails, optionSignal],
+    ["selected_strike", "strike", "strike_price"],
+  );
+  const selectedType = diagnosticValue(
+    [latestExecutionSignal, executionDetails, optionSignal],
+    ["option_type"],
+  );
+  const selectedExpiry = diagnosticValue(
+    [latestExecutionSignal, executionDetails, option],
+    ["expiry_date", "expiry"],
+  );
+  const candidateRows = diagnosticValue(
+    [latestExecutionSignal, executionDetails],
+    ["candidate_diagnostics", "candidates", "candidate_contracts", "contracts_checked"],
+  );
+  const candidateCountRaw = diagnosticValue(
+    [latestExecutionSignal, executionDetails],
+    ["candidate_count", "candidates_checked", "contracts_checked_count"],
+  );
+  const candidateCount = candidateCountRaw !== null && Number.isFinite(Number(candidateCountRaw))
+    ? Number(candidateCountRaw)
+    : Array.isArray(candidateRows) ? candidateRows.length : null;
+  const selectionReasons = diagnosticReasons(
+    executionDetails.option_selection,
+    executionDetails.option_selection_diagnostics,
+    latestExecutionSignal?.option_selection,
+    latestExecutionSignal?.option_selection_diagnostics,
+    optionSignal?.action === "HOLD" ? optionSignal : null,
+  ).filter((reason) => reason !== latestExecutionSignal?.skip_reason);
+  const quote = quoteProvenance(latestExecutionSignal, executionDetails, optionSignal, option);
   const executionDecision = latestExecutionSignal?.trade_placed
     ? { label: "Order placed", tone: "positive" }
     : latestExecutionSignal
@@ -1895,10 +2054,44 @@ function StrategySignalCard({ signal, option, recentSignals }) {
 
       <div className="stack-list">
         <div className="note-row compact">
-          <strong className={executionDecision.tone}>{executionDecision.label}</strong>
+          <strong className={markerDetected ? "positive" : "neutral"}>Marker</strong>
           <span>{latestExecutionSignal ? formatDateTime(latestExecutionSignal.timestamp) : "-"}</span>
+          <span>
+            {markerDetected
+              ? `${executionConsensus || latestExecutionSignal?.pine_marker_text || "Signal"} detected`
+              : "No fresh executable marker"}
+          </span>
+        </div>
+        <div className="note-row compact">
+          <strong className={selectedStrike ? "positive" : "neutral"}>Contract</strong>
+          <span>{selectedStrike ? `${selectedStrike} ${selectedType || ""}`.trim() : "Not selected"}</span>
+          <span>
+            {selectedExpiry
+              ? `Expiry ${formatDate(selectedExpiry)}`
+              : candidateCount !== null ? `${candidateCount} candidate(s) checked` : "Waiting for option selection"}
+          </span>
+        </div>
+        <div className="note-row compact">
+          <strong className={executionDecision.tone}>{executionDecision.label}</strong>
+          <span>{latestExecutionSignal?.trade_placed ? "Accepted" : "Blocked"}</span>
           <span>{latestExecutionSignal?.skip_reason || latestExecutionSignal?.consensus || "No execution decision recorded yet."}</span>
         </div>
+        <div className="note-row compact">
+          <strong>Quote</strong>
+          <span>{quote.source || "-"}</span>
+          <span>
+            {quote.timestamp
+              ? `${formatDateTime(quote.timestamp)} / age ${formatAge(quote.ageSeconds)}`
+              : "No quote timestamp recorded"}
+          </span>
+        </div>
+        {selectionReasons.slice(0, 4).map((reason) => (
+          <div key={reason} className="note-row compact">
+            <strong className="negative">Rejected</strong>
+            <span>Option filter</span>
+            <span>{reason}</span>
+          </div>
+        ))}
       </div>
 
       {showDetails ? (
@@ -1936,6 +2129,15 @@ function EngineStrikeCard({ signal, option, onInspect }) {
   const optionType = optionSignal.option_type || "-";
   const readiness = entryReadiness(signal, optionSignal);
   const rr = riskReward(optionSignal.entry_price, optionSignal.stop_loss, optionSignal.take_profit);
+  const quote = quoteProvenance(optionSignal, option);
+  const selectionReasons = diagnosticReasons(optionSignal);
+  const liquidity = optionSignal.liquidity || {};
+  const bid = nullableNumber(liquidity.bid);
+  const ask = nullableNumber(liquidity.ask);
+  const spreadPct = bid !== null && ask !== null
+    && Number.isFinite(bid) && Number.isFinite(ask) && (bid + ask) > 0
+    ? ((ask - bid) / ((ask + bid) / 2)) * 100
+    : null;
   const canInspect = (
     onInspect
     && option?.expiry_date
@@ -2008,6 +2210,26 @@ function EngineStrikeCard({ signal, option, onInspect }) {
           <strong>{rr}</strong>
         </div>
       </div>
+      <div className="chip-row">
+        <span className="chip">Chain {option?.chain_source || "-"}</span>
+        <span className="chip">Quote {quote.source || "-"}</span>
+        <span className="chip">Age {formatAge(quote.ageSeconds)}</span>
+        <span className="chip">Volume {formatCount(liquidity.volume)}</span>
+        <span className="chip">OI {formatCount(liquidity.oi)}</span>
+        <span className="chip">Spread {spreadPct === null ? "-" : formatPct(spreadPct)}</span>
+      </div>
+      {selectionReasons.length ? (
+        <div className="stack-list">
+          {selectionReasons.slice(0, 4).map((reason) => (
+            <div key={reason} className="note-row compact">
+              <strong className={optionSignal.action === "BUY" ? "positive" : "negative"}>
+                {optionSignal.action === "BUY" ? "Check" : "Rejected"}
+              </strong>
+              <span>{reason}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -2206,47 +2428,84 @@ function PositionsTable({ positions, onClose, onDelete, onInspect }) {
                 <th>Symbol</th>
                 <th>Strike</th>
                 <th>Type</th>
+                <th>Status</th>
                 <th>Entry</th>
                 <th>Current</th>
+                <th>Quote</th>
                 <th>P&amp;L</th>
                 <th>SL</th>
                 <th>Action</th>
               </tr>
             </thead>
             <tbody>
-              {positions.map((row) => (
-                <tr key={row.position_id}>
-                  <td>{row.symbol}</td>
-                  <td>
-                    <button
-                      type="button"
-                      className="inline-link"
-                      onClick={() => onInspect({
-                        symbol: row.symbol,
-                        strike: row.strike,
-                        optionType: row.option_type,
-                        expiry: row.expiry,
-                        positionId: row.position_id,
-                      })}
-                    >
-                      {row.strike}
-                    </button>
-                  </td>
-                  <td>{row.option_type}</td>
-                  <td>{formatMoney(row.entry_premium)}</td>
-                  <td>{formatMoney(row.current_premium)}</td>
-                  <td className={Number(row.unrealized_pnl) >= 0 ? "positive" : "negative"}>
-                    {formatSignedMoney(row.unrealized_pnl)}
-                  </td>
-                  <td>{formatMoney(row.current_sl)}</td>
-                  <td>
-                    <div className="button-row compact-actions">
-                      <button type="button" className="line-button" onClick={() => onClose(row.position_id)}>Exit</button>
-                      <button type="button" className="line-button" onClick={() => onDelete(row.position_id)}>Delete</button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {positions.map((row) => {
+                const status = String(row.status || "OPEN").toUpperCase();
+                const reconciliationPending = ["ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"].includes(status);
+                const statusLabel = status === "ENTRY_PENDING"
+                  ? "Entry pending reconciliation"
+                  : status === "EXIT_SUBMITTING"
+                    ? "Exit submission in progress"
+                  : status === "EXIT_PENDING"
+                    ? "Exit pending reconciliation"
+                    : status;
+                return (
+                  <tr key={row.position_id}>
+                    <td>{row.symbol}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="inline-link"
+                        onClick={() => onInspect({
+                          symbol: row.symbol,
+                          strike: row.strike,
+                          optionType: row.option_type,
+                          expiry: row.expiry,
+                          positionId: row.position_id,
+                        })}
+                      >
+                        {row.strike}
+                      </button>
+                    </td>
+                    <td>{row.option_type}</td>
+                    <td>
+                      <span className={`tag ${reconciliationPending ? "hold" : "buy"}`}>
+                        {statusLabel}
+                      </span>
+                    </td>
+                    <td>{formatMoney(row.entry_premium)}</td>
+                    <td>{formatMoney(row.current_premium)}</td>
+                    <td title={row.latest_quote_ts ? formatDateTime(row.latest_quote_ts) : ""}>
+                      {quoteSummary(row)}
+                    </td>
+                    <td className={Number(row.unrealized_pnl) >= 0 ? "positive" : "negative"}>
+                      {formatSignedMoney(row.unrealized_pnl)}
+                    </td>
+                    <td>{formatMoney(row.current_sl)}</td>
+                    <td>
+                      <div className="button-row compact-actions">
+                        <button
+                          type="button"
+                          className="line-button"
+                          disabled={reconciliationPending}
+                          title={reconciliationPending ? "Position is awaiting broker reconciliation" : "Exit position"}
+                          onClick={() => onClose(row.position_id)}
+                        >
+                          Exit
+                        </button>
+                        <button
+                          type="button"
+                          className="line-button"
+                          disabled={reconciliationPending}
+                          title={reconciliationPending ? "Cannot delete while broker reconciliation is pending" : "Delete position"}
+                          onClick={() => onDelete(row.position_id)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -2276,6 +2535,7 @@ function TradesTable({ rows }) {
                 <th>Type</th>
                 <th>Entry</th>
                 <th>Exit</th>
+                <th>Quote</th>
                 <th>P&amp;L</th>
                 <th>Reason</th>
               </tr>
@@ -2288,6 +2548,9 @@ function TradesTable({ rows }) {
                   <td>{row.option_type}</td>
                   <td>{formatMoney(row.entry_premium)}</td>
                   <td>{formatMoney(row.exit_premium)}</td>
+                  <td title={row.latest_quote_ts ? formatDateTime(row.latest_quote_ts) : ""}>
+                    {quoteSummary(row)}
+                  </td>
                   <td className={Number(row.realized_pnl) >= 0 ? "positive" : "negative"}>
                     {formatSignedMoney(row.realized_pnl)}
                   </td>
@@ -2348,6 +2611,7 @@ function PortfolioCard({ mode, portfolio, onResetPaper, onRefresh, busy }) {
                 <th>Qty</th>
                 <th>Avg</th>
                 <th>Last</th>
+                <th>Quote</th>
                 <th>P&amp;L</th>
               </tr>
             </thead>
@@ -2358,6 +2622,9 @@ function PortfolioCard({ mode, portfolio, onResetPaper, onRefresh, busy }) {
                   <td>{row.quantity || row.net_quantity || "-"}</td>
                   <td>{formatMoney(row.average_price || row.buy_price || row.entry_premium)}</td>
                   <td>{formatMoney(row.last_price || row.current_premium)}</td>
+                  <td title={row.latest_quote_ts ? formatDateTime(row.latest_quote_ts) : ""}>
+                    {quoteSummary(row)}
+                  </td>
                   <td className={Number(row.pnl || row.unrealized_pnl || 0) >= 0 ? "positive" : "negative"}>
                     {formatSignedMoney(row.pnl || row.unrealized_pnl || 0)}
                   </td>
@@ -2446,6 +2713,7 @@ function settingsToDraft(settings = {}) {
     "force_squareoff_time",
     "signal_min_score",
     "signal_cooldown_minutes",
+    "signal_max_per_day",
     "smtp_enabled",
     "smtp_host",
     "smtp_port",
@@ -2495,6 +2763,7 @@ function settingsDraftPayload(draft = {}) {
     "execution_max_daily_trades",
     "execution_lot_size",
     "signal_cooldown_minutes",
+    "signal_max_per_day",
     "smtp_port",
   ].forEach((key) => {
     const raw = payload[key];
@@ -2696,6 +2965,9 @@ function SettingsWindow({
             <SettingsField label="Cooldown Min" defaultText={formatDefaultValue(defaults, "signal_cooldown_minutes")}>
               <input className="select" type="number" min="0" value={settingsInputValue(draft, "signal_cooldown_minutes")} onChange={(event) => update("signal_cooldown_minutes", event.target.value)} />
             </SettingsField>
+            <SettingsField label="Successful Trades / Symbol" defaultText={formatDefaultValue(defaults, "signal_max_per_day")}>
+              <input className="select" type="number" min="1" value={settingsInputValue(draft, "signal_max_per_day")} onChange={(event) => update("signal_max_per_day", event.target.value)} />
+            </SettingsField>
           </div>
         </article>
 
@@ -2866,6 +3138,7 @@ function TradeHistoryDashboard({ historyData, strategyRows, filters, onFilterCha
                     <th>Contract</th>
                     <th>Entry</th>
                     <th>Exit</th>
+                    <th>Quote</th>
                     <th>P&amp;L</th>
                   </tr>
                 </thead>
@@ -2877,6 +3150,9 @@ function TradeHistoryDashboard({ historyData, strategyRows, filters, onFilterCha
                       <td>{row.strike} {row.option_type}</td>
                       <td>{formatMoney(row.entry_premium)}</td>
                       <td>{formatMoney(row.exit_premium)}</td>
+                      <td title={row.latest_quote_ts ? formatDateTime(row.latest_quote_ts) : ""}>
+                        {quoteSummary(row)}
+                      </td>
                       <td className={Number(row.realized_pnl) >= 0 ? "positive" : "negative"}>{formatSignedMoney(row.realized_pnl)}</td>
                     </tr>
                   ))}
@@ -4198,32 +4474,6 @@ function App() {
             </div>
           </div>
 
-          <div className="header-status-row">
-            <span className="chip emphasis">Stream {streamState}</span>
-            <span className={`chip ${brokerStatus === "ok" || brokerStatus === "paper" ? "emphasis" : ""}`}>
-              Broker {brokerStatus}
-            </span>
-            <span className="chip">Market {freshness.market_status || "-"}</span>
-            <span className="chip">Watchlist {layout.activeWatchlist}</span>
-            {chartHistoryLoading ? <span className="chip">Loading history</span> : null}
-            <span className="chip">IST {summaryLine}</span>
-          </div>
-          <div className="watchlist-row">
-            {Object.keys(layout.watchlists || {}).map((name) => (
-              <button key={name} type="button" className={`range-button ${layout.activeWatchlist === name ? "active" : ""}`} onClick={() => setActiveWatchlist(name)}>
-                {name}
-              </button>
-            ))}
-            <button type="button" className="tool-button" onClick={createWatchlist} title="New watchlist">
-              <span className="material-symbols-outlined" aria-hidden="true">add</span>
-            </button>
-            <button type="button" className="line-button" onClick={() => addToWatchlist(symbol)}>Add {symbol}</button>
-            {(layout.watchlists?.[layout.activeWatchlist] || []).map((item) => (
-              <button key={item} type="button" className={`watchlist-chip ${item === symbol ? "active" : ""}`} onClick={() => selectSymbol(item)} onDoubleClick={() => removeFromWatchlist(item)}>
-                {layout.favorites.includes(item) ? "★ " : ""}{item}
-              </button>
-            ))}
-          </div>
         </header>
 
         {error ? <div className="error-banner">{error}</div> : null}

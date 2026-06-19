@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
@@ -8,11 +8,16 @@ from sqlalchemy.pool import StaticPool
 from backend.db.models import Base, DataFreshness, ExecutionPosition, OptionQuote, RawCandle, SignalLog
 from backend.execution_engine.live_service import (
     MarketContext,
+    TechnicalSignal,
+    _maybe_refresh_option_chain,
+    _option_liquidity_failures,
     build_live_price_update,
+    build_option_selection,
     build_technical_signal,
     compute_paper_portfolio_metrics,
     latest_option_premium,
     refresh_open_positions_snapshot,
+    resolve_live_option_quote,
 )
 from backend.utils.config import Settings
 from backend.utils.constants import IST_ZONE
@@ -80,6 +85,79 @@ def _context() -> MarketContext:
             "close": float(latest.close),
             "volume": float(latest.volume),
         },
+    )
+
+
+def _option_context(*, latest_price: float = 24110.0) -> MarketContext:
+    return MarketContext(
+        symbol="Nifty 50",
+        instrument_key="NSE_INDEX|Nifty 50",
+        latest_price=latest_price,
+        latest_candle_ts=datetime.now(IST_ZONE),
+        chart_rows=[],
+        signal_rows=[],
+        technical_context={},
+        current_bar={
+            "open": latest_price,
+            "high": latest_price,
+            "low": latest_price,
+            "close": latest_price,
+            "volume": 0.0,
+        },
+    )
+
+
+def _option_signal(*, action: str = "BUY") -> TechnicalSignal:
+    return TechnicalSignal(
+        symbol="Nifty 50",
+        interval="1minute",
+        timestamp=datetime.now(IST_ZONE),
+        action=action,
+        bias=action,
+        score=80.0,
+        confidence=0.8,
+        conviction="high",
+        entry_price=24110.0,
+        stop_loss=24080.0,
+        take_profit=24170.0,
+        cooldown_seconds=0,
+        max_signals_reached=False,
+        reasons=[],
+        details={"atr_14": 10.0},
+    )
+
+
+def _add_option_quote(
+    session: Session,
+    *,
+    expiry: date,
+    strike: float,
+    option_type: str = "CE",
+    ts: datetime | None = None,
+    ltp: float = 100.0,
+    bid: float = 99.0,
+    ask: float = 101.0,
+    volume: float = 1000.0,
+    oi: float = 2000.0,
+    source: str = "upstox_option_chain",
+) -> None:
+    session.add(
+        OptionQuote(
+            instrument_key=f"NSE_FO|{int(strike)}{option_type}",
+            underlying_key="NSE_INDEX|Nifty 50",
+            underlying_symbol="Nifty 50",
+            expiry_date=expiry,
+            strike=strike,
+            option_type=option_type,
+            ts=ts or datetime.now(IST_ZONE),
+            ltp=ltp,
+            bid=bid,
+            ask=ask,
+            volume=volume,
+            oi=oi,
+            close_price=ltp,
+            source=source,
+        )
     )
 
 
@@ -178,6 +256,21 @@ def test_serialize_signal_log_exposes_execution_decision() -> None:
             "fresh_graph_marker": True,
             "pine_marker_time": candle_ts.isoformat(),
             "pine_marker_text": "BUY",
+            "option_selection": {
+                "quote_status": "unavailable",
+                "quote_source": None,
+                "quote_ts": None,
+                "quote_age_seconds": None,
+                "requested_atm": 24100.0,
+                "candidate_diagnostics": [
+                    {
+                        "strike": 24100.0,
+                        "status": "rejected",
+                        "rejections": ["Quote is stale."],
+                    }
+                ],
+                "reasons": ["Real Upstox option chain is stale."],
+            },
         },
     )
 
@@ -189,6 +282,12 @@ def test_serialize_signal_log_exposes_execution_decision() -> None:
     assert payload["fresh_graph_marker"] is True
     assert payload["pine_marker_text"] == "BUY"
     assert payload["skip_reason"] == "No liquid option contract passed the live filter."
+    assert payload["details"] == row.details
+    assert payload["option_selection"] == row.details["option_selection"]
+    assert payload["quote_status"] == "unavailable"
+    assert payload["requested_atm"] == 24100.0
+    assert payload["candidate_diagnostics"][0]["strike"] == 24100.0
+    assert payload["selection_reasons"] == ["Real Upstox option chain is stale."]
 
 
 def test_chart_payload_attaches_persisted_execution_signal_marker() -> None:
@@ -295,7 +394,7 @@ def test_build_technical_signal_holds_during_cooldown(monkeypatch) -> None:
     assert any("cooldown" in reason.lower() for reason in signal.reasons)
 
 
-def test_build_chart_payload_forces_one_minute_all_range() -> None:
+def test_build_chart_payload_falls_back_to_one_day_for_unknown_range() -> None:
     from backend.execution_engine.live_service import build_chart_payload
 
     engine = create_engine(
@@ -335,21 +434,22 @@ def test_build_chart_payload_forces_one_minute_all_range() -> None:
 
         range_keys = [item["key"] for item in payload["available_ranges"]]
         interval_keys = [item["interval"] for item in payload["available_intervals"]]
-        assert payload["range"] == "all"
+        assert payload["range"] == "1d"
         assert payload["interval"] == "1minute"
         assert payload["source_interval"] == "1minute"
         assert payload["is_resampled"] is False
         assert payload["start_date"] == "2026-04-21"
         assert payload["end_date"] == "2026-04-21"
         assert {marker["text"] for marker in payload["markers"]}.issubset({"BUY", "SELL"})
-        assert range_keys == ["all"]
-        assert interval_keys == ["1minute"]
+        assert "1d" in range_keys
+        assert "all" in range_keys
+        assert "1minute" in interval_keys
         assert len(payload["candles"]) == 80
     finally:
         session.close()
 
 
-def test_build_chart_payload_ignores_one_day_request() -> None:
+def test_build_chart_payload_honors_one_day_request() -> None:
     from backend.execution_engine.live_service import build_chart_payload
 
     engine = create_engine(
@@ -386,7 +486,7 @@ def test_build_chart_payload_ignores_one_day_request() -> None:
             now=datetime(2026, 4, 22, 10, 0, tzinfo=IST_ZONE),
         )
 
-        assert payload["range"] == "all"
+        assert payload["range"] == "1d"
         assert payload["interval"] == "1minute"
         assert payload["start_date"] == "2026-04-21"
         assert payload["end_date"] == "2026-04-21"
@@ -541,7 +641,170 @@ def test_settings_should_autostart_market_stream_uses_safe_defaults() -> None:
     assert forced_off.should_autostart_market_stream is False
 
 
-def test_latest_option_premium_uses_synthetic_fallback_when_db_quote_is_stale() -> None:
+def test_build_option_selection_uses_best_liquid_nearby_real_strike(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        now = datetime.now(IST_ZONE)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=now,
+            volume=100.0,
+            oi=250.0,
+        )
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24050.0,
+            ts=now,
+            bid=99.0,
+            ask=101.0,
+            volume=600.0,
+            oi=1200.0,
+        )
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24150.0,
+            ts=now,
+            bid=99.75,
+            ask=100.25,
+            volume=5000.0,
+            oi=10000.0,
+        )
+        session.commit()
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._resolve_expiry",
+            lambda **_kwargs: (expiry, [expiry]),
+        )
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._maybe_refresh_option_chain",
+            lambda *_args, **_kwargs: None,
+        )
+
+        selection = build_option_selection(
+            session,
+            context=_option_context(),
+            signal=_option_signal(),
+            settings=Settings(
+                _env_file=None,
+                upstox_access_token="",
+                option_chain_refresh_seconds=4,
+                option_min_volume=500,
+                option_min_oi=1000,
+                option_max_spread_pct=0.08,
+            ),
+        )
+
+        assert selection.signal["action"] == "BUY"
+        assert selection.signal["strike"] == 24150.0
+        assert selection.signal["quote_source"] == "upstox_option_chain"
+        assert selection.signal["quote_age_seconds"] is not None
+        diagnostics = selection.signal["candidate_diagnostics"]
+        assert len(diagnostics) == 5
+        assert next(item for item in diagnostics if item["strike"] == 24150.0)["status"] == "selected"
+        atm = next(item for item in diagnostics if item["strike"] == 24100.0)
+        assert any("volume" in reason.lower() for reason in atm["rejections"])
+        assert any("oi" in reason.lower() for reason in atm["rejections"])
+    finally:
+        session.close()
+
+
+def test_build_option_selection_rejects_stale_real_chain(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=datetime.now(IST_ZONE) - timedelta(minutes=5),
+            volume=5000.0,
+            oi=10000.0,
+        )
+        session.commit()
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._resolve_expiry",
+            lambda **_kwargs: (expiry, [expiry]),
+        )
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._maybe_refresh_option_chain",
+            lambda *_args, **_kwargs: None,
+        )
+
+        selection = build_option_selection(
+            session,
+            context=_option_context(),
+            signal=_option_signal(),
+            settings=Settings(_env_file=None, upstox_access_token="", option_chain_refresh_seconds=4),
+        )
+
+        assert selection.signal["action"] == "HOLD"
+        assert selection.signal["quote_status"] == "unavailable"
+        assert any("stale" in reason.lower() for reason in selection.signal["reasons"])
+        atm = next(
+            item
+            for item in selection.signal["candidate_diagnostics"]
+            if item["strike"] == 24100.0
+        )
+        assert any("stale" in reason.lower() for reason in atm["rejections"])
+    finally:
+        session.close()
+
+
+def test_build_option_selection_keeps_synthetic_chain_display_only(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._resolve_expiry",
+            lambda **_kwargs: (expiry, [expiry]),
+        )
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._maybe_refresh_option_chain",
+            lambda *_args, **_kwargs: None,
+        )
+
+        selection = build_option_selection(
+            session,
+            context=_option_context(),
+            signal=_option_signal(),
+            settings=Settings(_env_file=None, upstox_access_token=""),
+        )
+
+        assert selection.chain_source == "synthetic_display_only"
+        assert selection.chain_rows
+        assert selection.signal["action"] == "HOLD"
+        assert selection.signal["quote_status"] == "unavailable"
+        assert any("display-only" in reason for reason in selection.signal["reasons"])
+    finally:
+        session.close()
+
+
+def test_latest_option_premium_fails_closed_when_db_quote_is_stale() -> None:
     engine = create_engine(
         "sqlite:///:memory:",
         future=True,
@@ -592,17 +855,330 @@ def test_latest_option_premium_uses_synthetic_fallback_when_db_quote_is_stale() 
             expiry_date=expiry,
             strike=24100.0,
             option_type="CE",
-            settings=Settings(upstox_access_token="", option_chain_refresh_seconds=4),
+            settings=Settings(_env_file=None, upstox_access_token="", option_chain_refresh_seconds=4),
         )
 
-        assert price is not None
-        assert price != 201.0
-        assert price > 0.0
+        assert price is None
     finally:
         session.close()
 
 
-def test_refresh_open_positions_snapshot_updates_live_premium_and_pnl() -> None:
+def test_latest_option_premium_rejects_fresh_synthetic_quote() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=datetime.now(IST_ZONE),
+            source="synthetic",
+        )
+        session.commit()
+
+        price = latest_option_premium(
+            session,
+            symbol="Nifty 50",
+            expiry_date=expiry,
+            strike=24100.0,
+            option_type="CE",
+            settings=Settings(_env_file=None, upstox_access_token=""),
+        )
+
+        assert price is None
+    finally:
+        session.close()
+
+
+def test_latest_option_premium_prefers_fresh_real_quote_over_newer_synthetic() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        now = datetime.now(IST_ZONE)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=now - timedelta(seconds=1),
+            ltp=101.0,
+            source="upstox_option_chain",
+        )
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=now,
+            ltp=999.0,
+            source="synthetic",
+        )
+        session.commit()
+
+        price = latest_option_premium(
+            session,
+            symbol="Nifty 50",
+            expiry_date=expiry,
+            strike=24100.0,
+            option_type="CE",
+            settings=Settings(_env_file=None, upstox_access_token="", option_chain_refresh_seconds=4),
+        )
+
+        assert price == 101.0
+    finally:
+        session.close()
+
+
+def test_latest_option_premium_rejects_non_positive_real_quote() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=datetime.now(IST_ZONE),
+            ltp=0.0,
+            bid=0.0,
+            ask=0.0,
+        )
+        session.commit()
+
+        price = latest_option_premium(
+            session,
+            symbol="Nifty 50",
+            expiry_date=expiry,
+            strike=24100.0,
+            option_type="CE",
+            settings=Settings(_env_file=None, upstox_access_token=""),
+        )
+
+        assert price is None
+    finally:
+        session.close()
+
+
+def test_latest_option_premium_uses_older_positive_real_quote_over_newer_invalid_real() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        now = datetime.now(IST_ZONE)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=now - timedelta(seconds=1),
+            ltp=101.0,
+        )
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=now,
+            ltp=0.0,
+            bid=0.0,
+            ask=0.0,
+        )
+        session.commit()
+
+        price = latest_option_premium(
+            session,
+            symbol="Nifty 50",
+            expiry_date=expiry,
+            strike=24100.0,
+            option_type="CE",
+            settings=Settings(_env_file=None, upstox_access_token="", option_chain_refresh_seconds=4),
+        )
+
+        assert price == 101.0
+    finally:
+        session.close()
+
+
+def test_latest_option_premium_rejects_crossed_real_quote() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=datetime.now(IST_ZONE),
+            ltp=100.0,
+            bid=101.0,
+            ask=99.0,
+        )
+        session.commit()
+
+        price = latest_option_premium(
+            session,
+            symbol="Nifty 50",
+            expiry_date=expiry,
+            strike=24100.0,
+            option_type="CE",
+            settings=Settings(_env_file=None, upstox_access_token=""),
+        )
+
+        assert price is None
+    finally:
+        session.close()
+
+
+def test_same_minute_partial_snapshot_does_not_refresh_omitted_contract() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = date(2026, 6, 25)
+        quote_ts = datetime(2026, 6, 18, 10, 0, 5, tzinfo=IST_ZONE)
+        snapshot_ts = datetime(2026, 6, 18, 10, 0, 45, tzinfo=IST_ZONE)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=quote_ts,
+            ltp=101.0,
+        )
+        session.add(
+            DataFreshness(
+                source_name="upstox_option_chain:Nifty 50",
+                last_success_at=snapshot_ts,
+                status="ok",
+                details={
+                    "expiry_date": expiry.isoformat(),
+                    "snapshot_ts": snapshot_ts.isoformat(),
+                    "contracts": 1,
+                },
+            )
+        )
+        session.commit()
+
+        quote = resolve_live_option_quote(
+            session,
+            symbol="Nifty 50",
+            expiry_date=expiry,
+            strike=24100.0,
+            option_type="CE",
+            settings=Settings(_env_file=None, upstox_access_token="", option_chain_refresh_seconds=4),
+            now=snapshot_ts,
+        )
+
+        assert quote is None
+    finally:
+        session.close()
+
+
+def test_option_chain_refresh_gate_ignores_newer_synthetic_rows(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        now = datetime.now(IST_ZONE)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=now - timedelta(minutes=5),
+            source="upstox_option_chain",
+        )
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=now,
+            source="synthetic",
+        )
+        session.commit()
+        calls: list[dict] = []
+
+        class _Collector:
+            def sync_option_chain(self, _db, **kwargs):
+                calls.append(kwargs)
+
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service.UpstoxOptionChainCollector",
+            _Collector,
+        )
+
+        _maybe_refresh_option_chain(
+            session,
+            symbol="Nifty 50",
+            underlying_key="NSE_INDEX|Nifty 50",
+            expiry_date=expiry,
+            settings=Settings(
+                _env_file=None,
+                upstox_access_token="token",
+                option_chain_refresh_seconds=4,
+            ),
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["expiry_date"] == expiry
+    finally:
+        session.close()
+
+
+def test_option_liquidity_rejects_crossed_order_book() -> None:
+    failures = _option_liquidity_failures(
+        {
+            "instrument_key": "NSE_FO|24100CE",
+            "ltp": 100.0,
+            "bid": 101.0,
+            "ask": 99.0,
+            "volume": 5000.0,
+            "oi": 10000.0,
+        },
+        Settings(_env_file=None),
+    )
+
+    assert any("crossed" in failure.lower() for failure in failures)
+
+
+def test_refresh_open_positions_snapshot_preserves_pnl_when_real_quote_is_unavailable() -> None:
     engine = create_engine(
         "sqlite:///:memory:",
         future=True,
@@ -659,13 +1235,161 @@ def test_refresh_open_positions_snapshot_updates_live_premium_and_pnl() -> None:
         session.add(position)
         session.commit()
 
-        rows = refresh_open_positions_snapshot(session, settings=Settings(upstox_access_token=""))
+        rows = refresh_open_positions_snapshot(
+            session,
+            settings=Settings(_env_file=None, upstox_access_token=""),
+        )
 
         assert len(rows) == 1
-        assert rows[0].current_premium is not None
-        assert rows[0].current_premium != 100.0
-        assert rows[0].unrealized_pnl is not None
-        assert rows[0].metadata_json["latest_quote_source"] in {"synthetic_fallback", "synthetic"}
+        assert rows[0].current_premium == 100.0
+        assert rows[0].unrealized_pnl == 0.0
+        assert rows[0].metadata_json["latest_quote_status"] == "unavailable"
+        assert rows[0].metadata_json["latest_quote_source"] is None
+        assert "P&L was not changed" in rows[0].metadata_json["latest_quote_unavailable_reason"]
+    finally:
+        session.close()
+
+
+def test_refresh_open_positions_snapshot_does_not_mark_non_positive_quote() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        position = ExecutionPosition(
+            trade_date=datetime.now(IST_ZONE).date(),
+            symbol="Nifty 50",
+            interval="1minute",
+            strategy_name="test",
+            option_type="CE",
+            side="BUY",
+            expiry_date=expiry,
+            strike=24100.0,
+            quantity=50,
+            status="OPEN",
+            entry_price=100.0,
+            entry_premium=100.0,
+            stop_loss=80.0,
+            initial_sl=80.0,
+            current_sl=80.0,
+            trailing_stop=0.0,
+            peak_premium=110.0,
+            tsl_active=False,
+            take_profit=140.0,
+            target_premium=140.0,
+            current_price=110.0,
+            current_premium=110.0,
+            pnl_points=10.0,
+            pnl_value=500.0,
+            realized_pnl=0.0,
+            unrealized_pnl=500.0,
+            metadata_json={"instrument_key": "NSE_FO|24100CE"},
+        )
+        session.add(position)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=datetime.now(IST_ZONE),
+            ltp=0.0,
+            bid=0.0,
+            ask=0.0,
+        )
+        session.commit()
+
+        rows = refresh_open_positions_snapshot(
+            session,
+            settings=Settings(_env_file=None, upstox_access_token=""),
+        )
+
+        assert rows[0].current_premium == 110.0
+        assert rows[0].unrealized_pnl == 500.0
+        assert rows[0].metadata_json["latest_quote_status"] == "unavailable"
+    finally:
+        session.close()
+
+
+def test_refresh_open_positions_snapshot_uses_fresh_real_quote() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        expiry = datetime.now(IST_ZONE).date() + timedelta(days=5)
+        quote_received_at = datetime.now(IST_ZONE)
+        position = ExecutionPosition(
+            trade_date=datetime.now(IST_ZONE).date(),
+            symbol="Nifty 50",
+            interval="1minute",
+            strategy_name="test",
+            option_type="CE",
+            side="BUY",
+            expiry_date=expiry,
+            strike=24100.0,
+            quantity=50,
+            status="OPEN",
+            entry_price=100.0,
+            entry_premium=100.0,
+            stop_loss=80.0,
+            initial_sl=80.0,
+            current_sl=80.0,
+            trailing_stop=0.0,
+            peak_premium=100.0,
+            tsl_active=False,
+            take_profit=140.0,
+            target_premium=140.0,
+            current_price=100.0,
+            current_premium=100.0,
+            pnl_points=0.0,
+            pnl_value=0.0,
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,
+            metadata_json={"instrument_key": "NSE_FO|24100CE"},
+        )
+        session.add(position)
+        _add_option_quote(
+            session,
+            expiry=expiry,
+            strike=24100.0,
+            ts=quote_received_at,
+            ltp=112.0,
+            bid=111.5,
+            ask=112.5,
+        )
+        session.add(
+            DataFreshness(
+                source_name="upstox_option_chain:Nifty 50",
+                last_success_at=quote_received_at,
+                status="ok",
+                details={
+                    "expiry_date": expiry.isoformat(),
+                    "snapshot_ts": quote_received_at.isoformat(),
+                    "contracts": 1,
+                },
+            )
+        )
+        session.commit()
+
+        rows = refresh_open_positions_snapshot(
+            session,
+            settings=Settings(_env_file=None, upstox_access_token="", option_chain_refresh_seconds=4),
+        )
+
+        assert len(rows) == 1
+        assert rows[0].current_premium == 112.0
+        assert rows[0].unrealized_pnl == 600.0
+        assert rows[0].metadata_json["latest_quote_status"] == "available"
+        assert rows[0].metadata_json["latest_quote_source"] == "upstox_option_chain"
+        assert rows[0].metadata_json["latest_quote_age_seconds"] is not None
     finally:
         session.close()
 
@@ -698,7 +1422,7 @@ def test_compute_paper_portfolio_metrics_derives_balance_from_open_and_closed_po
                 trailing_stop=0.0,
                 current_premium=110.0,
                 unrealized_pnl=500.0,
-                metadata_json={},
+                metadata_json={"latest_quote_status": "unavailable"},
             )
         )
         session.add(
@@ -730,6 +1454,9 @@ def test_compute_paper_portfolio_metrics_derives_balance_from_open_and_closed_po
         assert metrics["invested_amount"] == 5000.0
         assert metrics["realized_pnl"] == 500.0
         assert metrics["unrealized_pnl"] == 500.0
+        assert metrics["unpriced_positions_count"] == 1
+        assert metrics["unpriced_unrealized_pnl"] == 500.0
+        assert metrics["priced_unrealized_pnl"] == 0.0
         assert metrics["available_balance"] == 95500.0
         assert metrics["equity"] == 101000.0
     finally:

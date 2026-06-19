@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 from backend.db.models import Base, ExecutionPosition
 from backend.execution_engine.live_service import compute_paper_portfolio_metrics
 from backend.utils.app_state import (
+    apply_runtime_execution_settings,
     get_runtime_execution_settings,
     get_runtime_trading_mode,
     reset_paper_account,
@@ -59,6 +60,28 @@ def test_upstox_token_persists_to_runtime_env_and_env_file(tmp_path, monkeypatch
         assert (tmp_path / ".env").read_text(encoding="utf-8") == (
             "OTHER_KEY=value\nUPSTOX_ACCESS_TOKEN=fresh-token\n"
         )
+    finally:
+        session.close()
+
+
+def test_signal_max_per_day_applies_from_runtime_settings() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        set_runtime_execution_settings(session, {"signal_max_per_day": 4})
+        session.commit()
+        settings = Settings(_env_file=None, signal_max_per_day=2)
+
+        apply_runtime_execution_settings(session, settings)
+
+        assert get_runtime_execution_settings(session)["signal_max_per_day"] == 4
+        assert settings.signal_max_per_day == 4
     finally:
         session.close()
 

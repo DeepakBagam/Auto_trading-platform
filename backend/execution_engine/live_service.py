@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from backend.api.market_stream_runtime import get_market_stream_runtime_status
 from backend.data_layer.collectors.upstox_option_chain import UpstoxOptionChainCollector
-from backend.db.models import DataFreshness, DailySummary, ExecutionOrder, ExecutionPosition, OptionQuote, RawCandle, SignalLog
+from backend.db.models import DataFreshness, ExecutionOrder, ExecutionPosition, OptionQuote, RawCandle, SignalLog
 from backend.execution_engine.slippage_tracker import get_vix_context
 from backend.execution_engine.strike_selector import get_atm_iv as _strike_get_atm_iv
 from backend.feature_engine.price_features import build_price_features
@@ -1798,25 +1798,14 @@ def _load_option_quotes(
     expiry_date: date,
     max_rows: int = 2000,
 ) -> list[OptionQuoteView]:
-    rows = (
-        db.execute(
-            select(OptionQuote)
-            .where(
-                symbol_value_filter(OptionQuote.underlying_symbol, symbol),
-                OptionQuote.expiry_date == expiry_date,
-            )
-            .order_by(OptionQuote.ts.desc())
-            .limit(max_rows)
-        )
-        .scalars()
-        .all()
+    rows = _load_latest_option_quote_rows(
+        db,
+        symbol=symbol,
+        expiry_date=expiry_date,
+        max_rows=max_rows,
     )
-    by_contract: dict[tuple[float, str], OptionQuoteView] = {}
-    for row in rows:
-        key = (float(row.strike), str(row.option_type))
-        if key in by_contract:
-            continue
-        by_contract[key] = OptionQuoteView(
+    return [
+        OptionQuoteView(
             instrument_key=str(row.instrument_key),
             strike=float(row.strike),
             option_type=str(row.option_type),  # type: ignore[arg-type]
@@ -1841,7 +1830,69 @@ def _load_option_quotes(
             ),
             source=str(row.source or "db"),
         )
-    return sorted(by_contract.values(), key=lambda item: (item.strike, item.option_type))
+        for row in rows
+    ]
+
+
+def _load_latest_option_quote_rows(
+    db: Session,
+    *,
+    symbol: str,
+    expiry_date: date,
+    max_rows: int = 2000,
+) -> list[OptionQuote]:
+    rows = (
+        db.execute(
+            select(OptionQuote)
+            .where(
+                symbol_value_filter(OptionQuote.underlying_symbol, symbol),
+                OptionQuote.expiry_date == expiry_date,
+            )
+            .order_by(OptionQuote.ts.desc())
+            .limit(max_rows)
+        )
+        .scalars()
+        .all()
+    )
+    by_contract: dict[tuple[float, str], OptionQuote] = {}
+    for row in rows:
+        key = (float(row.strike), str(row.option_type).upper())
+        selected = by_contract.get(key)
+        selected_priority = (
+            int(_is_real_upstox_option_source(selected.source)),
+            int(_is_positive_option_ltp(selected.ltp)),
+        ) if selected is not None else (-1, -1)
+        row_priority = (
+            int(_is_real_upstox_option_source(row.source)),
+            int(_is_positive_option_ltp(row.ltp)),
+        )
+        if selected is not None and selected_priority >= row_priority:
+            continue
+        by_contract[key] = row
+    return sorted(by_contract.values(), key=lambda item: (float(item.strike), str(item.option_type)))
+
+
+def _is_real_upstox_option_source(source: Any) -> bool:
+    return str(source or "").strip().lower().startswith("upstox_option_chain")
+
+
+def _is_positive_option_ltp(value: Any) -> bool:
+    ltp = _to_float(value)
+    return ltp is not None and ltp > 0.0
+
+
+def _option_quote_book_is_crossed(bid: Any, ask: Any) -> bool:
+    bid_value = _to_float(bid)
+    ask_value = _to_float(ask)
+    return bid_value is not None and ask_value is not None and ask_value < bid_value
+
+
+def _option_quote_age_seconds(quote_ts: datetime | None, *, now: datetime | None = None) -> float | None:
+    current = _ensure_ist(now) or datetime.now(IST_ZONE)
+    latest = _ensure_ist(quote_ts)
+    if latest is None:
+        return None
+    return round(max(0.0, (current - latest).total_seconds()), 3)
 
 
 def resolve_underlying_key(db: Session, symbol: str, settings: Settings | None = None) -> str | None:
@@ -1889,6 +1940,72 @@ def _latest_option_quote_ts(db: Session, symbol: str, expiry_date: date) -> date
     )
 
 
+def _latest_real_option_quote_ts(db: Session, symbol: str, expiry_date: date) -> datetime | None:
+    return db.scalar(
+        select(func.max(OptionQuote.ts)).where(
+            symbol_value_filter(OptionQuote.underlying_symbol, symbol),
+            OptionQuote.expiry_date == expiry_date,
+            func.lower(OptionQuote.source).like("upstox_option_chain%"),
+            OptionQuote.ltp > 0,
+        )
+    )
+
+
+def _latest_upstox_option_chain_success_ts(
+    db: Session,
+    symbol: str,
+    expiry_date: date,
+) -> datetime | None:
+    freshness = db.scalar(
+        select(DataFreshness)
+        .where(DataFreshness.source_name == f"upstox_option_chain:{symbol}")
+        .limit(1)
+    )
+    if freshness is None:
+        return None
+    details = freshness.details or {}
+    recorded_expiry = str(details.get("expiry_date") or "").strip()
+    if recorded_expiry and recorded_expiry != expiry_date.isoformat():
+        return None
+    return freshness.last_success_at
+
+
+def _latest_upstox_option_chain_snapshot_ts(
+    db: Session,
+    symbol: str,
+    expiry_date: date,
+) -> datetime | None:
+    freshness = db.scalar(
+        select(DataFreshness)
+        .where(DataFreshness.source_name == f"upstox_option_chain:{symbol}")
+        .limit(1)
+    )
+    if freshness is None:
+        return None
+    details = freshness.details or {}
+    recorded_expiry = str(details.get("expiry_date") or "").strip()
+    if recorded_expiry and recorded_expiry != expiry_date.isoformat():
+        return None
+    return _parse_iso_datetime(details.get("snapshot_ts"))
+
+
+def _effective_real_quote_ts(
+    quote_ts: datetime | None,
+    chain_success_ts: datetime | None,
+    chain_snapshot_ts: datetime | None = None,
+) -> datetime | None:
+    quote = _ensure_ist(quote_ts)
+    success = _ensure_ist(chain_success_ts)
+    snapshot = _ensure_ist(chain_snapshot_ts)
+    if quote is None:
+        return None
+    if success is None or snapshot is None:
+        return quote
+    if quote == snapshot:
+        return max(quote, success)
+    return quote
+
+
 def _option_quote_is_fresh(
     quote_ts: datetime | None,
     *,
@@ -1903,7 +2020,8 @@ def _option_quote_is_fresh(
     if latest is None:
         return False
     max_age_seconds = max(2, int(getattr(settings, "option_chain_refresh_seconds", 4)) * 3)
-    return (current - latest).total_seconds() <= max_age_seconds
+    age_seconds = (current - latest).total_seconds()
+    return -2.0 <= age_seconds <= max_age_seconds
 
 
 def resolve_live_option_quote(
@@ -1920,6 +2038,8 @@ def resolve_live_option_quote(
     settings = settings or get_settings()
     current = _ensure_ist(now) or datetime.now(IST_ZONE)
     normalized_type = str(option_type).upper()
+    chain_success_ts = _latest_upstox_option_chain_success_ts(db, symbol, expiry_date)
+    chain_snapshot_ts = _latest_upstox_option_chain_snapshot_ts(db, symbol, expiry_date)
 
     def _load_row() -> OptionQuote | None:
         filters = [
@@ -1927,6 +2047,8 @@ def resolve_live_option_quote(
             OptionQuote.expiry_date == expiry_date,
             OptionQuote.strike == float(strike),
             OptionQuote.option_type == normalized_type,
+            func.lower(OptionQuote.source).like("upstox_option_chain%"),
+            OptionQuote.ltp > 0,
         ]
         if instrument_key:
             filters.insert(0, OptionQuote.instrument_key == str(instrument_key))
@@ -1938,14 +2060,25 @@ def resolve_live_option_quote(
         )
 
     row = _load_row()
-    if row is not None and _option_quote_is_fresh(row.ts, settings=settings, now=current):
+    effective_ts = _effective_real_quote_ts(
+        row.ts if row is not None else None,
+        chain_success_ts,
+        chain_snapshot_ts,
+    )
+    if (
+        row is not None
+        and _is_positive_option_ltp(row.ltp)
+        and not _option_quote_book_is_crossed(row.bid, row.ask)
+        and _option_quote_is_fresh(effective_ts, settings=settings, now=current)
+    ):
         return {
             "instrument_key": str(row.instrument_key),
             "ltp": float(row.ltp),
             "bid": float(row.bid) if row.bid is not None else None,
             "ask": float(row.ask) if row.ask is not None else None,
             "source": str(row.source or "db"),
-            "ts": _ensure_ist(row.ts),
+            "ts": effective_ts,
+            "age_seconds": _option_quote_age_seconds(effective_ts, now=current),
             "stale": False,
         }
 
@@ -1958,50 +2091,28 @@ def resolve_live_option_quote(
         settings=settings,
     )
     row = _load_row()
-    if row is not None and _option_quote_is_fresh(row.ts, settings=settings, now=current):
-        return {
-            "instrument_key": str(row.instrument_key),
-            "ltp": float(row.ltp),
-            "bid": float(row.bid) if row.bid is not None else None,
-            "ask": float(row.ask) if row.ask is not None else None,
-            "source": str(row.source or "db"),
-            "ts": _ensure_ist(row.ts),
-            "stale": False,
-        }
-
-    try:
-        underlying_instrument_key, _display_symbol = resolve_instrument_key(db, symbol)
-    except ValueError:
-        return None
-    rows = _load_recent_candles(db, instrument_key=underlying_instrument_key, interval=LIVE_INTERVAL, limit=5)
-    if not rows:
-        return None
-    quotes = synthetic_option_chain(
-        symbol=symbol,
-        underlying_price=float(rows[-1].close),
-        expiry_date=expiry_date,
-        strike_step=strike_step_for_symbol(symbol),
+    chain_success_ts = _latest_upstox_option_chain_success_ts(db, symbol, expiry_date)
+    chain_snapshot_ts = _latest_upstox_option_chain_snapshot_ts(db, symbol, expiry_date)
+    effective_ts = _effective_real_quote_ts(
+        row.ts if row is not None else None,
+        chain_success_ts,
+        chain_snapshot_ts,
     )
-    for quote in quotes:
-        if float(quote.strike) == float(strike) and str(quote.option_type).upper() == normalized_type:
-            return {
-                "instrument_key": str(quote.instrument_key) if quote.instrument_key else instrument_key,
-                "ltp": float(quote.ltp),
-                "bid": float(quote.bid) if quote.bid is not None else None,
-                "ask": float(quote.ask) if quote.ask is not None else None,
-                "source": "synthetic_fallback",
-                "ts": current,
-                "stale": False,
-            }
-    if row is not None:
+    if (
+        row is not None
+        and _is_positive_option_ltp(row.ltp)
+        and not _option_quote_book_is_crossed(row.bid, row.ask)
+        and _option_quote_is_fresh(effective_ts, settings=settings, now=current)
+    ):
         return {
             "instrument_key": str(row.instrument_key),
             "ltp": float(row.ltp),
             "bid": float(row.bid) if row.bid is not None else None,
             "ask": float(row.ask) if row.ask is not None else None,
             "source": str(row.source or "db"),
-            "ts": _ensure_ist(row.ts),
-            "stale": True,
+            "ts": effective_ts,
+            "age_seconds": _option_quote_age_seconds(effective_ts, now=current),
+            "stale": False,
         }
     return None
 
@@ -2010,7 +2121,7 @@ def compute_paper_portfolio_metrics(
     db: Session,
     *,
     settings: Settings | None = None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     settings = settings or get_settings()
     starting_balance = float(get_paper_starting_balance(db, settings=settings))
     reset_at = get_paper_reset_at(db)
@@ -2044,6 +2155,15 @@ def compute_paper_portfolio_metrics(
         sum(float(row.unrealized_pnl or 0.0) for row in open_positions),
         2,
     )
+    unpriced_positions = [
+        row
+        for row in open_positions
+        if str((row.metadata_json or {}).get("latest_quote_status") or "").lower() == "unavailable"
+    ]
+    unpriced_unrealized_pnl = round(
+        sum(float(row.unrealized_pnl or 0.0) for row in unpriced_positions),
+        2,
+    )
     available_balance = round(starting_balance + realized_pnl - invested_amount, 2)
     equity = round(available_balance + invested_amount + unrealized_pnl, 2)
     return {
@@ -2052,6 +2172,9 @@ def compute_paper_portfolio_metrics(
         "invested_amount": invested_amount,
         "realized_pnl": realized_pnl,
         "unrealized_pnl": unrealized_pnl,
+        "unpriced_positions_count": len(unpriced_positions),
+        "unpriced_unrealized_pnl": unpriced_unrealized_pnl,
+        "priced_unrealized_pnl": round(unrealized_pnl - unpriced_unrealized_pnl, 2),
         "total_pnl": round(realized_pnl + unrealized_pnl, 2),
         "equity": equity,
         "reset_at": reset_at.isoformat() if reset_at is not None else "",
@@ -2114,7 +2237,7 @@ def _maybe_refresh_option_chain(
 ) -> None:
     if underlying_key is None or not settings.has_market_data_access:
         return
-    latest_ts = _latest_option_quote_ts(db, symbol, expiry_date)
+    latest_ts = _latest_real_option_quote_ts(db, symbol, expiry_date)
     now = datetime.now(IST_ZONE)
     stale = latest_ts is None or (now - (_ensure_ist(latest_ts) or now)).total_seconds() > max(
         2,
@@ -2132,6 +2255,130 @@ def _maybe_refresh_option_chain(
         db.commit()
     except Exception:
         db.rollback()
+
+
+def _option_candidate_diagnostics(
+    rows: list[OptionQuote],
+    *,
+    requested_atm: float,
+    strike_step: int,
+    option_type: str,
+    settings: Settings,
+    now: datetime,
+    chain_success_ts: datetime | None = None,
+    chain_snapshot_ts: datetime | None = None,
+) -> list[dict[str, Any]]:
+    normalized_type = str(option_type).upper()
+    expected_strikes = [
+        float(requested_atm),
+        float(requested_atm - strike_step),
+        float(requested_atm + strike_step),
+        float(requested_atm - (2 * strike_step)),
+        float(requested_atm + (2 * strike_step)),
+    ]
+    rows_by_strike = {
+        float(row.strike): row
+        for row in rows
+        if str(row.option_type).upper() == normalized_type
+    }
+    premium_min = float(settings.execution_premium_min)
+    premium_max = float(settings.execution_premium_max)
+    min_volume = max(1.0, float(getattr(settings, "option_min_volume", 500.0)))
+    min_oi = max(1.0, float(getattr(settings, "option_min_oi", 1000.0)))
+    max_spread_pct = max(0.0001, float(getattr(settings, "option_max_spread_pct", 0.08)))
+    diagnostics: list[dict[str, Any]] = []
+
+    for strike in expected_strikes:
+        row = rows_by_strike.get(strike)
+        distance_steps = int(round(abs(strike - requested_atm) / max(1, strike_step)))
+        if row is None:
+            diagnostics.append(
+                {
+                    "strike": strike,
+                    "option_type": normalized_type,
+                    "distance_steps": distance_steps,
+                    "status": "rejected",
+                    "source": None,
+                    "quote_ts": None,
+                    "quote_age_seconds": None,
+                    "ltp": None,
+                    "bid": None,
+                    "ask": None,
+                    "spread_pct": None,
+                    "volume": None,
+                    "oi": None,
+                    "ranking_score": None,
+                    "rejections": ["No quote is available for this strike."],
+                }
+            )
+            continue
+
+        quote_ts = _effective_real_quote_ts(row.ts, chain_success_ts, chain_snapshot_ts)
+        age_seconds = _option_quote_age_seconds(quote_ts, now=now)
+        quote = {
+            "instrument_key": str(row.instrument_key or ""),
+            "ltp": _to_float(row.ltp),
+            "bid": _to_float(row.bid),
+            "ask": _to_float(row.ask),
+            "volume": _to_float(row.volume),
+            "oi": _to_float(row.oi),
+            "source": str(row.source or ""),
+        }
+        entry_price = _to_float(row.ltp)
+        bid = _to_float(row.bid)
+        ask = _to_float(row.ask)
+        volume = _to_float(row.volume) or 0.0
+        oi = _to_float(row.oi) or 0.0
+        spread_pct = (
+            (float(ask) - float(bid)) / max(float(entry_price or 0.0), 1.0)
+            if bid is not None and ask is not None and bid > 0 and ask >= bid
+            else None
+        )
+        rejections: list[str] = []
+        if not _is_real_upstox_option_source(row.source):
+            rejections.append(f"Quote source {row.source or 'unknown'} is not a real Upstox option-chain quote.")
+        if not _option_quote_is_fresh(quote_ts, settings=settings, now=now):
+            max_age = max(2, int(getattr(settings, "option_chain_refresh_seconds", 4)) * 3)
+            age_label = "unknown" if age_seconds is None else f"{age_seconds:.1f}s"
+            rejections.append(f"Quote is stale (age {age_label}, maximum {max_age}s).")
+        if entry_price is None or not (premium_min <= entry_price <= premium_max):
+            price_label = "missing" if entry_price is None else f"{entry_price:.2f}"
+            rejections.append(
+                f"Premium {price_label} is outside configured range {premium_min:.2f}-{premium_max:.2f}."
+            )
+        rejections.extend(_option_liquidity_failures(quote, settings))
+
+        ranking_score = None
+        if not rejections and spread_pct is not None:
+            distance_component = distance_steps * 0.35
+            spread_component = spread_pct / max_spread_pct
+            liquidity_component = (
+                min(volume / min_volume, 5.0) * 0.15
+                + min(oi / min_oi, 5.0) * 0.15
+            )
+            ranking_score = round(distance_component + spread_component - liquidity_component, 6)
+
+        diagnostics.append(
+            {
+                "strike": strike,
+                "option_type": normalized_type,
+                "distance_steps": distance_steps,
+                "status": "eligible" if not rejections else "rejected",
+                "instrument_key": str(row.instrument_key or ""),
+                "source": str(row.source or ""),
+                "quote_ts": quote_ts.isoformat() if quote_ts is not None else None,
+                "quote_age_seconds": age_seconds,
+                "ltp": entry_price,
+                "bid": bid,
+                "ask": ask,
+                "spread_pct": round(spread_pct, 6) if spread_pct is not None else None,
+                "volume": volume,
+                "oi": oi,
+                "ranking_score": ranking_score,
+                "rejections": rejections,
+            }
+        )
+    return diagnostics
 
 
 def build_option_selection(
@@ -2175,18 +2422,34 @@ def build_option_selection(
         expiry_date=expiry_date,
         settings=settings,
     )
+    current = datetime.now(IST_ZONE)
+    quote_rows = _load_latest_option_quote_rows(db, symbol=context.symbol, expiry_date=expiry_date)
     quotes = _load_option_quotes(db, symbol=context.symbol, expiry_date=expiry_date)
+    real_quote_rows = [row for row in quote_rows if _is_real_upstox_option_source(row.source)]
+    chain_success_ts = _latest_upstox_option_chain_success_ts(db, context.symbol, expiry_date)
+    chain_snapshot_ts = _latest_upstox_option_chain_snapshot_ts(db, context.symbol, expiry_date)
+    real_chain_generated_at = _effective_real_quote_ts(
+        max(
+            (_ensure_ist(row.ts) for row in real_quote_rows if _ensure_ist(row.ts) is not None),
+            default=None,
+        ),
+        chain_success_ts,
+        chain_snapshot_ts,
+    )
     chain_generated_at = _latest_option_quote_ts(db, context.symbol, expiry_date)
-    chain_source = next((str(item.source or "db") for item in quotes if item.source), "synthetic")
+    chain_source = next((str(item.source or "db") for item in quotes if item.source), "unavailable")
     if not quotes:
-        quotes = synthetic_option_chain(
+        display_quotes = synthetic_option_chain(
             symbol=context.symbol,
             underlying_price=context.latest_price,
             expiry_date=expiry_date,
             strike_step=strike_step,
         )
-        chain_source = "synthetic"
+        quotes = display_quotes
+        chain_source = "synthetic_display_only"
         chain_generated_at = datetime.now(IST_ZONE)
+    elif not real_quote_rows:
+        chain_source = "synthetic_display_only"
     chain_rows = build_chain_rows(quotes)
 
     signal_payload: dict[str, Any] = {
@@ -2203,74 +2466,49 @@ def build_option_selection(
     dte = max(1, (expiry_date - datetime.now(IST_ZONE).date()).days)
     option_type = "CE" if signal.action == "BUY" else "PE"
     requested_atm = nearest_strike(context.latest_price, strike_step)
-    selected_strike, quote = _nearest_atm_option_quote(
-        chain_rows,
-        spot_price=context.latest_price,
+    candidate_diagnostics = _option_candidate_diagnostics(
+        quote_rows,
+        requested_atm=requested_atm,
         strike_step=strike_step,
         option_type=option_type,
+        settings=settings,
+        now=current,
+        chain_success_ts=chain_success_ts,
+        chain_snapshot_ts=chain_snapshot_ts,
     )
-    if selected_strike is not None and quote is not None:
-        entry_price = _to_float(quote.get("ltp"))
-        instrument_key = quote.get("instrument_key")
-        quote_source = str(quote.get("source") or chain_source)
-        premium_min = float(settings.execution_premium_min)
-        premium_max = float(settings.execution_premium_max)
-        liquidity_failures = _option_liquidity_failures(quote, settings)
-        if entry_price is not None and premium_min <= entry_price <= premium_max and not liquidity_failures:
-            risk_plan = _option_risk_plan(float(entry_price), signal, settings)
-            stop_loss = risk_plan["stop_loss"]
-            take_profit = risk_plan["take_profit"]
-            iv_rank = _compute_iv_rank(db, context.symbol, _strike_get_atm_iv(chain_rows, requested_atm))
-            trail_trigger = risk_plan["trail_trigger_price"]
-            trailing_stop_loss = risk_plan["trailing_stop_loss"]
-            signal_payload = {
-                "action": "BUY",
-                "option_type": option_type,
-                "strike": float(selected_strike),
-                "entry_price": float(entry_price),
-                "stop_loss": float(stop_loss),
-                "take_profit": float(take_profit),
-                "confidence": signal.confidence,
-                "instrument_key": instrument_key,
-                "quote_source": quote_source,
-                "iv_rank": iv_rank,
-                "days_to_expiry": dte,
-                "trail_trigger_price": float(trail_trigger),
-                "trailing_stop_loss": float(trailing_stop_loss),
-                "trail_step_pct": float(OPTION_TRAIL_STOP_PCT),
-                "stop_loss_pct": float(risk_plan["stop_pct"]),
-                "target_pct": float(risk_plan["target_pct"]),
-                "liquidity": {
-                    "volume": _to_float(quote.get("volume")),
-                    "oi": _to_float(quote.get("oi")),
-                    "bid": _to_float(quote.get("bid")),
-                    "ask": _to_float(quote.get("ask")),
-                    "max_spread_pct": float(getattr(settings, "option_max_spread_pct", 0.08)),
-                },
-                "reasons": [
-                    f"{signal.action} signal mapped to ATM {option_type}.",
-                    f"Requested ATM strike {requested_atm:.0f}, selected nearest available strike {selected_strike:.0f}.",
-                    f"ATR-aware option risk: SL {risk_plan['stop_pct']:.0%} below entry, target {risk_plan['target_pct']:.0%} above entry.",
-                    f"Liquidity passed: volume/OI/spread within configured limits.",
-                    f"Quote source: {quote_source}.",
-                ],
-            }
-        else:
-            reasons = []
-            if entry_price is None or not (premium_min <= float(entry_price or 0.0) <= premium_max):
-                reasons.append("ATM option premium is missing or outside the configured premium range.")
-            reasons.extend(liquidity_failures)
-            signal_payload = {
-                "action": "HOLD",
-                "option_type": None,
-                "strike": None,
-                "entry_price": None,
-                "stop_loss": None,
-                "take_profit": None,
-                "confidence": signal.confidence,
-                "reasons": reasons[:6],
-            }
-    else:
+    real_chain_fresh = _option_quote_is_fresh(
+        real_chain_generated_at,
+        settings=settings,
+        now=current,
+    )
+    eligible_candidates = [
+        item for item in candidate_diagnostics
+        if item["status"] == "eligible" and item["ranking_score"] is not None
+    ]
+    selected = min(
+        eligible_candidates,
+        key=lambda item: (
+            float(item["ranking_score"]),
+            int(item["distance_steps"]),
+            float(item["spread_pct"]),
+            -float(item["oi"]),
+            -float(item["volume"]),
+        ),
+        default=None,
+    )
+    if not real_chain_fresh or selected is None:
+        reasons: list[str] = []
+        if not real_quote_rows:
+            reasons.append("No real Upstox option chain is available; synthetic quotes are display-only.")
+        elif not real_chain_fresh:
+            chain_age = _option_quote_age_seconds(real_chain_generated_at, now=current)
+            age_label = "unknown" if chain_age is None else f"{chain_age:.1f}s"
+            reasons.append(f"Real Upstox option chain is stale (latest age {age_label}).")
+        rejected = [item for item in candidate_diagnostics if item["rejections"]]
+        for item in rejected:
+            reasons.append(
+                f"{item['strike']:.0f} {option_type}: {item['rejections'][0]}"
+            )
         signal_payload = {
             "action": "HOLD",
             "option_type": None,
@@ -2279,7 +2517,57 @@ def build_option_selection(
             "stop_loss": None,
             "take_profit": None,
             "confidence": signal.confidence,
-            "reasons": ["No ATM option quote is available in the current chain window."],
+            "quote_status": "unavailable",
+            "quote_source": None,
+            "quote_age_seconds": None,
+            "requested_atm": float(requested_atm),
+            "candidate_diagnostics": candidate_diagnostics,
+            "reasons": (reasons or ["No liquid fresh real option quote passed the execution filter."])[:6],
+        }
+    else:
+        selected["status"] = "selected"
+        selected_strike = float(selected["strike"])
+        entry_price = float(selected["ltp"])
+        quote_source = str(selected["source"])
+        risk_plan = _option_risk_plan(entry_price, signal, settings)
+        iv_rank = _compute_iv_rank(db, context.symbol, _strike_get_atm_iv(chain_rows, requested_atm))
+        signal_payload = {
+            "action": "BUY",
+            "option_type": option_type,
+            "strike": selected_strike,
+            "entry_price": entry_price,
+            "stop_loss": float(risk_plan["stop_loss"]),
+            "take_profit": float(risk_plan["take_profit"]),
+            "confidence": signal.confidence,
+            "instrument_key": selected["instrument_key"],
+            "quote_status": "available",
+            "quote_source": quote_source,
+            "quote_ts": selected["quote_ts"],
+            "quote_age_seconds": selected["quote_age_seconds"],
+            "requested_atm": float(requested_atm),
+            "candidate_diagnostics": candidate_diagnostics,
+            "iv_rank": iv_rank,
+            "days_to_expiry": dte,
+            "trail_trigger_price": float(risk_plan["trail_trigger_price"]),
+            "trailing_stop_loss": float(risk_plan["trailing_stop_loss"]),
+            "trail_step_pct": float(OPTION_TRAIL_STOP_PCT),
+            "stop_loss_pct": float(risk_plan["stop_pct"]),
+            "target_pct": float(risk_plan["target_pct"]),
+            "liquidity": {
+                "volume": selected["volume"],
+                "oi": selected["oi"],
+                "bid": selected["bid"],
+                "ask": selected["ask"],
+                "spread_pct": selected["spread_pct"],
+                "max_spread_pct": float(getattr(settings, "option_max_spread_pct", 0.08)),
+            },
+            "reasons": [
+                f"{signal.action} signal mapped to {option_type}.",
+                f"Evaluated ATM +/- 2 strikes around {requested_atm:.0f}; selected {selected_strike:.0f}.",
+                f"Selected by distance, spread, OI and volume score {selected['ranking_score']:.3f}.",
+                f"Fresh real quote source: {quote_source}, age {float(selected['quote_age_seconds'] or 0.0):.1f}s.",
+                f"ATR-aware option risk: SL {risk_plan['stop_pct']:.0%}, target {risk_plan['target_pct']:.0%}.",
+            ],
         }
 
     return OptionSelection(
@@ -2305,14 +2593,18 @@ def _option_liquidity_failures(quote: dict[str, Any], settings: Settings) -> lis
     max_spread_pct = float(getattr(settings, "option_max_spread_pct", 0.08))
     if not quote.get("instrument_key"):
         failures.append("Selected option has no broker instrument key.")
+    if entry_price <= 0:
+        failures.append("Option LTP must be positive.")
     if volume < min_volume:
         failures.append(f"Option volume {volume:.0f} is below minimum {min_volume:.0f}.")
     if oi < min_oi:
         failures.append(f"Option OI {oi:.0f} is below minimum {min_oi:.0f}.")
     if bid is None or ask is None or bid <= 0 or ask <= 0:
         failures.append("Option bid/ask is missing.")
+    elif ask < bid:
+        failures.append("Option order book is crossed because ask is below bid.")
     else:
-        spread_pct = abs(ask - bid) / max(entry_price, 1.0)
+        spread_pct = (ask - bid) / max(entry_price, 1.0)
         if spread_pct > max_spread_pct:
             failures.append(f"Option spread {spread_pct:.1%} exceeds maximum {max_spread_pct:.1%}.")
     return failures
@@ -2367,7 +2659,10 @@ def _mark_position_to_market(
     premium: float,
     quote_source: str,
     quote_ts: datetime | None,
+    quote_age_seconds: float | None,
 ) -> None:
+    if premium <= 0:
+        raise ValueError("Option mark premium must be positive.")
     row.current_price = float(premium)
     row.current_premium = float(premium)
     row.peak_premium = max(
@@ -2381,8 +2676,11 @@ def _mark_position_to_market(
     row.pnl_value = float(row.unrealized_pnl)
     row.pnl_points = round(float(premium) - float(row.entry_premium or row.entry_price or 0.0), 2)
     metadata = dict(row.metadata_json or {})
+    metadata["latest_quote_status"] = "available"
     metadata["latest_quote_source"] = quote_source
     metadata["latest_quote_ts"] = quote_ts.isoformat() if quote_ts is not None else None
+    metadata["latest_quote_age_seconds"] = quote_age_seconds
+    metadata.pop("latest_quote_unavailable_reason", None)
     row.metadata_json = metadata
 
 
@@ -2392,16 +2690,24 @@ def refresh_open_positions_snapshot(
     settings: Settings | None = None,
 ) -> list[ExecutionPosition]:
     settings = settings or get_settings()
+    runtime_mode = get_runtime_trading_mode(db, settings=settings)
     rows = (
         db.execute(
             select(ExecutionPosition)
-            .where(ExecutionPosition.status == "OPEN")
+            .where(
+                ExecutionPosition.status.in_(
+                    ["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"]
+                )
+            )
             .order_by(ExecutionPosition.opened_at.desc())
         )
         .scalars()
         .all()
     )
+    rows = [row for row in rows if _position_matches_mode(row, runtime_mode)]
     for row in rows:
+        if str(row.status).upper() != "OPEN":
+            continue
         metadata = row.metadata_json or {}
         quote = resolve_live_option_quote(
             db,
@@ -2413,12 +2719,23 @@ def refresh_open_positions_snapshot(
             settings=settings,
         )
         if quote is None:
+            unavailable_metadata = dict(metadata)
+            unavailable_metadata["latest_quote_status"] = "unavailable"
+            unavailable_metadata["latest_quote_source"] = None
+            unavailable_metadata["latest_quote_ts"] = None
+            unavailable_metadata["latest_quote_age_seconds"] = None
+            unavailable_metadata["latest_quote_checked_at"] = datetime.now(IST_ZONE).isoformat()
+            unavailable_metadata["latest_quote_unavailable_reason"] = (
+                "No fresh real Upstox option quote is available; position P&L was not changed."
+            )
+            row.metadata_json = unavailable_metadata
             continue
         _mark_position_to_market(
             row,
             premium=float(quote["ltp"]),
             quote_source=str(quote.get("source") or "unknown"),
             quote_ts=_ensure_ist(quote.get("ts")),
+            quote_age_seconds=_to_float(quote.get("age_seconds")),
         )
     if rows:
         db.flush()
@@ -2450,6 +2767,9 @@ def _serialize_position(row: ExecutionPosition) -> dict[str, Any]:
         "instrument_key": metadata.get("instrument_key"),
         "latest_quote_source": metadata.get("latest_quote_source"),
         "latest_quote_ts": metadata.get("latest_quote_ts"),
+        "latest_quote_age_seconds": metadata.get("latest_quote_age_seconds"),
+        "latest_quote_status": metadata.get("latest_quote_status"),
+        "latest_quote_unavailable_reason": metadata.get("latest_quote_unavailable_reason"),
         "premium_history": metadata.get("premium_history") or [],
     }
 
@@ -2476,7 +2796,12 @@ def _serialize_order(row: ExecutionOrder) -> dict[str, Any]:
 
 
 def _serialize_signal_log(row: SignalLog) -> dict[str, Any]:
-    details = row.details or {}
+    details = dict(row.details or {})
+    option_selection = (
+        dict(details.get("option_selection") or {})
+        if isinstance(details.get("option_selection"), dict)
+        else {}
+    )
     return {
         "id": row.id,
         "timestamp": _ensure_ist(row.timestamp).isoformat() if row.timestamp else None,
@@ -2487,6 +2812,15 @@ def _serialize_signal_log(row: SignalLog) -> dict[str, Any]:
         "pine_signal": row.pine_signal,
         "trade_placed": bool(row.trade_placed),
         "skip_reason": row.skip_reason,
+        "details": details,
+        "option_selection": option_selection,
+        "quote_status": option_selection.get("quote_status"),
+        "quote_source": option_selection.get("quote_source"),
+        "quote_ts": option_selection.get("quote_ts"),
+        "quote_age_seconds": option_selection.get("quote_age_seconds"),
+        "requested_atm": option_selection.get("requested_atm"),
+        "candidate_diagnostics": option_selection.get("candidate_diagnostics") or [],
+        "selection_reasons": option_selection.get("reasons") or [],
         "fresh_graph_marker": bool(details.get("fresh_graph_marker")),
         "pine_marker_time": details.get("pine_marker_time"),
         "pine_marker_text": details.get("pine_marker_text"),
@@ -2581,21 +2915,48 @@ def _stream_diagnostics_payload(
     }
 
 
-def _stats_payload(db: Session) -> dict[str, Any]:
+def _stats_payload(db: Session, *, settings: Settings | None = None) -> dict[str, Any]:
+    settings = settings or get_settings()
     today = datetime.now(IST_ZONE).date()
-    today_summary = db.get(DailySummary, today)
-    open_positions = refresh_open_positions_snapshot(db)
-    paper = compute_paper_portfolio_metrics(db)
+    runtime_mode = get_runtime_trading_mode(db, settings=settings)
+    closed_positions = (
+        db.execute(
+            select(ExecutionPosition).where(
+                ExecutionPosition.trade_date == today,
+                ExecutionPosition.status == "CLOSED",
+            )
+        )
+        .scalars()
+        .all()
+    )
+    closed_positions = [
+        row for row in closed_positions if _position_matches_mode(row, runtime_mode)
+    ]
+    pnl_values = [float(row.realized_pnl or row.pnl_value or 0.0) for row in closed_positions]
+    wins = sum(1 for value in pnl_values if value > 0.0)
+    open_positions = refresh_open_positions_snapshot(db, settings=settings)
+    paper = compute_paper_portfolio_metrics(db, settings=settings)
+    unpriced_positions = [
+        row
+        for row in open_positions
+        if str((row.metadata_json or {}).get("latest_quote_status") or "").lower() == "unavailable"
+    ]
+    unpriced_unrealized_pnl = round(
+        sum(float(row.unrealized_pnl or 0.0) for row in unpriced_positions),
+        2,
+    )
     return {
-        "win_rate": float(today_summary.win_rate if today_summary is not None else 0.0),
-        "total_pnl_today": float(today_summary.total_pnl if today_summary is not None else 0.0),
+        "win_rate": round((wins / len(closed_positions) * 100.0) if closed_positions else 0.0, 2),
+        "total_pnl_today": round(sum(pnl_values), 2),
         "open_positions_count": len(open_positions),
         "open_positions_unrealized_pnl": round(
             sum(float(row.unrealized_pnl or 0.0) for row in open_positions),
             2,
         ),
-        "total_trades_today": int(today_summary.total_trades if today_summary is not None else 0),
-        "wins_today": int(today_summary.winning_trades if today_summary is not None else 0),
+        "open_positions_unpriced_count": len(unpriced_positions),
+        "open_positions_unpriced_unrealized_pnl": unpriced_unrealized_pnl,
+        "total_trades_today": len(closed_positions),
+        "wins_today": wins,
         "paper_starting_balance": float(paper["starting_balance"]),
         "paper_available_balance": float(paper["available_balance"]),
         "paper_invested_amount": float(paper["invested_amount"]),
@@ -3099,7 +3460,7 @@ def build_live_snapshot(
             latest_candle_ts=context.latest_candle_ts,
             settings=settings,
         ),
-        "stats": _stats_payload(db),
+        "stats": _stats_payload(db, settings=settings),
         "signal": {
             "enabled": bool(DIRECTIONAL_SIGNALS_ENABLED),
             "action": signal.action,

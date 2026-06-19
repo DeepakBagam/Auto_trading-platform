@@ -35,6 +35,7 @@ RUNTIME_SETTING_KEYS = {
     "force_squareoff_time",
     "signal_min_score",
     "signal_cooldown_minutes",
+    "signal_max_per_day",
     "signal_require_volume_confirmation",
     "signal_min_volume_ratio",
     "signal_require_breakout",

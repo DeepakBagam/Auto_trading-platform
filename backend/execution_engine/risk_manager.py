@@ -11,6 +11,12 @@ class TradeSizingResult:
     capital_allocated: float
     vix_multiplier: float
     entry_premium: float
+    risk_budget: float
+    risk_per_lot: float
+    estimated_risk: float
+    affordable_lots: int
+    risk_limited_lots: int
+    reason: str
 
 
 @dataclass(slots=True)
@@ -103,28 +109,54 @@ def compute_quantity(
         capital_per_trade_pct = per_trade_risk_pct if per_trade_risk_pct is not None else 0.02
     multiplier = vix_position_multiplier(vix_level)
     price = max(0.01, float(entry_price))
-    capital_allocated = max(0.0, float(capital) * max(0.0, float(capital_per_trade_pct)) * multiplier)
-    if fixed_lots is not None:
-        lots = max(min_lots, int(fixed_lots))
-        if max_lots is not None:
-            lots = min(lots, max(1, int(max_lots)))
-        capital_allocated = round(price * lot_size * lots, 2)
+    available_capital = max(0.0, float(capital))
+    risk_budget = available_capital * max(0.0, float(capital_per_trade_pct)) * multiplier
+    stop_distance = price - float(stop_loss_price) if stop_loss_price is not None else 0.0
+    cost_per_lot = price * lot_size
+    affordable_lots = floor(available_capital / cost_per_lot) if cost_per_lot > 0.0 else 0
+
+    if stop_distance <= 0.0:
+        lots = 0
+        risk_per_lot = 0.0
+        risk_limited_lots = 0
+        reason = "invalid_stop_loss"
     else:
-        stop_distance = 0.0
-        if stop_loss_price is not None:
-            stop_distance = max(0.0, price - float(stop_loss_price))
-        sizing_unit = stop_distance if stop_distance > 0.0 else price
-        affordable_lots = floor(capital_allocated / (sizing_unit * lot_size))
-        lots = max(min_lots, affordable_lots)
+        risk_per_lot = stop_distance * lot_size
+        risk_limited_lots = floor(risk_budget / risk_per_lot) if risk_per_lot > 0.0 else 0
+        candidate_lots = min(affordable_lots, risk_limited_lots)
+        if fixed_lots is not None:
+            candidate_lots = min(candidate_lots, max(0, int(fixed_lots)))
         if max_lots is not None:
-            lots = min(lots, max(1, int(max_lots)))
-    qty = max(lot_size, lots * lot_size)
+            candidate_lots = min(candidate_lots, max(0, int(max_lots)))
+
+        if risk_limited_lots < min_lots:
+            lots = 0
+            reason = "risk_budget_below_minimum_lot"
+        elif affordable_lots < min_lots:
+            lots = 0
+            reason = "insufficient_available_balance"
+        elif candidate_lots < min_lots:
+            lots = 0
+            reason = "requested_lots_below_minimum"
+        else:
+            lots = candidate_lots
+            reason = "sized"
+
+    qty = lots * lot_size
+    capital_allocated = price * qty
+    estimated_risk = risk_per_lot * lots
     return TradeSizingResult(
         qty=int(qty),
         lots=int(lots),
         capital_allocated=round(capital_allocated, 2),
         vix_multiplier=float(multiplier),
         entry_premium=float(entry_price),
+        risk_budget=round(risk_budget, 2),
+        risk_per_lot=round(risk_per_lot, 2),
+        estimated_risk=round(estimated_risk, 2),
+        affordable_lots=int(affordable_lots),
+        risk_limited_lots=int(risk_limited_lots),
+        reason=reason,
     )
 
 

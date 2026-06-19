@@ -92,9 +92,10 @@ class UpstoxOptionChainCollector:
         chain_rows: list[dict[str, Any]],
         fetched_at: datetime | None = None,
     ) -> dict[str, int]:
-        snapshot_ts = (fetched_at or datetime.now(IST_ZONE)).astimezone(IST_ZONE).replace(second=0, microsecond=0)
+        snapshot_ts = (fetched_at or datetime.now(IST_ZONE)).astimezone(IST_ZONE)
         inserted = 0
         updated = 0
+        skipped = 0
 
         for row in chain_rows:
             strike = _to_float(row.get("strike_price"))
@@ -105,7 +106,12 @@ class UpstoxOptionChainCollector:
                 market = node.get("market_data") or {}
                 greeks = node.get("option_greeks") or {}
                 instrument_key = str(node.get("instrument_key") or "").strip()
-                if strike is None or not instrument_key:
+                ltp = _to_float(market.get("ltp"))
+                bid = _to_float(market.get("bid_price"))
+                ask = _to_float(market.get("ask_price"))
+                crossed_book = bid is not None and ask is not None and ask < bid
+                if strike is None or not instrument_key or ltp is None or ltp <= 0 or crossed_book:
+                    skipped += 1
                     continue
 
                 existing = db.scalar(
@@ -128,9 +134,9 @@ class UpstoxOptionChainCollector:
                         strike=strike,
                         option_type=option_type,
                         ts=snapshot_ts,
-                        ltp=float(_to_float(market.get("ltp")) or 0.0),
-                        bid=_to_float(market.get("bid_price")),
-                        ask=_to_float(market.get("ask_price")),
+                        ltp=float(ltp),
+                        bid=bid,
+                        ask=ask,
                         volume=float(_to_float(market.get("volume")) or 0.0),
                         oi=_to_float(market.get("oi")),
                         close_price=_to_float(market.get("close_price")),
@@ -153,9 +159,9 @@ class UpstoxOptionChainCollector:
 
                 existing.instrument_key = instrument_key
                 existing.underlying_key = underlying_key
-                existing.ltp = float(_to_float(market.get("ltp")) or 0.0)
-                existing.bid = _to_float(market.get("bid_price"))
-                existing.ask = _to_float(market.get("ask_price"))
+                existing.ltp = float(ltp)
+                existing.bid = bid
+                existing.ask = ask
                 existing.volume = float(_to_float(market.get("volume")) or 0.0)
                 existing.oi = _to_float(market.get("oi"))
                 existing.close_price = _to_float(market.get("close_price"))
@@ -173,22 +179,31 @@ class UpstoxOptionChainCollector:
                 existing.source = "upstox_option_chain"
                 updated += 1
 
-        self._mark_freshness(
-            db,
-            source_name=f"upstox_option_chain:{underlying_symbol}",
-            status="ok",
-            details={
-                "underlying_key": underlying_key,
-                "underlying_symbol": underlying_symbol,
-                "expiry_date": expiry_date.isoformat(),
-                "rows": len(chain_rows),
-                "inserted": inserted,
-                "updated": updated,
-                "snapshot_ts": snapshot_ts.isoformat(),
-            },
-        )
+        persisted = inserted + updated
+        if persisted > 0:
+            self._mark_freshness(
+                db,
+                source_name=f"upstox_option_chain:{underlying_symbol}",
+                status="ok",
+                details={
+                    "underlying_key": underlying_key,
+                    "underlying_symbol": underlying_symbol,
+                    "expiry_date": expiry_date.isoformat(),
+                    "rows": len(chain_rows),
+                    "contracts": persisted,
+                    "inserted": inserted,
+                    "updated": updated,
+                    "skipped": skipped,
+                    "snapshot_ts": snapshot_ts.isoformat(),
+                },
+            )
         db.commit()
-        return {"inserted": inserted, "updated": updated, "rows": len(chain_rows)}
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "rows": len(chain_rows),
+            "skipped": skipped,
+        }
 
     def sync_option_chain(
         self,

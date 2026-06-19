@@ -63,6 +63,9 @@ class BaseBroker:
     def cancel_all_pending(self) -> BrokerOrderResponse:
         raise NotImplementedError
 
+    def get_order_status(self, order_id: str) -> BrokerOrderResponse:
+        raise NotImplementedError
+
     def get_portfolio(self) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -156,6 +159,18 @@ class PaperBroker(BaseBroker):
             status="OK",
             message=f"cancelled={cancelled}",
             payload={"cancelled": cancelled},
+        )
+
+    def get_order_status(self, order_id: str) -> BrokerOrderResponse:
+        row = self._orders.get(order_id)
+        if row is None:
+            return BrokerOrderResponse(False, order_id, "NOT_FOUND", "order_not_found", {})
+        return BrokerOrderResponse(
+            True,
+            order_id,
+            str(row.get("status") or "UNKNOWN"),
+            "paper_order_status",
+            {"data": {"order_id": order_id, "status": row.get("status")}},
         )
 
     def get_portfolio(self) -> dict[str, Any]:
@@ -276,12 +291,21 @@ class UpstoxBroker(BaseBroker):
         for attempt in range(2):
             try:
                 request_kwargs: dict[str, Any] = {"headers": self.headers, "timeout": 15}
-                if method.upper() == "GET":
+                normalized_method = method.upper()
+                if normalized_method in {"GET", "DELETE"}:
                     request_kwargs["params"] = payload or {}
-                    res = self.session.get(url, **request_kwargs)
                 else:
                     request_kwargs["json"] = payload or {}
+                if normalized_method == "GET":
+                    res = self.session.get(url, **request_kwargs)
+                elif normalized_method == "POST":
                     res = self.session.post(url, **request_kwargs)
+                elif normalized_method == "PUT":
+                    res = self.session.put(url, **request_kwargs)
+                elif normalized_method == "DELETE":
+                    res = self.session.delete(url, **request_kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
                 data = res.json() if res.content else {}
                 if res.status_code == 401 and attempt == 0:
                     # Force immediate re-read by resetting the throttle clock
@@ -291,11 +315,13 @@ class UpstoxBroker(BaseBroker):
                 break
             except Exception as exc:
                 self._record_failure()
-                if attempt == 1:
+                # A mutating request may have reached the broker even when the
+                # response was lost. Never resubmit it automatically.
+                if method.upper() != "GET" or attempt == 1:
                     return BrokerOrderResponse(
                         success=False,
                         order_id=None,
-                        status="ERROR",
+                        status="AMBIGUOUS" if method.upper() != "GET" else "ERROR",
                         message=str(exc),
                         payload={"path": path},
                     )
@@ -365,10 +391,10 @@ class UpstoxBroker(BaseBroker):
             "price": float(price or 0.0),
             "trigger_price": float(trigger_price or 0.0),
         }
-        return self._request("POST", "/v2/order/modify", payload)
+        return self._request("PUT", "/v2/order/modify", payload)
 
     def cancel_order(self, order_id: str) -> BrokerOrderResponse:
-        return self._request("POST", "/v2/order/cancel", {"order_id": order_id})
+        return self._request("DELETE", "/v2/order/cancel", {"order_id": order_id})
 
     def cancel_all_pending(self) -> BrokerOrderResponse:
         # Broker-side bulk cancel endpoint varies by broker account setup.
@@ -379,6 +405,11 @@ class UpstoxBroker(BaseBroker):
             message="bulk_cancel_not_supported_by_adapter",
             payload={},
         )
+
+    def get_order_status(self, order_id: str) -> BrokerOrderResponse:
+        response = self._request("GET", "/v2/order/details", {"order_id": order_id})
+        response.order_id = order_id
+        return response
 
     def get_portfolio(self) -> dict[str, Any]:
         self._refresh_token_if_available()
