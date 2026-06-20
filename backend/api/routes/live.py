@@ -70,8 +70,6 @@ def snapshot(
 @router.get("/chart")
 def chart(
     symbol: str | None = Query(None),
-    range_key: str | None = Query(None, alias="range"),
-    interval: str | None = Query(None),
     db: Session = Depends(get_db_session),
 ) -> dict:
     settings = _runtime_settings(db)
@@ -80,8 +78,6 @@ def chart(
         return build_chart_payload(
             db,
             symbol=target,
-            range_key=range_key or "1d",
-            interval_key=interval,
             settings=settings,
         )
     except ValueError as exc:

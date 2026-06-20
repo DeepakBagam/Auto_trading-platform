@@ -13,30 +13,9 @@ const NAV_ITEMS = [
   { id: "settings", label: "Settings", eyebrow: "Runtime", icon: "settings" },
 ];
 const IST_TIME_ZONE = "Asia/Kolkata";
-const CHART_RANGE_FALLBACK = [
-  { key: "1d", label: "1D", interval: "1minute", supports_live: true },
-  { key: "5d", label: "5D", interval: "5minute", supports_live: false },
-  { key: "1m", label: "1M", interval: "15minute", supports_live: false },
-  { key: "6m", label: "6M", interval: "1hour", supports_live: false },
-  { key: "1y", label: "1Y", interval: "day", supports_live: false },
-  { key: "all", label: "ALL", interval: "1minute", supports_live: true },
-];
-const CHART_INTERVAL_FALLBACK = [
-  { key: "1m", label: "1m", interval: "1minute" },
-  { key: "5m", label: "5m", interval: "5minute" },
-  { key: "15m", label: "15m", interval: "15minute" },
-  { key: "30m", label: "30m", interval: "30minute" },
-  { key: "1h", label: "1h", interval: "1hour" },
-  { key: "1d", label: "1D", interval: "day" },
-];
 const LIVE_CHART_WINDOW_LIMITS = {
-  "1d": 1200,
-  "all": 5000,
+  recent: 1200,
 };
-const PREFETCH_CHART_RANGES = [];
-const PREFETCH_SYMBOLS = [];
-const HISTORY_BATCH_SIZE = 5000;
-const FULL_HISTORY_CANDLE_LIMIT = 1000;
 const TERMINAL_LAYOUT_STORAGE_KEY = "alpha-terminal-layout-v2";
 const DEFAULT_INDICATORS = [
   { id: "ema-9", type: "EMA", period: 9, color: "#f7c948", enabled: true },
@@ -457,7 +436,7 @@ function formatChartCrosshairTime(timeValue) {
 }
 
 function chartCacheKey(symbol, rangeKey, intervalKey) {
-  return `${symbol || ""}::${rangeKey || "1d"}::${intervalKey || "1minute"}`;
+  return `${symbol || ""}::${rangeKey || "recent"}::${intervalKey || "1minute"}`;
 }
 
 function normalizeChartCandles(rows = []) {
@@ -479,58 +458,15 @@ function normalizeChartCandles(rows = []) {
     ));
 }
 
-function chartCandleKey(row) {
-  return row?.x || row?.time || "";
-}
-
-function mergeChartCandleRows(existing = [], incoming = [], mode = "append") {
-  const merged = mode === "prepend" ? [...incoming, ...existing] : [...existing, ...incoming];
-  const byTime = new Map();
-  merged.forEach((row) => {
-    const key = chartCandleKey(row);
-    if (key) {
-      byTime.set(key, row);
-    }
-  });
-  return Array.from(byTime.values()).sort((a, b) => parseChartTime(chartCandleKey(a)) - parseChartTime(chartCandleKey(b)));
-}
-
-function chartEndpointParams(symbol, rangeKey, intervalKey) {
+function chartEndpointParams(symbol) {
   const params = new URLSearchParams({
     symbol: symbol || "",
-    range: rangeKey || "1d",
-    interval: intervalKey || "1minute",
   });
   return params.toString();
 }
 
-function chartFromCandlePayload(payload, rangeKey = "1d") {
-  const oldest = payload?.oldest || payload?.candles?.[0]?.x || null;
-  const latest = payload?.latest || payload?.candles?.[payload?.candles?.length - 1]?.x || null;
-  return {
-    symbol: payload?.symbol,
-    instrument_key: payload?.instrument_key,
-    range: rangeKey,
-    label: rangeKey === "all" ? "ALL" : rangeKey.toUpperCase(),
-    interval: payload?.interval || "1minute",
-    supports_live: payload?.interval === "1minute",
-    is_resampled: payload?.interval !== "1minute",
-    start_date: oldest ? oldest.slice(0, 10) : null,
-    end_date: latest ? latest.slice(0, 10) : null,
-    generated_at: new Date().toISOString(),
-    candles: payload?.candles || [],
-    available_count: Number(payload?.available_count || payload?.total || 0) || null,
-    oldest,
-    latest,
-    markers: [],
-    pine_levels: [],
-    available_ranges: CHART_RANGE_FALLBACK,
-    available_intervals: payload?.available_intervals || CHART_INTERVAL_FALLBACK,
-  };
-}
-
-async function fetchChartPayload(symbol, rangeKey, intervalKey) {
-  return apiChartFetch(`/api/live/chart?${chartEndpointParams(symbol, rangeKey, intervalKey)}`);
+async function fetchChartPayload(symbol) {
+  return apiChartFetch(`/api/live/chart?${chartEndpointParams(symbol)}`);
 }
 
 function stableId(prefix) {
@@ -562,7 +498,7 @@ function defaultLayout() {
   return {
     selectedSymbol: "",
     timeframe: "1minute",
-    range: "1d",
+    range: "recent",
     theme: getInitialTheme(),
     recentSearches: [],
     favorites: [],
@@ -595,7 +531,7 @@ function mergeLayout(raw) {
 
 function defaultSymbolState() {
   return {
-    range: "1d",
+    range: "recent",
     interval: "1minute",
     indicators: DEFAULT_INDICATORS,
     drawings: [],
@@ -864,43 +800,6 @@ function mergeLiveChart(currentChart, update) {
   };
 }
 
-function markerFromSignal(signal) {
-  const details = signal?.details || {};
-  const action = String(details.pine_marker_text || "").toUpperCase();
-  const time = details.pine_marker_time;
-  if (!details.fresh_graph_marker || !time || !["BUY", "SELL"].includes(action)) {
-    return null;
-  }
-  return {
-    time,
-    position: action === "BUY" ? "belowBar" : "aboveBar",
-    color: action === "BUY" ? "#16a34a" : "#dc2626",
-    shape: action === "BUY" ? "arrowUp" : "arrowDown",
-    text: action,
-  };
-}
-
-function mergeSignalMarker(currentChart, signal) {
-  if (!currentChart) {
-    return currentChart;
-  }
-  const current = currentChart;
-  const marker = markerFromSignal(signal);
-  if (!marker || !current.supports_live) {
-    return current;
-  }
-  const markers = [...(current.markers || [])];
-  const markerKey = `${marker.time}:${marker.text}`;
-  if (!markers.some((row) => `${row.time}:${row.text}` === markerKey)) {
-    markers.push(marker);
-  }
-  markers.sort((a, b) => parseChartTime(a.time) - parseChartTime(b.time));
-  return {
-    ...current,
-    markers,
-  };
-}
-
 function MetricCard({ label, value, meta, tone }) {
   return (
     <article className="metric-card">
@@ -1015,18 +914,12 @@ function Sidebar({ activeView, onChange, snapshot, streamState }) {
 function ChartPanel({
   symbol,
   chart,
-  rangeKey,
-  intervalKey,
   indicators,
   drawings,
   activeDrawingTool,
   selectedDrawingId,
   replay,
   alerts,
-  onRangeChange,
-  onIntervalChange,
-  onRangeWarm,
-  onLoadMoreHistory,
   onIndicatorsChange,
   onDrawingsChange,
   onActiveDrawingToolChange,
@@ -1050,7 +943,6 @@ function ChartPanel({
   const drawingDraftRef = useRef(null);
   const dragDrawingRef = useRef(null);
   const viewportStateRef = useRef({ key: "", firstTime: null, lastTime: null, candleCount: 0 });
-  const historyRequestRef = useRef("");
   const [indicatorType, setIndicatorType] = useState("EMA");
   const [indicatorPeriod, setIndicatorPeriod] = useState(20);
   const [replayStart, setReplayStart] = useState("");
@@ -1065,10 +957,6 @@ function ChartPanel({
   const [openPanel, setOpenPanel] = useState("");
   const [crosshair, setCrosshair] = useState(null);
   const deferredChart = useDeferredValue(chart);
-  const ranges = deferredChart?.available_ranges || CHART_RANGE_FALLBACK;
-  const intervals = deferredChart?.available_intervals || CHART_INTERVAL_FALLBACK;
-  const rangeKeys = new Set(["all", "1d", "5d", "1m", "1mo", "6m", "6mo", "1y", "2y", "5y"]);
-  const primaryRanges = ranges.filter((item) => rangeKeys.has(item.key));
   const candles = React.useMemo(() => normalizeChartCandles(deferredChart?.candles || []), [deferredChart]);
   const replayIndex = replay?.active ? Math.max(0, Math.min(Number(replay.index || 0), candles.length - 1)) : null;
   const displayCandles = replay?.active ? candles.slice(0, replayIndex + 1) : candles;
@@ -1091,8 +979,6 @@ function ChartPanel({
     .filter((row) => row.label && Number.isFinite(row.price)), [deferredChart]);
   const activeCandle = crosshair || displayCandles[displayCandles.length - 1] || null;
   const activeTone = activeCandle && activeCandle.close >= activeCandle.open ? "positive" : "negative";
-  const activeRangeLabel = ranges.find((item) => item.key === rangeKey)?.label || deferredChart?.label || "Chart";
-  const activeIntervalLabel = intervals.find((item) => item.interval === intervalKey || item.key === intervalKey)?.label || intervalKey || "-";
   const latestSignal = signalMarkers[signalMarkers.length - 1] || null;
   const signalFocusKeyRef = useRef("");
 
@@ -1233,38 +1119,6 @@ function ChartPanel({
   }, []);
 
   useEffect(() => {
-    const timeScale = chartRef.current?.timeScale?.();
-    if (!timeScale || typeof timeScale.subscribeVisibleLogicalRangeChange !== "function") {
-      return undefined;
-    }
-    const onVisibleRange = (logicalRange) => {
-      if (!logicalRange || !displayCandles.length || typeof onLoadMoreHistory !== "function") {
-        return;
-      }
-      if (Number(logicalRange.from) > 40) {
-        return;
-      }
-      const oldest = deferredChart?.oldest || deferredChart?.candles?.[0]?.x;
-      const requestKey = `${symbol}:${intervalKey}:${oldest || ""}`;
-      if (!oldest || historyRequestRef.current === requestKey) {
-        return;
-      }
-      historyRequestRef.current = requestKey;
-      Promise.resolve(onLoadMoreHistory(oldest)).finally(() => {
-        window.setTimeout(() => {
-          if (historyRequestRef.current === requestKey) {
-            historyRequestRef.current = "";
-          }
-        }, 500);
-      });
-    };
-    timeScale.subscribeVisibleLogicalRangeChange(onVisibleRange);
-    return () => {
-      timeScale.unsubscribeVisibleLogicalRangeChange?.(onVisibleRange);
-    };
-  }, [symbol, intervalKey, displayCandles.length, deferredChart?.oldest, deferredChart?.candles, onLoadMoreHistory]);
-
-  useEffect(() => {
     if (!seriesRef.current || !deferredChart) {
       return;
     }
@@ -1276,7 +1130,7 @@ function ChartPanel({
       wickDownColor: chartTheme.down,
       borderVisible: chartType === "bars",
     });
-    const currentKey = `${symbol || ""}:${deferredChart?.range || rangeKey}:${deferredChart?.interval || intervalKey}`;
+    const currentKey = `${symbol || ""}:recent:1minute`;
     const previousViewport = viewportStateRef.current;
     const firstTime = displayCandles[0]?.time || null;
     const lastTime = displayCandles[displayCandles.length - 1]?.time || null;
@@ -1481,7 +1335,7 @@ function ChartPanel({
       context.drawImage(image, 0, 0, snapshot.width, snapshot.height);
     }
     const link = document.createElement("a");
-    link.download = `${String(symbol || "chart").replace(/\s+/g, "-").toLowerCase()}-${rangeKey}.png`;
+    link.download = `${String(symbol || "chart").replace(/\s+/g, "-").toLowerCase()}-1minute.png`;
     link.href = canvas.toDataURL("image/png");
     link.click();
   }
@@ -1802,9 +1656,7 @@ function ChartPanel({
         </div>
         <div className="chart-meta">
           <span className="chip">
-            {activeRangeLabel}
-            {" / "}
-            {activeIntervalLabel}
+            Recent sessions / 1m
           </span>
           <span className={`chip ${deferredChart?.supports_live ? "emphasis" : ""}`}>
             {deferredChart?.supports_live ? "Live WS" : "Archive"}
@@ -3415,10 +3267,9 @@ function App() {
   const [tradeHistory, setTradeHistory] = useState(null);
   const [strategyPerformance, setStrategyPerformance] = useState([]);
   const [contractModal, setContractModal] = useState(null);
-  const [chartRange, setChartRange] = useState("1d");
-  const [chartInterval, setChartInterval] = useState("1minute");
+  const chartRange = "recent";
+  const chartInterval = "1minute";
   const [chartLoading, setChartLoading] = useState(false);
-  const [chartHistoryLoading, setChartHistoryLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [portfolioLoading, setPortfolioLoading] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -3444,16 +3295,10 @@ function App() {
   const [smtpTesting, setSmtpTesting] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
   const chartCacheRef = useRef(new Map());
-  const chartWarmRef = useRef(new Set());
-  const chartHistoryWarmRef = useRef(new Set());
   const chartSelectionRef = useRef({ range: chartRange, interval: chartInterval });
   const reconnectTimerRef = useRef(null);
   const reconnectAttemptRef = useRef(0);
   const currentSymbolState = getSymbolState(layout, symbol);
-
-  useEffect(() => {
-    chartSelectionRef.current = { range: chartRange, interval: chartInterval };
-  }, [chartRange, chartInterval]);
 
   useEffect(() => {
     writeStoredLayout(layout);
@@ -3471,14 +3316,6 @@ function App() {
       theme,
     }, symbol, { range: chartRange, interval: chartInterval }));
   }, [symbol, chartRange, chartInterval, theme]);
-
-  useEffect(() => {
-    if (!symbol) {
-      return;
-    }
-    setChartRange("1d");
-    setChartInterval("1minute");
-  }, [symbol]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -3658,15 +3495,6 @@ function App() {
               calendar: message.payload?.calendar || current?.calendar || {},
               history: message.payload?.history || current?.history || {},
             })));
-            if (chartSelectionRef.current.interval === "1minute") {
-              setChart((current) => {
-                const next = mergeSignalMarker(current, message.payload?.signal);
-                if (next?.range && next?.interval) {
-                  chartCacheRef.current.set(chartCacheKey(symbol, next.range, next.interval), next);
-                }
-                return next;
-              });
-            }
             setStreamState("live");
             return;
           }
@@ -3731,7 +3559,7 @@ function App() {
         const cacheKey = chartCacheKey(symbol, chartRange, chartInterval);
         const hasVisibleChart = Boolean(chartCacheRef.current.get(cacheKey));
         setChartLoading(!hasVisibleChart);
-        const data = await fetchChartPayload(symbol, chartRange, chartInterval);
+        const data = await fetchChartPayload(symbol);
         if (!active) {
           return;
         }
@@ -3984,68 +3812,9 @@ function App() {
   }
 
   async function refreshChart() {
-    const data = await fetchChartPayload(symbol, chartRange, chartInterval);
+    const data = await fetchChartPayload(symbol);
     chartCacheRef.current.set(chartCacheKey(symbol, chartRange, chartInterval), data);
     setChart(data);
-  }
-
-  async function warmChartRange(range, interval = chartInterval) {
-    if (!symbol || !range || !interval) {
-      return;
-    }
-    const key = chartCacheKey(symbol, range, interval);
-    if (chartCacheRef.current.has(key) || chartWarmRef.current.has(key)) {
-      return;
-    }
-    chartWarmRef.current.add(key);
-    try {
-      const data = await fetchChartPayload(symbol, range, interval);
-      chartCacheRef.current.set(key, data);
-    } catch (_error) {
-      // Hover/focus warming is opportunistic.
-    } finally {
-      chartWarmRef.current.delete(key);
-    }
-  }
-
-  async function loadMoreChartHistory(before) {
-    if (!symbol || !before || chartHistoryLoading) {
-      return;
-    }
-    const requestKey = chartCacheKey(symbol, chartRange, chartInterval) + `::${before}`;
-    if (chartHistoryWarmRef.current.has(requestKey)) {
-      return;
-    }
-    chartHistoryWarmRef.current.add(requestKey);
-    setChartHistoryLoading(true);
-    try {
-      const data = await apiChartFetch(
-        `/api/candles/history?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(chartInterval)}&before=${encodeURIComponent(before)}&limit=${HISTORY_BATCH_SIZE}`,
-      );
-      const incoming = Array.isArray(data?.candles) ? data.candles : [];
-      if (!incoming.length) {
-        return;
-      }
-      const key = chartCacheKey(symbol, chartRange, chartInterval);
-      setChart((current) => {
-        const base = current || chartCacheRef.current.get(key) || selectedChart || {};
-        const mergedCandles = mergeChartCandleRows(base.candles || [], incoming, "prepend");
-        const nextChart = {
-          ...base,
-          candles: mergedCandles,
-          available_count: Number(data?.available_count || base.available_count || 0) || null,
-          oldest: mergedCandles[0]?.x || base.oldest,
-          history_loaded_at: new Date().toISOString(),
-        };
-        chartCacheRef.current.set(key, nextChart);
-        return nextChart;
-      });
-    } catch (loadError) {
-      setError(loadError.message || "Unable to load historical candles.");
-    } finally {
-      chartHistoryWarmRef.current.delete(requestKey);
-      setChartHistoryLoading(false);
-    }
   }
 
   async function updateMode(mode) {
@@ -4367,26 +4136,6 @@ function App() {
     refreshTradeHistory(next);
   }
 
-  function changeChartRange(nextRange) {
-    const ranges = selectedChart?.available_ranges || CHART_RANGE_FALLBACK;
-    const selectedRange = ranges.find((item) => item.key === nextRange) || null;
-    const nextInterval = selectedRange?.interval || chartInterval || "1minute";
-    const cached = chartCacheRef.current.get(chartCacheKey(symbol, nextRange, nextInterval));
-    if (cached) {
-      setChart(cached);
-    }
-    setChartRange(nextRange);
-    setChartInterval(nextInterval);
-  }
-
-  function changeChartInterval(nextInterval) {
-    const cached = chartCacheRef.current.get(chartCacheKey(symbol, chartRange, nextInterval));
-    if (cached) {
-      setChart(cached);
-    }
-    setChartInterval(nextInterval);
-  }
-
   return (
     <div className="workspace">
       <Sidebar
@@ -4570,18 +4319,12 @@ function App() {
               <ChartPanel
                 symbol={selectedSnapshot.symbol || symbol}
                 chart={selectedChart}
-                rangeKey={chartRange}
-                intervalKey={chartInterval}
                 indicators={currentSymbolState.indicators || []}
                 drawings={currentSymbolState.drawings || []}
                 activeDrawingTool={activeDrawingTool}
                 selectedDrawingId={selectedDrawingId}
                 replay={replay}
                 alerts={layout.alerts || []}
-                onRangeChange={changeChartRange}
-                onIntervalChange={changeChartInterval}
-                onRangeWarm={warmChartRange}
-                onLoadMoreHistory={loadMoreChartHistory}
                 onIndicatorsChange={updateCurrentIndicators}
                 onDrawingsChange={updateCurrentDrawings}
                 onActiveDrawingToolChange={setActiveDrawingTool}

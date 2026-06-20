@@ -234,6 +234,32 @@ def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> Non
     assert min(row["ts"] for row in captured_rows).time().isoformat() == "09:15:00"
 
 
+def test_pine_marker_calculation_is_ready_after_thirty_closed_candles() -> None:
+    from backend.execution_engine.live_service import _build_pine_chart_overlay
+
+    start = datetime(2026, 6, 18, 9, 15, tzinfo=IST_ZONE)
+    rows = [
+        {
+            "ts": start + timedelta(minutes=index),
+            "open": 24000.0 + index,
+            "high": 24003.0 + index,
+            "low": 23997.0 + index,
+            "close": 24001.0 + index,
+            "volume": 100.0,
+        }
+        for index in range(30)
+    ]
+
+    overlay = _build_pine_chart_overlay(
+        rows,
+        interval="1minute",
+        settings=Settings(),
+        range_key="1d",
+    )
+
+    assert set(overlay) == {"markers", "levels"}
+
+
 def test_serialize_signal_log_exposes_execution_decision() -> None:
     from backend.execution_engine.live_service import _serialize_signal_log
 
@@ -394,7 +420,7 @@ def test_build_technical_signal_holds_during_cooldown(monkeypatch) -> None:
     assert any("cooldown" in reason.lower() for reason in signal.reasons)
 
 
-def test_build_chart_payload_falls_back_to_one_day_for_unknown_range() -> None:
+def test_build_chart_payload_forces_single_one_minute_mode(monkeypatch) -> None:
     from backend.execution_engine.live_service import build_chart_payload
 
     engine = create_engine(
@@ -424,32 +450,39 @@ def test_build_chart_payload_falls_back_to_one_day_for_unknown_range() -> None:
                 )
             )
         session.commit()
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._build_pine_chart_overlay",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("chart-only marker generation must not run")
+            ),
+        )
 
         payload = build_chart_payload(
             session,
             symbol="Nifty 50",
             range_key="2y",
+            interval_key="1hour",
             now=datetime(2026, 4, 22, 10, 0, tzinfo=IST_ZONE),
         )
 
         range_keys = [item["key"] for item in payload["available_ranges"]]
         interval_keys = [item["interval"] for item in payload["available_intervals"]]
-        assert payload["range"] == "1d"
+        assert payload["range"] == "recent"
         assert payload["interval"] == "1minute"
         assert payload["source_interval"] == "1minute"
         assert payload["is_resampled"] is False
-        assert payload["start_date"] == "2026-04-21"
+        assert payload["start_date"] == "2026-04-15"
         assert payload["end_date"] == "2026-04-21"
-        assert {marker["text"] for marker in payload["markers"]}.issubset({"BUY", "SELL"})
-        assert "1d" in range_keys
-        assert "all" in range_keys
-        assert "1minute" in interval_keys
+        assert payload["markers"] == []
+        assert payload["pine_levels"] == []
+        assert range_keys == ["recent"]
+        assert interval_keys == ["1minute"]
         assert len(payload["candles"]) == 80
     finally:
         session.close()
 
 
-def test_build_chart_payload_honors_one_day_request() -> None:
+def test_build_chart_payload_ignores_legacy_one_day_request() -> None:
     from backend.execution_engine.live_service import build_chart_payload
 
     engine = create_engine(
@@ -486,9 +519,9 @@ def test_build_chart_payload_honors_one_day_request() -> None:
             now=datetime(2026, 4, 22, 10, 0, tzinfo=IST_ZONE),
         )
 
-        assert payload["range"] == "1d"
+        assert payload["range"] == "recent"
         assert payload["interval"] == "1minute"
-        assert payload["start_date"] == "2026-04-21"
+        assert payload["start_date"] == "2026-04-15"
         assert payload["end_date"] == "2026-04-21"
         assert len(payload["candles"]) == 5
         assert payload["markers"] == []
@@ -496,7 +529,7 @@ def test_build_chart_payload_honors_one_day_request() -> None:
         session.close()
 
 
-def test_chart_payload_uses_partial_current_session_before_fifty_candles() -> None:
+def test_chart_payload_uses_recent_one_minute_sessions() -> None:
     from backend.execution_engine.live_service import build_chart_payload
 
     engine = create_engine(
@@ -549,6 +582,9 @@ def test_chart_payload_uses_partial_current_session_before_fifty_candles() -> No
         )
 
         assert payload["latest"] == "2026-06-18T09:36:00+05:30"
+        assert payload["range"] == "recent"
+        assert payload["interval"] == "1minute"
+        assert payload["start_date"] == "2026-06-12"
         assert len(payload["candles"]) == 82
     finally:
         session.close()

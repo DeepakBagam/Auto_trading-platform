@@ -50,7 +50,7 @@ DEFAULT_SIGNAL_MIN_SCORE = 63.0
 VIX_MAX_THRESHOLD = 20.0   # Skip signals when VIX is too high (options too expensive)
 VIX_MIN_THRESHOLD = 11.0   # Skip signals when VIX is too low (premiums too small)
 DEFAULT_MAX_SIGNALS_PER_DAY = 2
-DEFAULT_CHART_RANGE = "1d"
+DEFAULT_CHART_RANGE = "recent"
 SIGNAL_ENTRY_START = time(9, 45)
 SIGNAL_ENTRY_END = time(15, 0)
 OPTION_STOP_LOSS_PCT = 0.35
@@ -58,20 +58,15 @@ OPTION_TARGET_PCT = 0.60
 OPTION_TRAIL_TRIGGER_PCT = 0.50
 OPTION_TRAIL_STOP_PCT = 0.20
 CHART_RANGE_SPECS: dict[str, dict[str, Any]] = {
-    "1d": {"label": "1D", "interval": "1minute", "days": 1, "supports_live": True},
-    "5d": {"label": "5D", "interval": "5minute", "days": 5, "supports_live": False},
-    "1m": {"label": "1M", "interval": "15minute", "days": 31, "supports_live": False},
-    "6m": {"label": "6M", "interval": "1hour", "days": 183, "supports_live": False},
-    "1y": {"label": "1Y", "interval": "day", "years": 1, "supports_live": False},
-    "all": {"label": "ALL", "interval": "1minute", "all_history": True, "supports_live": True},
+    "recent": {
+        "label": "Recent sessions",
+        "interval": "1minute",
+        "trading_sessions": 5,
+        "supports_live": True,
+    },
 }
 CHART_INTERVAL_OPTIONS: list[dict[str, str]] = [
     {"key": "1m", "label": "1m", "interval": "1minute"},
-    {"key": "5m", "label": "5m", "interval": "5minute"},
-    {"key": "15m", "label": "15m", "interval": "15minute"},
-    {"key": "30m", "label": "30m", "interval": "30minute"},
-    {"key": "1h", "label": "1h", "interval": "1hour"},
-    {"key": "1d", "label": "1D", "interval": "day"},
 ]
 CHART_CONFIRMATION_RULES: dict[str, tuple[str, str]] = {
     "1minute": ("3min", "5min"),
@@ -508,6 +503,10 @@ def _chart_range_plan(
         start_date = earliest.date()
     elif bool(spec.get("from_availability")):
         start_date = end_date - timedelta(days=_default_chart_days_for_interval(str(spec["interval"])))
+    elif "trading_sessions" in spec:
+        start_date = end_date
+        for _ in range(max(1, int(spec["trading_sessions"])) - 1):
+            start_date = previous_trading_day(start_date)
     elif "years" in spec:
         start_date = end_date - relativedelta(years=int(spec["years"]))
     else:
@@ -967,14 +966,14 @@ def _build_pine_chart_overlay(
 ) -> dict[str, Any]:
     if not DIRECTIONAL_SIGNALS_ENABLED:
         return {"markers": [], "levels": []}
-    if len(rows) < 60:
+    if len(rows) < 30:
         return {"markers": [], "levels": []}
     if len(rows) > 20_000:
         rows = rows[-20_000:]
 
     frame = pd.DataFrame(rows)
     frame["ts"] = pd.to_datetime(frame["ts"])
-    if frame.empty or len(frame) < 60:
+    if frame.empty or len(frame) < 30:
         return {"markers": [], "levels": []}
 
     close = pd.to_numeric(frame["close"], errors="coerce")
@@ -3063,6 +3062,7 @@ def _attach_execution_signal_markers(
                     symbol_value_filter(SignalLog.symbol, symbol),
                     SignalLog.timestamp >= start_ts,
                     SignalLog.timestamp <= end_ts,
+                    SignalLog.interval == SIGNAL_INTERVAL,
                     SignalLog.pine_signal.in_(["BUY", "SELL"]),
                 )
             )
@@ -3080,7 +3080,11 @@ def _attach_execution_signal_markers(
     for row in rows:
         action = str(row.pine_signal or "").upper()
         timestamp = _ensure_ist(row.timestamp)
-        if timestamp is None or action not in {"BUY", "SELL"}:
+        if (
+            timestamp is None
+            or action not in {"BUY", "SELL"}
+            or not bool((row.details or {}).get("fresh_graph_marker"))
+        ):
             continue
         marker = {
             "time": timestamp.isoformat(),
@@ -3114,20 +3118,18 @@ def build_chart_payload(
     settings = settings or get_settings()
     current = _ensure_ist(now) or datetime.now(IST_ZONE)
     instrument_key, display_symbol = resolve_instrument_key(db, symbol)
-    range_name = str(range_key or DEFAULT_CHART_RANGE).strip().lower()
-    selected_interval = normalize_interval(interval_key) if interval_key else None
+    # The live chart and execution engine share one canonical timeframe.
+    # Range/interval parameters remain accepted for backwards compatibility.
+    range_name = DEFAULT_CHART_RANGE
+    selected_interval = LIVE_INTERVAL
     plan = _chart_range_plan(range_name, current, interval_override=selected_interval)
-    source_interval = str(plan["interval"])
+    source_interval = LIVE_INTERVAL
     latest_source_ts = _latest_chart_source_ts(db, instrument_key=instrument_key, interval=source_interval)
     earliest_source_ts = _earliest_chart_source_ts(db, instrument_key=instrument_key, interval=source_interval)
-    if source_interval != LIVE_INTERVAL and latest_source_ts is None:
-        latest_source_ts = _latest_chart_source_ts(db, instrument_key=instrument_key, interval=LIVE_INTERVAL)
-        earliest_source_ts = _earliest_chart_source_ts(db, instrument_key=instrument_key, interval=LIVE_INTERVAL)
-    if range_name != "all" and (source_interval.endswith("minute") or source_interval.endswith("hour")):
-        latest_source_ts = (
-            _latest_complete_intraday_ts(db, instrument_key=instrument_key, now=current)
-            or latest_source_ts
-        )
+    latest_source_ts = (
+        _latest_complete_intraday_ts(db, instrument_key=instrument_key, now=current)
+        or latest_source_ts
+    )
     cache_key = (
         instrument_key,
         range_name,
@@ -3137,7 +3139,7 @@ def build_chart_payload(
     cached = _CHART_PAYLOAD_CACHE.get(cache_key)
     if cached is not None:
         return _attach_execution_signal_markers(db, cached, symbol=display_symbol)
-    redis_key = f"chart:v7:{instrument_key}:{range_name}:{source_interval}:{cache_key[3] or 'none'}"
+    redis_key = f"chart:v8:{instrument_key}:{range_name}:{source_interval}:{cache_key[3] or 'none'}"
     redis_cached = redis_get_json(redis_key)
     if redis_cached is not None:
         _CHART_PAYLOAD_CACHE[cache_key] = redis_cached
@@ -3171,14 +3173,6 @@ def build_chart_payload(
         ]
 
     candles = serialize_rows(rows)
-    pine_overlay = _build_pine_chart_overlay(
-        rows,
-        interval=str(plan["interval"]),
-        settings=settings,
-        range_key=str(plan["key"]),
-    )
-    markers = list(pine_overlay.get("markers") or [])
-    pine_levels = list(pine_overlay.get("levels") or [])
     interval_payloads: dict[str, Any] = {}
     payload = {
         "symbol": display_symbol,
@@ -3196,8 +3190,8 @@ def build_chart_payload(
         "oldest": candles[0]["x"] if candles else None,
         "latest": candles[-1]["x"] if candles else None,
         "interval_payloads": interval_payloads,
-        "markers": markers,
-        "pine_levels": pine_levels,
+        "markers": [],
+        "pine_levels": [],
         "available_ranges": _chart_range_options(),
         "available_intervals": _chart_interval_options(),
     }

@@ -85,3 +85,17 @@ def test_pending_position_controls_and_successful_trade_wording_are_present() ->
     assert "Entry pending reconciliation" in source
     assert "Exit pending reconciliation" in source
     assert 'label="Successful Trades / Symbol"' in source
+
+
+def test_chart_ui_is_fixed_to_execution_aligned_one_minute_mode() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "Recent sessions / 1m" in source
+    assert "changeChartRange" not in source
+    assert "changeChartInterval" not in source
+    assert "warmChartRange" not in source
+    assert "loadMoreChartHistory" not in source
+    assert "markerFromSignal" not in source
+    assert "mergeSignalMarker" not in source
+    assert 'range: rangeKey || "1d"' not in source
+    assert 'interval: intervalKey || "1minute"' not in source
