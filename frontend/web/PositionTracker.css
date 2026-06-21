@@ -81,7 +81,7 @@
   animation: pulse 2s infinite;
 }
 
-.live-indicator.paper-mode {
+.live-indicator.sandbox-mode {
   color: var(--accent);
 }
 

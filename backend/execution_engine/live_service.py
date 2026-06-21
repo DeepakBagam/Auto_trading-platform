@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, select
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from backend.api.market_stream_runtime import get_market_stream_runtime_status
 from backend.data_layer.collectors.upstox_option_chain import UpstoxOptionChainCollector
+from backend.data_layer.instrument_metadata import resolve_option_contract_metadata
 from backend.db.models import DataFreshness, ExecutionOrder, ExecutionPosition, OptionQuote, RawCandle, SignalLog
 from backend.execution_engine.slippage_tracker import get_vix_context
 from backend.execution_engine.strike_selector import get_atm_iv as _strike_get_atm_iv
@@ -25,7 +27,11 @@ from backend.execution_engine.options_engine import (
     synthetic_option_chain,
 )
 from backend.utils.calendar_utils import is_trading_day, market_session_bounds, next_trading_day, previous_trading_day
-from backend.utils.app_state import get_paper_reset_at, get_paper_starting_balance, get_runtime_trading_mode
+from backend.utils.app_state import (
+    get_runtime_trading_mode,
+    get_sandbox_reset_at,
+    get_sandbox_starting_balance,
+)
 from backend.utils.config import Settings, get_settings
 from backend.utils.constants import IST_ZONE
 from backend.utils.intervals import normalize_interval
@@ -51,6 +57,8 @@ VIX_MAX_THRESHOLD = 20.0   # Skip signals when VIX is too high (options too expe
 VIX_MIN_THRESHOLD = 11.0   # Skip signals when VIX is too low (premiums too small)
 DEFAULT_MAX_SIGNALS_PER_DAY = 2
 DEFAULT_CHART_RANGE = "recent"
+PINE_SIGNAL_WARMUP_BARS = 20
+PINE_PARITY_HISTORY_BARS = 2500
 SIGNAL_ENTRY_START = time(9, 45)
 SIGNAL_ENTRY_END = time(15, 0)
 OPTION_STOP_LOSS_PCT = 0.35
@@ -84,8 +92,9 @@ CHART_MARKER_LIMITS: dict[str, int] = {
     "1y": 30,
     "2y": 30,
 }
-_CHART_PAYLOAD_CACHE: dict[tuple[str, str, str, str | None], dict[str, Any]] = {}
+_CHART_PAYLOAD_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _INSTRUMENT_RESOLVE_CACHE: dict[str, tuple[str, str]] = {}
+_PINE_MARKER_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 
 # ---------------------------------------------------------------------------
 # Market regime constants
@@ -94,8 +103,8 @@ _REGIME_TRENDING = "TRENDING"
 _REGIME_RANGE = "RANGE_BOUND"
 _REGIME_VOLATILE = "HIGH_VOLATILITY"
 
-# Data staleness: if last candle is older than this, halt signal generation.
-_DATA_STALE_SECONDS = 86400  # 24 hours - disabled for testing with historical data
+# During an open session, completed one-minute candles must remain close to real time.
+_DATA_STALE_SECONDS = 180
 
 
 def _detect_regime(
@@ -380,6 +389,32 @@ def _candles_to_frame(rows: list[RawCandle]) -> pd.DataFrame:
             "volume": [float(row.volume or 0.0) for row in rows],
         }
     )
+
+
+def _pine_rma(series: pd.Series, length: int) -> pd.Series:
+    """Match Pine Script ta.rma: SMA seed followed by Wilder smoothing."""
+    period = max(1, int(length))
+    values = pd.to_numeric(series, errors="coerce")
+    result = np.full(len(values), np.nan, dtype="float64")
+    valid_values: list[float] = []
+    seeded = False
+    previous = float("nan")
+
+    for position, value in enumerate(values.to_numpy(dtype="float64", copy=False)):
+        if np.isnan(value):
+            continue
+        numeric = float(value)
+        if not seeded:
+            valid_values.append(numeric)
+            if len(valid_values) < period:
+                continue
+            previous = sum(valid_values[-period:]) / period
+            seeded = True
+        else:
+            previous = ((previous * (period - 1)) + numeric) / period
+        result[position] = previous
+
+    return pd.Series(result, index=values.index, dtype="float64")
 
 
 def _resample_frame(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -966,14 +1001,14 @@ def _build_pine_chart_overlay(
 ) -> dict[str, Any]:
     if not DIRECTIONAL_SIGNALS_ENABLED:
         return {"markers": [], "levels": []}
-    if len(rows) < 30:
+    if len(rows) < PINE_SIGNAL_WARMUP_BARS:
         return {"markers": [], "levels": []}
     if len(rows) > 20_000:
         rows = rows[-20_000:]
 
     frame = pd.DataFrame(rows)
     frame["ts"] = pd.to_datetime(frame["ts"])
-    if frame.empty or len(frame) < 30:
+    if frame.empty or len(frame) < PINE_SIGNAL_WARMUP_BARS:
         return {"markers": [], "levels": []}
 
     close = pd.to_numeric(frame["close"], errors="coerce")
@@ -990,9 +1025,6 @@ def _build_pine_chart_overlay(
         axis=1,
     ).max(axis=1)
 
-    def rma(series: pd.Series, length: int) -> pd.Series:
-        return series.ewm(alpha=1.0 / max(1, int(length)), adjust=False).mean()
-
     sensitivity = float(getattr(settings, "pine_signal_sensitivity", 1.0))
     atr_length = int(getattr(settings, "pine_signal_atr_length", 10))
     atr_multiplier = float(getattr(settings, "pine_signal_atr_multiplier", 7.0))
@@ -1000,57 +1032,70 @@ def _build_pine_chart_overlay(
     ma_length = int(getattr(settings, "pine_signal_ma_length", 20))
     use_volume_filter = bool(getattr(settings, "pine_signal_use_volume_filter", False))
     volume_threshold = float(getattr(settings, "pine_signal_volume_threshold", 1.1))
-    show_signals = bool(getattr(settings, "pine_signal_show_signals", True))
     signal_cooldown = int(getattr(settings, "pine_signal_cooldown_bars", 2))
     atr_risk = int(getattr(settings, "pine_signal_atr_risk", 3))
     risk_atr_length = int(getattr(settings, "pine_signal_risk_atr_length", 14))
     percent_stop = float(getattr(settings, "pine_signal_percent_stop", 1.0))
 
-    if not show_signals:
-        return {"markers": [], "levels": []}
-
-    atr = rma(true_range, atr_length)
+    atr = _pine_rma(true_range, atr_length)
     factor = sensitivity * atr_multiplier
     upper_band = close + (factor * atr)
     lower_band = close - (factor * atr)
 
-    supertrend_line: list[float | None] = [None] * len(frame)
-    direction: list[int | None] = [None] * len(frame)
-    final_upper: list[float | None] = [None] * len(frame)
-    final_lower: list[float | None] = [None] * len(frame)
+    close_values = close.to_numpy(dtype="float64", copy=False)
+    high_values = high.to_numpy(dtype="float64", copy=False)
+    low_values = low.to_numpy(dtype="float64", copy=False)
+    volume_values = volume.to_numpy(dtype="float64", copy=False)
+    atr_values = atr.to_numpy(dtype="float64", copy=False)
+    upper_values = upper_band.to_numpy(dtype="float64", copy=False)
+    lower_values = lower_band.to_numpy(dtype="float64", copy=False)
+    supertrend_line = np.full(len(frame), np.nan, dtype="float64")
+    final_upper = np.full(len(frame), np.nan, dtype="float64")
+    final_lower = np.full(len(frame), np.nan, dtype="float64")
 
     for index in range(len(frame)):
-        if pd.isna(atr.iloc[index]) or pd.isna(close.iloc[index]):
+        if np.isnan(atr_values[index]) or np.isnan(close_values[index]):
             continue
 
-        current_upper = float(upper_band.iloc[index])
-        current_lower = float(lower_band.iloc[index])
+        current_upper = upper_values[index]
+        current_lower = lower_values[index]
         if index > 0:
             prev_lower = final_lower[index - 1]
             prev_upper = final_upper[index - 1]
-            prev_close_value = close.iloc[index - 1]
-            if prev_lower is not None and not pd.isna(prev_close_value):
-                current_lower = current_lower if current_lower > prev_lower or float(prev_close_value) < prev_lower else prev_lower
-            if prev_upper is not None and not pd.isna(prev_close_value):
-                current_upper = current_upper if current_upper < prev_upper or float(prev_close_value) > prev_upper else prev_upper
+            prev_close_value = close_values[index - 1]
+            if not np.isnan(prev_lower) and not np.isnan(prev_close_value):
+                current_lower = (
+                    current_lower
+                    if current_lower > prev_lower or prev_close_value < prev_lower
+                    else prev_lower
+                )
+            if not np.isnan(prev_upper) and not np.isnan(prev_close_value):
+                current_upper = (
+                    current_upper
+                    if current_upper < prev_upper or prev_close_value > prev_upper
+                    else prev_upper
+                )
 
         final_upper[index] = current_upper
         final_lower[index] = current_lower
 
-        if index == 0 or pd.isna(atr.iloc[index - 1]) or supertrend_line[index - 1] is None:
+        if index == 0 or np.isnan(atr_values[index - 1]) or np.isnan(supertrend_line[index - 1]):
             current_direction = 1
         elif supertrend_line[index - 1] == final_upper[index - 1]:
-            current_direction = -1 if float(close.iloc[index]) > current_upper else 1
+            current_direction = -1 if close_values[index] > current_upper else 1
         else:
-            current_direction = 1 if float(close.iloc[index]) < current_lower else -1
+            current_direction = 1 if close_values[index] < current_lower else -1
 
-        direction[index] = current_direction
         supertrend_line[index] = current_lower if current_direction == -1 else current_upper
 
     ma = close.rolling(max(1, ma_length), min_periods=max(1, ma_length)).mean()
     volume_ma = volume.rolling(20, min_periods=20).mean()
-    atr_14 = rma(true_range, 14)
-    atr_band = rma(true_range, risk_atr_length) * atr_risk
+    atr_14 = _pine_rma(true_range, 14)
+    atr_band = _pine_rma(true_range, risk_atr_length) * atr_risk
+    ma_values = ma.to_numpy(dtype="float64", copy=False)
+    volume_ma_values = volume_ma.to_numpy(dtype="float64", copy=False)
+    atr_14_values = atr_14.to_numpy(dtype="float64", copy=False)
+    atr_band_values = atr_band.to_numpy(dtype="float64", copy=False)
 
     markers: list[dict[str, Any]] = []
     levels: list[dict[str, Any]] = []
@@ -1060,32 +1105,32 @@ def _build_pine_chart_overlay(
     for index in range(1, len(frame)):
         line = supertrend_line[index]
         prev_line = supertrend_line[index - 1]
-        if line is None or prev_line is None:
+        if np.isnan(line) or np.isnan(prev_line):
             continue
 
-        current_close = close.iloc[index]
-        previous_close = close.iloc[index - 1]
-        if pd.isna(current_close) or pd.isna(previous_close):
+        current_close = close_values[index]
+        previous_close = close_values[index - 1]
+        if np.isnan(current_close) or np.isnan(previous_close):
             continue
 
-        raw_buy = float(previous_close) <= float(prev_line) and float(current_close) > float(line)
-        raw_sell = float(previous_close) >= float(prev_line) and float(current_close) < float(line)
+        raw_buy = previous_close <= prev_line and current_close > line
+        raw_sell = previous_close >= prev_line and current_close < line
 
-        trend_up = bool(not pd.isna(ma.iloc[index]) and float(current_close) > float(ma.iloc[index]))
-        trend_down = bool(not pd.isna(ma.iloc[index]) and float(current_close) < float(ma.iloc[index]))
+        trend_up = bool(not np.isnan(ma_values[index]) and current_close > ma_values[index])
+        trend_down = bool(not np.isnan(ma_values[index]) and current_close < ma_values[index])
         trend_filter_buy = (not use_trend_filter) or trend_up
         trend_filter_sell = (not use_trend_filter) or trend_down
 
         volume_ok = True
         if use_volume_filter:
             volume_ok = bool(
-                not pd.isna(volume_ma.iloc[index])
-                and float(volume.iloc[index]) > (float(volume_ma.iloc[index]) * volume_threshold)
+                not np.isnan(volume_ma_values[index])
+                and volume_values[index] > (volume_ma_values[index] * volume_threshold)
             )
 
         momentum_ok = bool(
-            not pd.isna(atr_14.iloc[index])
-            and abs(float(current_close) - float(previous_close)) > (float(atr_14.iloc[index]) * 0.1)
+            not np.isnan(atr_14_values[index])
+            and abs(current_close - previous_close) > (atr_14_values[index] * 0.1)
         )
 
         buy_signal = raw_buy and trend_filter_buy and volume_ok and momentum_ok
@@ -1105,12 +1150,12 @@ def _build_pine_chart_overlay(
         if ts is None:
             continue
 
-        if percent_stop != 0 and not pd.isna(atr_band.iloc[index]):
-            entry = float(current_close)
+        if percent_stop != 0 and not np.isnan(atr_band_values[index]):
+            entry = current_close
             stop = (
-                float(low.iloc[index]) - float(atr_band.iloc[index])
+                low_values[index] - atr_band_values[index]
                 if action == "BUY"
-                else float(high.iloc[index]) + float(atr_band.iloc[index])
+                else high_values[index] + atr_band_values[index]
             )
             risk_unit = entry - stop
             levels = [
@@ -1146,25 +1191,83 @@ def _build_chart_markers(
     return list(_build_pine_chart_overlay(rows, interval=interval, settings=settings, range_key=range_key)["markers"])
 
 
+def _pine_settings_fingerprint(settings: Settings) -> tuple[Any, ...]:
+    return (
+        float(settings.pine_signal_sensitivity),
+        int(settings.pine_signal_atr_length),
+        float(settings.pine_signal_atr_multiplier),
+        bool(settings.pine_signal_use_trend_filter),
+        int(settings.pine_signal_ma_length),
+        bool(settings.pine_signal_use_volume_filter),
+        float(settings.pine_signal_volume_threshold),
+        int(settings.pine_signal_cooldown_bars),
+        int(settings.pine_signal_atr_risk),
+        int(settings.pine_signal_risk_atr_length),
+        float(settings.pine_signal_percent_stop),
+    )
+
+
+def _cache_pine_marker(cache_key: tuple[Any, ...] | None, marker: dict[str, Any] | None) -> None:
+    if cache_key is None:
+        return
+    if cache_key not in _PINE_MARKER_CACHE and len(_PINE_MARKER_CACHE) >= 32:
+        _PINE_MARKER_CACHE.pop(next(iter(_PINE_MARKER_CACHE)))
+    _PINE_MARKER_CACHE[cache_key] = dict(marker) if marker is not None else None
+
+
 def _latest_fresh_pine_marker(
     rows: list[RawCandle],
     *,
     settings: Settings,
     candle_ts: datetime,
+    instrument_key: str | None = None,
 ) -> dict[str, Any] | None:
     candle_ts = _ensure_ist(candle_ts)
     if candle_ts is None:
         return None
-    session_start, session_end = market_session_bounds(candle_ts.date())
-    session_rows = [
-        row
-        for row in rows
-        if (
-            _ensure_ist(row.ts) is not None
-            and session_start <= _ensure_ist(row.ts) < session_end
+    regular_session_rows: list[RawCandle] = []
+    for row in rows:
+        row_ts = _ensure_ist(row.ts)
+        if row_ts is None or row_ts > candle_ts:
+            continue
+        session_start, session_end = market_session_bounds(row_ts.date())
+        if session_start <= row_ts < session_end:
+            regular_session_rows.append(row)
+    if not regular_session_rows:
+        return None
+
+    cache_key: tuple[Any, ...] | None = None
+    if instrument_key:
+        latest_rows = regular_session_rows[-3:]
+        cache_key = (
+            instrument_key,
+            len(regular_session_rows),
+            _ensure_ist(regular_session_rows[0].ts),
+            _ensure_ist(regular_session_rows[-1].ts),
+            tuple(
+                (
+                    float(row.open),
+                    float(row.high),
+                    float(row.low),
+                    float(row.close),
+                    float(row.volume or 0.0),
+                )
+                for row in latest_rows
+            ),
+            float(settings.pine_signal_sensitivity),
+            int(settings.pine_signal_atr_length),
+            float(settings.pine_signal_atr_multiplier),
+            bool(settings.pine_signal_use_trend_filter),
+            int(settings.pine_signal_ma_length),
+            bool(settings.pine_signal_use_volume_filter),
+            float(settings.pine_signal_volume_threshold),
+            int(settings.pine_signal_cooldown_bars),
         )
-    ]
-    overlay_rows = _candles_to_frame(session_rows).to_dict("records")
+        if cache_key in _PINE_MARKER_CACHE:
+            cached_marker = _PINE_MARKER_CACHE[cache_key]
+            return dict(cached_marker) if cached_marker is not None else None
+
+    overlay_rows = _candles_to_frame(regular_session_rows).to_dict("records")
     overlay = _build_pine_chart_overlay(
         overlay_rows,
         interval=SIGNAL_INTERVAL,
@@ -1173,15 +1276,20 @@ def _latest_fresh_pine_marker(
     )
     markers = list(overlay.get("markers") or [])
     if not markers:
+        _cache_pine_marker(cache_key, None)
         return None
     latest_marker = markers[-1]
     marker_ts = _parse_iso_datetime(latest_marker.get("time"))
     if marker_ts is None:
+        _cache_pine_marker(cache_key, None)
         return None
     if marker_ts.replace(second=0, microsecond=0) != candle_ts.replace(second=0, microsecond=0):
+        _cache_pine_marker(cache_key, None)
         return None
     action = str(latest_marker.get("text") or "").upper()
-    return latest_marker if action in {"BUY", "SELL"} else None
+    marker = latest_marker if action in {"BUY", "SELL"} else None
+    _cache_pine_marker(cache_key, marker)
+    return marker
 
 
 def _closed_signal_rows(rows: list[RawCandle], now: datetime) -> list[RawCandle]:
@@ -1202,7 +1310,7 @@ def load_market_context(
     symbol: str,
     settings: Settings | None = None,
     chart_limit: int = 180,
-    signal_limit: int = 240,
+    signal_limit: int = PINE_PARITY_HISTORY_BARS,
     now: datetime | None = None,
 ) -> MarketContext:
     settings = settings or get_settings()
@@ -1302,10 +1410,25 @@ def _parse_time_setting(value: str, fallback: time) -> time:
         return fallback
 
 
-def _strategy_window_status(now: datetime, settings: Settings | None = None) -> tuple[str, bool]:
+def _symbol_setting(settings: Settings, symbol: str, key: str, default: Any) -> Any:
+    return settings.signal_profile_for_symbol(symbol).get(key, getattr(settings, key, default))
+
+
+def _strategy_window_status(
+    now: datetime,
+    settings: Settings | None = None,
+    *,
+    symbol: str = "",
+) -> tuple[str, bool]:
     settings = settings or get_settings()
-    entry_start = _parse_time_setting(getattr(settings, "entry_window_start", ""), SIGNAL_ENTRY_START)
-    entry_end = _parse_time_setting(getattr(settings, "entry_window_end", ""), SIGNAL_ENTRY_END)
+    entry_start = _parse_time_setting(
+        _symbol_setting(settings, symbol, "entry_window_start", ""),
+        SIGNAL_ENTRY_START,
+    )
+    entry_end = _parse_time_setting(
+        _symbol_setting(settings, symbol, "entry_window_end", ""),
+        SIGNAL_ENTRY_END,
+    )
     now_time = now.timetz().replace(tzinfo=None)
     if now_time < entry_start:
         return "avoid_open", False
@@ -1355,7 +1478,7 @@ def _resample_five_minute_signal_frame(rows: list[RawCandle]) -> pd.DataFrame:
             bar_count=("ts", "count"),
         )
     )
-    grouped = grouped[grouped["bar_count"] >= 4].copy()  # Relaxed from 5 to 4 bars
+    grouped = grouped[grouped["bar_count"] >= 5].copy()
     if grouped.empty:
         return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
     grouped["ts"] = grouped["bucket_start"] + timedelta(minutes=5)
@@ -1396,12 +1519,26 @@ def build_technical_signal(
 
     rows = context.signal_rows
 
-    # --- Data freshness guard: halt if feed is stale ---
+    # Halt only when the expected market session is missing or an open-session
+    # feed has stopped advancing.
     if rows:
         last_ts = _ensure_ist(rows[-1].ts)
         if last_ts is not None:
             age_seconds = int((now - last_ts).total_seconds())
-            if age_seconds > _DATA_STALE_SECONDS:
+            session_start, session_end = market_session_bounds(now.date())
+            expected_session_date = (
+                now.date()
+                if is_trading_day(now.date()) and now >= session_start
+                else previous_trading_day(now.date())
+            )
+            stale_session = last_ts.date() < expected_session_date
+            stale_open_session = bool(
+                is_trading_day(now.date())
+                and session_start <= now <= session_end
+                and last_ts.date() == now.date()
+                and age_seconds > _DATA_STALE_SECONDS
+            )
+            if stale_session or stale_open_session:
                 return TechnicalSignal(
                     symbol=context.symbol,
                     interval=SIGNAL_INTERVAL,
@@ -1426,7 +1563,7 @@ def build_technical_signal(
                     },
                 )
 
-    if len(rows) < 60:
+    if len(rows) < PINE_SIGNAL_WARMUP_BARS:
         return TechnicalSignal(
             symbol=context.symbol,
             interval=SIGNAL_INTERVAL,
@@ -1441,15 +1578,15 @@ def build_technical_signal(
             take_profit=None,
             cooldown_seconds=0,
             max_signals_reached=False,
-            reasons=["Waiting for enough 1-minute candles to build a stable signal."],
+            reasons=["Waiting for enough 1-minute candles to initialize the Pine strategy."],
             details={"warmup_candles": len(rows), "strategy_interval": SIGNAL_INTERVAL},
         )
     
     # Use 1-minute candles directly (no resampling)
     frame = _candles_to_frame(rows)
-    signal_frame = build_price_features(frame) if len(frame) >= 30 else frame
+    signal_frame = build_price_features(frame)
     
-    if len(signal_frame) < 25:
+    if len(signal_frame) < PINE_SIGNAL_WARMUP_BARS:
         return TechnicalSignal(
             symbol=context.symbol,
             interval=SIGNAL_INTERVAL,
@@ -1464,7 +1601,7 @@ def build_technical_signal(
             take_profit=None,
             cooldown_seconds=0,
             max_signals_reached=False,
-            reasons=["Waiting for enough 1-minute candles to build the EMA/RSI setup."],
+            reasons=["Waiting for enough 1-minute candles to initialize the Pine strategy."],
             details={"strategy_interval": SIGNAL_INTERVAL, "warmup_candles_1m": len(signal_frame)},
         )
 
@@ -1483,11 +1620,16 @@ def build_technical_signal(
     prev_ema_21 = _to_float(prev.get("ema_21")) or ema_21
     rsi = _to_float(row.get("rsi_14")) or 50.0
     atr = max(1e-9, _to_float(row.get("atr_14")) or 0.0)
+    adx = _to_float(row.get("adx_14")) or 0.0
     volume = _to_float(row.get("volume")) or 0.0
     volume_avg = _to_float(row.get("volume_sma_20")) or 0.0
     volume_ratio = _to_float(row.get("volume_ratio_20")) or 1.0
     candle_ts = _parse_iso_datetime(row.get("ts")) or now
-    window_status, entry_window_open = _strategy_window_status(now, settings)
+    window_status, entry_window_open = _strategy_window_status(
+        now,
+        settings,
+        symbol=context.symbol,
+    )
     vix_level, vix_ma, vix_ratio = get_vix_context(db)
     vix_min = float(getattr(settings, "signal_vix_min", VIX_MIN_THRESHOLD))
     vix_max = float(getattr(settings, "signal_vix_max", VIX_MAX_THRESHOLD))
@@ -1508,9 +1650,11 @@ def build_technical_signal(
     break_prev_low = close < prev_low
     require_volume = bool(getattr(settings, "signal_require_volume_confirmation", True))
     require_breakout = bool(getattr(settings, "signal_require_breakout", True))
-    atr_min = float(getattr(settings, "signal_atr_min_points", 4.0))
-    atr_max = float(getattr(settings, "signal_atr_max_points", 80.0))
+    atr_min = float(_symbol_setting(settings, context.symbol, "signal_atr_min_points", 4.0))
+    atr_max = float(_symbol_setting(settings, context.symbol, "signal_atr_max_points", 80.0))
     atr_ok = atr_min <= atr <= atr_max
+    min_adx = float(_symbol_setting(settings, context.symbol, "signal_min_adx", 0.0))
+    adx_ok = min_adx <= 0 or adx >= min_adx
 
     # ============================================================================
     # 1-MINUTE SIGNAL SYSTEM
@@ -1572,7 +1716,12 @@ def build_technical_signal(
         and atr_ok
     )
 
-    fresh_marker = _latest_fresh_pine_marker(rows, settings=settings, candle_ts=candle_ts)
+    fresh_marker = _latest_fresh_pine_marker(
+        rows,
+        settings=settings,
+        candle_ts=candle_ts,
+        instrument_key=context.instrument_key,
+    )
     pine_action = str((fresh_marker or {}).get("text") or "").upper()
     raw_action = pine_action if pine_action in {"BUY", "SELL"} else "HOLD"
     raw_score = 100.0 if raw_action in {"BUY", "SELL"} else max(score_buy, score_sell)
@@ -1642,6 +1791,9 @@ def build_technical_signal(
     if not atr_ok:
         action = "HOLD"
         reasons.append(f"ATR {atr:.2f} is outside the configured {atr_min:.2f}-{atr_max:.2f} point range.")
+    if not adx_ok:
+        action = "HOLD"
+        reasons.append(f"ADX {adx:.2f} is below the configured minimum {min_adx:.2f}.")
     if vix_too_high:
         action = "HOLD"
         reasons.append(f"VIX is above {vix_max:.1f}; skipping fresh option entries.")
@@ -1687,6 +1839,7 @@ def build_technical_signal(
         "prev_ema_21": round(prev_ema_21, 2),
         "rsi_14": round(rsi, 2),
         "atr_14": round(atr, 2),
+        "adx_14": round(adx, 2),
         "volume": round(volume, 2),
         "volume_sma_20": round(volume_avg, 2),
         "volume_ratio_20": round(volume_ratio, 2),
@@ -1707,9 +1860,16 @@ def build_technical_signal(
         "atr_ok": atr_ok,
         "atr_min_points": atr_min,
         "atr_max_points": atr_max,
+        "adx_min": min_adx,
+        "adx_ok": adx_ok,
         "buy_ready": buy_ready,
         "sell_ready": sell_ready,
         "pine_signal": raw_action if raw_action in {"BUY", "SELL"} else "OFF",
+        "raw_signal": raw_action,
+        "execution_decision": action,
+        "execution_rejection_reasons": (
+            reasons if raw_action in {"BUY", "SELL"} and action == "HOLD" else []
+        ),
         "pine_marker_time": fresh_marker.get("time") if fresh_marker else None,
         "pine_marker_text": fresh_marker.get("text") if fresh_marker else None,
         "execution_signal_source": "graph_marker_pine_overlay",
@@ -1717,8 +1877,18 @@ def build_technical_signal(
         "signal_min_score": min_score,
         "score_buy": round(score_buy, 1),
         "score_sell": round(score_sell, 1),
-        "entry_window_start": settings.entry_window_start,
-        "entry_window_end": settings.entry_window_end,
+        "entry_window_start": _symbol_setting(
+            settings,
+            context.symbol,
+            "entry_window_start",
+            settings.entry_window_start,
+        ),
+        "entry_window_end": _symbol_setting(
+            settings,
+            context.symbol,
+            "entry_window_end",
+            settings.entry_window_end,
+        ),
         "window_status": window_status,
         "entry_window_open": entry_window_open,
         "vix_level": vix_level,
@@ -2116,14 +2286,14 @@ def resolve_live_option_quote(
     return None
 
 
-def compute_paper_portfolio_metrics(
+def compute_sandbox_portfolio_metrics(
     db: Session,
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
-    starting_balance = float(get_paper_starting_balance(db, settings=settings))
-    reset_at = get_paper_reset_at(db)
+    starting_balance = float(get_sandbox_starting_balance(db, settings=settings))
+    reset_at = get_sandbox_reset_at(db)
     open_positions = (
         db.execute(select(ExecutionPosition).where(ExecutionPosition.status == "OPEN"))
         .scalars()
@@ -2134,14 +2304,14 @@ def compute_paper_portfolio_metrics(
         .scalars()
         .all()
     )
-    def _is_paper(row: ExecutionPosition) -> bool:
+    def _is_sandbox(row: ExecutionPosition) -> bool:
         metadata = row.metadata_json or {}
-        return str(metadata.get("execution_mode") or "paper").lower() == "paper"
+        return str(metadata.get("execution_mode") or "").lower() == "sandbox"
     def _in_window(row: ExecutionPosition) -> bool:
         opened = _ensure_ist(row.opened_at)
         return reset_at is None or (opened is not None and opened >= _ensure_ist(reset_at))
-    open_positions = [row for row in open_positions if _is_paper(row) and _in_window(row)]
-    closed_positions = [row for row in closed_positions if _is_paper(row) and _in_window(row)]
+    open_positions = [row for row in open_positions if _is_sandbox(row) and _in_window(row)]
+    closed_positions = [row for row in closed_positions if _is_sandbox(row) and _in_window(row)]
     invested_amount = round(
         sum(float(row.entry_premium or row.entry_price or 0.0) * int(row.quantity or 0) for row in open_positions),
         2,
@@ -2182,19 +2352,19 @@ def compute_paper_portfolio_metrics(
 
 def _position_execution_mode(row: ExecutionPosition) -> str:
     metadata = row.metadata_json or {}
-    return str(metadata.get("execution_mode") or "paper").lower()
+    return str(metadata.get("execution_mode") or "archived_paper").lower()
 
 
 def _position_matches_mode(row: ExecutionPosition, mode: str) -> bool:
-    return _position_execution_mode(row) == str(mode or "paper").lower()
+    return _position_execution_mode(row) == str(mode or "sandbox").lower()
 
 
 def _order_matches_mode(row: ExecutionOrder, mode: str) -> bool:
     broker_name = str(row.broker_name or "paper").lower()
-    normalized_mode = str(mode or "paper").lower()
+    normalized_mode = str(mode or "sandbox").lower()
     if normalized_mode == "live":
-        return broker_name != "paper"
-    return broker_name == "paper"
+        return broker_name not in {"paper", "upstox_sandbox"}
+    return broker_name == "upstox_sandbox"
 
 
 def _compute_iv_rank(
@@ -2528,6 +2698,49 @@ def build_option_selection(
         selected_strike = float(selected["strike"])
         entry_price = float(selected["ltp"])
         quote_source = str(selected["source"])
+        contract_metadata = None
+        if str(settings.execution_mode).lower() == "sandbox":
+            try:
+                contract_metadata = (
+                    resolve_option_contract_metadata(
+                        settings=settings,
+                        underlying_key=str(underlying_key or ""),
+                        expiry_date=expiry_date,
+                        instrument_key=str(selected["instrument_key"]),
+                    )
+                    if underlying_key
+                    else None
+                )
+            except Exception:
+                contract_metadata = None
+            if contract_metadata is None:
+                signal_payload = {
+                    "action": "HOLD",
+                    "option_type": None,
+                    "strike": None,
+                    "entry_price": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "confidence": signal.confidence,
+                    "quote_status": "unavailable",
+                    "quote_source": quote_source,
+                    "quote_ts": selected["quote_ts"],
+                    "quote_age_seconds": selected["quote_age_seconds"],
+                    "requested_atm": float(requested_atm),
+                    "candidate_diagnostics": candidate_diagnostics,
+                    "reasons": [
+                        "Current Upstox contract lot/tick metadata is unavailable; Sandbox fails closed."
+                    ],
+                }
+                return OptionSelection(
+                    expiry_date=expiry_date,
+                    strike_step=strike_step,
+                    chain_source=chain_source,
+                    chain_generated_at=_ensure_ist(chain_generated_at),
+                    available_expiries=available_expiries,
+                    chain_rows=chain_rows,
+                    signal=signal_payload,
+                )
         risk_plan = _option_risk_plan(entry_price, signal, settings)
         iv_rank = _compute_iv_rank(db, context.symbol, _strike_get_atm_iv(chain_rows, requested_atm))
         signal_payload = {
@@ -2539,6 +2752,10 @@ def build_option_selection(
             "take_profit": float(risk_plan["take_profit"]),
             "confidence": signal.confidence,
             "instrument_key": selected["instrument_key"],
+            "lot_size": contract_metadata.lot_size if contract_metadata is not None else None,
+            "minimum_lot": contract_metadata.minimum_lot if contract_metadata is not None else None,
+            "tick_size": contract_metadata.tick_size if contract_metadata is not None else None,
+            "freeze_quantity": contract_metadata.freeze_quantity if contract_metadata is not None else None,
             "quote_status": "available",
             "quote_source": quote_source,
             "quote_ts": selected["quote_ts"],
@@ -2695,7 +2912,7 @@ def refresh_open_positions_snapshot(
             select(ExecutionPosition)
             .where(
                 ExecutionPosition.status.in_(
-                    ["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"]
+                    ["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING", "MANUAL_REVIEW"]
                 )
             )
             .order_by(ExecutionPosition.opened_at.desc())
@@ -2762,6 +2979,7 @@ def _serialize_position(row: ExecutionPosition) -> dict[str, Any]:
         "initial_sl": row.initial_sl or row.stop_loss,
         "target_premium": row.target_premium or row.take_profit,
         "status": row.status,
+        "entry_order_id": row.entry_order_id,
         "exit_reason": row.exit_reason,
         "instrument_key": metadata.get("instrument_key"),
         "latest_quote_source": metadata.get("latest_quote_source"),
@@ -2770,6 +2988,14 @@ def _serialize_position(row: ExecutionPosition) -> dict[str, Any]:
         "latest_quote_status": metadata.get("latest_quote_status"),
         "latest_quote_unavailable_reason": metadata.get("latest_quote_unavailable_reason"),
         "premium_history": metadata.get("premium_history") or [],
+        "metadata": {
+            "entry_order_status": metadata.get("entry_order_status"),
+            "broker_sl_order_id": metadata.get("broker_sl_order_id"),
+            "broker_sl_order_status": metadata.get("broker_sl_order_status"),
+            "broker_sl_trigger_price": metadata.get("broker_sl_trigger_price"),
+            "manual_review_operation": metadata.get("manual_review_operation"),
+            "manual_review_message": metadata.get("manual_review_message"),
+        },
     }
 
 
@@ -2786,6 +3012,8 @@ def _serialize_order(row: ExecutionOrder) -> dict[str, Any]:
         "price": row.price,
         "trigger_price": row.trigger_price,
         "status": row.status,
+        "broker_name": row.broker_name,
+        "broker_order_id": row.broker_order_id,
         "realized_pnl": row.realized_pnl,
         "unrealized_pnl": row.unrealized_pnl,
         "created_at": _ensure_ist(row.created_at).isoformat() if row.created_at else None,
@@ -2809,6 +3037,9 @@ def _serialize_signal_log(row: SignalLog) -> dict[str, Any]:
         "consensus": row.consensus,
         "combined_score": row.combined_score,
         "pine_signal": row.pine_signal,
+        "raw_signal": details.get("raw_signal") or row.pine_signal,
+        "execution_decision": details.get("execution_decision") or row.consensus,
+        "execution_rejection_reasons": details.get("execution_rejection_reasons") or [],
         "trade_placed": bool(row.trade_placed),
         "skip_reason": row.skip_reason,
         "details": details,
@@ -2934,7 +3165,7 @@ def _stats_payload(db: Session, *, settings: Settings | None = None) -> dict[str
     pnl_values = [float(row.realized_pnl or row.pnl_value or 0.0) for row in closed_positions]
     wins = sum(1 for value in pnl_values if value > 0.0)
     open_positions = refresh_open_positions_snapshot(db, settings=settings)
-    paper = compute_paper_portfolio_metrics(db, settings=settings)
+    sandbox = compute_sandbox_portfolio_metrics(db, settings=settings)
     unpriced_positions = [
         row
         for row in open_positions
@@ -2956,13 +3187,13 @@ def _stats_payload(db: Session, *, settings: Settings | None = None) -> dict[str
         "open_positions_unpriced_unrealized_pnl": unpriced_unrealized_pnl,
         "total_trades_today": len(closed_positions),
         "wins_today": wins,
-        "paper_starting_balance": float(paper["starting_balance"]),
-        "paper_available_balance": float(paper["available_balance"]),
-        "paper_invested_amount": float(paper["invested_amount"]),
-        "paper_realized_pnl": float(paper["realized_pnl"]),
-        "paper_unrealized_pnl": float(paper["unrealized_pnl"]),
-        "paper_total_pnl": float(paper["total_pnl"]),
-        "paper_equity": float(paper["equity"]),
+        "sandbox_starting_balance": float(sandbox["starting_balance"]),
+        "sandbox_available_balance": float(sandbox["available_balance"]),
+        "sandbox_invested_amount": float(sandbox["invested_amount"]),
+        "sandbox_realized_pnl": float(sandbox["realized_pnl"]),
+        "sandbox_unrealized_pnl": float(sandbox["unrealized_pnl"]),
+        "sandbox_total_pnl": float(sandbox["total_pnl"]),
+        "sandbox_equity": float(sandbox["equity"]),
     }
 
 
@@ -3135,11 +3366,15 @@ def build_chart_payload(
         range_name,
         source_interval,
         latest_source_ts.isoformat() if latest_source_ts is not None else None,
+        _pine_settings_fingerprint(settings),
     )
     cached = _CHART_PAYLOAD_CACHE.get(cache_key)
     if cached is not None:
         return _attach_execution_signal_markers(db, cached, symbol=display_symbol)
-    redis_key = f"chart:v8:{instrument_key}:{range_name}:{source_interval}:{cache_key[3] or 'none'}"
+    redis_key = (
+        f"chart:v10:{instrument_key}:{range_name}:{source_interval}:"
+        f"{cache_key[3] or 'none'}:{hash(cache_key[4])}"
+    )
     redis_cached = redis_get_json(redis_key)
     if redis_cached is not None:
         _CHART_PAYLOAD_CACHE[cache_key] = redis_cached
@@ -3173,6 +3408,41 @@ def build_chart_payload(
         ]
 
     candles = serialize_rows(rows)
+    marker_source_rows = _closed_signal_rows(
+        _load_recent_candles(
+            db,
+            instrument_key=instrument_key,
+            interval=LIVE_INTERVAL,
+            limit=PINE_PARITY_HISTORY_BARS,
+        ),
+        current,
+    )
+    regular_session_rows: list[RawCandle] = []
+    for row in marker_source_rows:
+        row_ts = _ensure_ist(row.ts)
+        if row_ts is None:
+            continue
+        session_start, session_end = market_session_bounds(row_ts.date())
+        if session_start <= row_ts < session_end:
+            regular_session_rows.append(row)
+    overlay = _build_pine_chart_overlay(
+        _candles_to_frame(regular_session_rows).to_dict("records"),
+        interval=LIVE_INTERVAL,
+        settings=settings,
+        range_key=range_name,
+    )
+    visible_start = _parse_iso_datetime(candles[0]["x"]) if candles else None
+    visible_end = _parse_iso_datetime(candles[-1]["x"]) if candles else None
+    markers = [
+        marker
+        for marker in overlay.get("markers") or []
+        if (
+            visible_start is not None
+            and visible_end is not None
+            and (marker_ts := _parse_iso_datetime(marker.get("time"))) is not None
+            and visible_start <= marker_ts <= visible_end
+        )
+    ]
     interval_payloads: dict[str, Any] = {}
     payload = {
         "symbol": display_symbol,
@@ -3190,7 +3460,7 @@ def build_chart_payload(
         "oldest": candles[0]["x"] if candles else None,
         "latest": candles[-1]["x"] if candles else None,
         "interval_payloads": interval_payloads,
-        "markers": [],
+        "markers": markers,
         "pine_levels": [],
         "available_ranges": _chart_range_options(),
         "available_intervals": _chart_interval_options(),

@@ -13,7 +13,7 @@ from backend.utils.config import Settings, get_settings
 from backend.utils.constants import IST_ZONE
 
 RUNTIME_SETTINGS_KEY = "runtime_execution_settings"
-SENSITIVE_RUNTIME_KEYS = {"upstox_access_token", "smtp_password"}
+SENSITIVE_RUNTIME_KEYS = {"upstox_access_token", "upstox_sandbox_access_token", "smtp_password"}
 RUNTIME_SETTING_KEYS = {
     "execution_enabled",
     "execution_symbols",
@@ -45,10 +45,15 @@ RUNTIME_SETTING_KEYS = {
     "signal_vix_max",
     "signal_atr_min_points",
     "signal_atr_max_points",
+    "signal_min_adx",
+    "signal_symbol_profiles",
     "option_min_volume",
     "option_min_oi",
     "option_max_spread_pct",
     "upstox_access_token",
+    "upstox_sandbox_access_token",
+    "sandbox_limit_protection_pct",
+    "sandbox_price_tick",
     "smtp_enabled",
     "smtp_host",
     "smtp_port",
@@ -127,6 +132,11 @@ def set_runtime_execution_settings(db: Session, values: dict[str, Any]) -> dict[
             current[key] = token
             os.environ["UPSTOX_ACCESS_TOKEN"] = token
             _set_env_file_key("UPSTOX_ACCESS_TOKEN", token)
+        elif key == "upstox_sandbox_access_token" and value:
+            token = str(value).strip()
+            current[key] = token
+            os.environ["UPSTOX_SANDBOX_ACCESS_TOKEN"] = token
+            _set_env_file_key("UPSTOX_SANDBOX_ACCESS_TOKEN", token)
         else:
             current[key] = value
     set_setting_value(db, RUNTIME_SETTINGS_KEY, current)
@@ -144,25 +154,36 @@ def apply_runtime_execution_settings(db: Session, settings: Settings) -> Setting
     token = runtime.get("upstox_access_token")
     if token:
         os.environ["UPSTOX_ACCESS_TOKEN"] = str(token).strip()
+    sandbox_token = runtime.get("upstox_sandbox_access_token")
+    if sandbox_token:
+        os.environ["UPSTOX_SANDBOX_ACCESS_TOKEN"] = str(sandbox_token).strip()
     return settings
 
 
 def get_runtime_trading_mode(db: Session, settings: Settings | None = None) -> str:
     cfg = settings or get_settings()
     runtime_mode = str(get_setting_value(db, "runtime_trading_mode", cfg.execution_mode) or cfg.execution_mode)
-    return runtime_mode.strip().lower()
+    normalized = runtime_mode.strip().lower()
+    if normalized == "paper":
+        set_setting_value(db, "runtime_trading_mode", "sandbox")
+        runtime = get_runtime_execution_settings(db)
+        runtime["execution_enabled"] = False
+        set_setting_value(db, RUNTIME_SETTINGS_KEY, runtime)
+        db.commit()
+        return "sandbox"
+    return normalized if normalized in {"sandbox", "live"} else "sandbox"
 
 
 def set_runtime_trading_mode(db: Session, mode: str) -> str:
-    normalized = str(mode or "paper").strip().lower()
-    if normalized not in {"paper", "live"}:
-        raise ValueError("Trading mode must be 'paper' or 'live'")
+    normalized = str(mode or "sandbox").strip().lower()
+    if normalized not in {"sandbox", "live"}:
+        raise ValueError("Trading mode must be 'sandbox' or 'live'")
     set_setting_value(db, "runtime_trading_mode", normalized)
     return normalized
 
 
-def get_paper_reset_at(db: Session) -> datetime | None:
-    raw = get_setting_value(db, "paper_reset_at")
+def get_sandbox_reset_at(db: Session) -> datetime | None:
+    raw = get_setting_value(db, "sandbox_reset_at")
     if not raw:
         return None
     try:
@@ -171,24 +192,24 @@ def get_paper_reset_at(db: Session) -> datetime | None:
         return None
 
 
-def get_paper_starting_balance(db: Session, settings: Settings | None = None) -> float:
+def get_sandbox_starting_balance(db: Session, settings: Settings | None = None) -> float:
     cfg = settings or get_settings()
-    raw = get_setting_value(db, "paper_starting_balance", cfg.execution_capital)
+    raw = get_setting_value(db, "sandbox_starting_balance", cfg.execution_capital)
     try:
         return float(raw)
     except (TypeError, ValueError):
         return float(cfg.execution_capital)
 
 
-def reset_paper_account(
+def reset_sandbox_account(
     db: Session,
     *,
     starting_balance: float,
     clear_open_positions: bool = False,
 ) -> dict[str, Any]:
     now = datetime.now(IST_ZONE)
-    set_setting_value(db, "paper_starting_balance", float(starting_balance))
-    set_setting_value(db, "paper_reset_at", now.isoformat())
+    set_setting_value(db, "sandbox_starting_balance", float(starting_balance))
+    set_setting_value(db, "sandbox_reset_at", now.isoformat())
     deleted_positions = 0
     if clear_open_positions:
         rows = (
@@ -198,13 +219,13 @@ def reset_paper_account(
         )
         for row in rows:
             metadata = row.metadata_json or {}
-            if str(metadata.get("execution_mode") or "paper").lower() != "paper":
+            if str(metadata.get("execution_mode") or "").lower() != "sandbox":
                 continue
             db.delete(row)
             deleted_positions += 1
     return {
-        "paper_starting_balance": float(starting_balance),
-        "paper_reset_at": now.isoformat(),
+        "sandbox_starting_balance": float(starting_balance),
+        "sandbox_reset_at": now.isoformat(),
         "deleted_open_positions": deleted_positions,
     }
 

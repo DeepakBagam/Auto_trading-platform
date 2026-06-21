@@ -49,6 +49,8 @@ class GraphSignalTrade:
     exit_ts: datetime
     exit_price: float
     exit_reason: str
+    gross_pnl_points: float
+    transaction_cost_points: float
     pnl_points: float
     holding_minutes: int
     mfe_points: float
@@ -149,6 +151,7 @@ def _simulate_one(
     action: str,
     atr: pd.Series,
     trade_id: int,
+    cost_bps_per_side: float,
 ) -> tuple[GraphSignalTrade | None, int]:
     if signal_idx + 1 >= len(candles):
         return None, signal_idx
@@ -209,7 +212,12 @@ def _simulate_one(
                 break
         exit_idx, exit_ts, exit_price, exit_reason = idx, ts, close, "EOD_CLOSE"
 
-    pnl = _move(action, entry_price, exit_price)
+    gross_pnl = _move(action, entry_price, exit_price)
+    transaction_cost = (
+        (entry_price * max(0.0, cost_bps_per_side) / 10_000.0)
+        + (exit_price * max(0.0, cost_bps_per_side) / 10_000.0)
+    )
+    pnl = gross_pnl - transaction_cost
     holding = max(0, int((exit_ts - entry_ts).total_seconds() // 60))
     return (
         GraphSignalTrade(
@@ -224,6 +232,8 @@ def _simulate_one(
             exit_ts=exit_ts,
             exit_price=round(exit_price, 2),
             exit_reason=exit_reason,
+            gross_pnl_points=round(gross_pnl, 2),
+            transaction_cost_points=round(transaction_cost, 2),
             pnl_points=round(pnl, 2),
             holding_minutes=holding,
             mfe_points=round(mfe, 2),
@@ -234,7 +244,13 @@ def _simulate_one(
     )
 
 
-def simulate(candles: pd.DataFrame, settings: Settings, entry_dates: set[date]) -> list[GraphSignalTrade]:
+def simulate(
+    candles: pd.DataFrame,
+    settings: Settings,
+    entry_dates: set[date],
+    *,
+    cost_bps_per_side: float = 2.0,
+) -> list[GraphSignalTrade]:
     markers = _marker_map(candles, settings)
     atr = _atr_series(candles)
     entry_start = _parse_hhmm(settings.entry_window_start, DEFAULT_ENTRY_START)
@@ -266,7 +282,14 @@ def simulate(candles: pd.DataFrame, settings: Settings, entry_dates: set[date]) 
             i += 1
             continue
 
-        trade, exit_idx = _simulate_one(candles, i, action, atr, len(trades) + 1)
+        trade, exit_idx = _simulate_one(
+            candles,
+            i,
+            action,
+            atr,
+            len(trades) + 1,
+            cost_bps_per_side,
+        )
         if trade is None:
             break
         trades.append(trade)
@@ -279,6 +302,8 @@ def simulate(candles: pd.DataFrame, settings: Settings, entry_dates: set[date]) 
 def _stats(trades: list[GraphSignalTrade]) -> dict[str, Any]:
     total = len(trades)
     pnl = [trade.pnl_points for trade in trades]
+    gross_pnl = [trade.gross_pnl_points for trade in trades]
+    costs = [trade.transaction_cost_points for trade in trades]
     wins = [value for value in pnl if value > 0]
     losses = [value for value in pnl if value <= 0]
     equity = 0.0
@@ -294,6 +319,8 @@ def _stats(trades: list[GraphSignalTrade]) -> dict[str, Any]:
         "losses": len(losses),
         "win_rate": round((len(wins) / total * 100.0) if total else 0.0, 2),
         "total_points": round(sum(pnl), 2),
+        "gross_points": round(sum(gross_pnl), 2),
+        "transaction_cost_points": round(sum(costs), 2),
         "avg_points": round((sum(pnl) / total) if total else 0.0, 2),
         "best_trade": round(max(pnl), 2) if pnl else 0.0,
         "worst_trade": round(min(pnl), 2) if pnl else 0.0,
@@ -323,13 +350,24 @@ def main() -> None:
     parser.add_argument("--symbol", default="Nifty 50")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--output-dir", default="logs/backtests")
+    parser.add_argument(
+        "--cost-bps-per-side",
+        type=float,
+        default=2.0,
+        help="Underlying-price execution-cost proxy per entry and exit side; not an option-fee model.",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
     candles = _load_candles(args.symbol, args.days)
     sessions = sorted({idx.date() for idx in candles.index})
     entry_dates = set(sessions[-max(1, int(args.days)):])
-    trades = simulate(candles, settings, entry_dates)
+    trades = simulate(
+        candles,
+        settings,
+        entry_dates,
+        cost_bps_per_side=args.cost_bps_per_side,
+    )
     stats = _stats(trades)
     csv_path, json_path = _save(trades, stats, args.symbol, args.days, args.output_dir)
 
@@ -337,7 +375,14 @@ def main() -> None:
     print(f"Symbol: {args.symbol}")
     print(f"Bars: {len(candles):,} ({candles.index[0].date()} -> {candles.index[-1].date()})")
     print(f"Entry sessions: {min(entry_dates)} -> {max(entry_dates)}")
-    print(f"Trades: {stats['trades']} | Win rate: {stats['win_rate']}% | Total points: {stats['total_points']}")
+    print(
+        f"Trades: {stats['trades']} | Win rate: {stats['win_rate']}% | "
+        f"Net points: {stats['total_points']}"
+    )
+    print(
+        f"Gross points: {stats['gross_points']} | Costs: {stats['transaction_cost_points']} "
+        f"({args.cost_bps_per_side:.1f} bps/side)"
+    )
     print(f"Avg: {stats['avg_points']} | Best: {stats['best_trade']} | Worst: {stats['worst_trade']}")
     print(f"Profit factor: {stats['profit_factor']} | Max DD points: {stats['max_drawdown_points']}")
     print(f"CSV: {csv_path}")

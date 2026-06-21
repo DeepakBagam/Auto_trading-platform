@@ -1,7 +1,7 @@
 // PositionTracker.js - Live Position Tracking with Real-time P&L
 // Professional execution monitoring with risk metrics
 
-const PositionTracker = ({ symbol, mode = "paper" }) => {
+const PositionTracker = ({ symbol, mode = "sandbox" }) => {
   const [positions, setPositions] = React.useState([]);
   const [summary, setSummary] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
@@ -37,7 +37,7 @@ const PositionTracker = ({ symbol, mode = "paper" }) => {
       const data = await snapshotResponse.json();
       const modePayload = modeResponse?.ok ? await modeResponse.json() : null;
       const portfolio = portfolioResponse?.ok ? await portfolioResponse.json() : null;
-      const activeMode = modePayload?.mode || portfolio?.mode || mode || data.execution?.mode || 'paper';
+      const activeMode = modePayload?.mode || portfolio?.mode || mode || data.execution?.mode || 'sandbox';
       const liveBrokerError = parseBrokerError(portfolio?.errors?.[0]?.body)
         || parseBrokerError(portfolio?.errors?.[0])
         || parseBrokerError(modePayload?.broker?.errors?.[0]?.body)
@@ -58,10 +58,10 @@ const PositionTracker = ({ symbol, mode = "paper" }) => {
         ?? funds.margin_used
         ?? 0
       );
-      const paperPositions = data.positions || [];
+      const sandboxPositions = data.positions || [];
       const livePositions = Array.isArray(portfolio?.positions) ? portfolio.positions : [];
 
-      setPositions(activeMode === 'live' ? livePositions : paperPositions);
+      setPositions(activeMode === 'live' ? livePositions : sandboxPositions);
       setSummary({
         mode: activeMode,
         portfolio_status: portfolio?.status || null,
@@ -74,9 +74,9 @@ const PositionTracker = ({ symbol, mode = "paper" }) => {
         total_trades: data.stats?.total_trades_today || 0,
         wins: data.stats?.wins_today || 0,
         win_rate: data.stats?.win_rate || 0,
-        available_balance: activeMode === 'live' ? (liveReady ? liveAvailable : null) : data.stats?.paper_available_balance || 0,
-        invested_amount: activeMode === 'live' ? (liveReady ? liveUsed : null) : data.stats?.paper_invested_amount || 0,
-        equity: activeMode === 'live' ? (liveReady ? liveAvailable + liveUsed : null) : data.stats?.paper_equity || 0,
+        available_balance: activeMode === 'live' ? (liveReady ? liveAvailable : null) : data.stats?.sandbox_available_balance || 0,
+        invested_amount: activeMode === 'live' ? (liveReady ? liveUsed : null) : data.stats?.sandbox_invested_amount || 0,
+        equity: activeMode === 'live' ? (liveReady ? liveAvailable + liveUsed : null) : data.stats?.sandbox_equity || 0,
       });
     } catch (error) {
       console.error('Failed to fetch positions:', error);
@@ -212,7 +212,7 @@ const PositionTracker = ({ symbol, mode = "paper" }) => {
           </div>
 
           <div className="summary-card">
-            <div className="summary-label">{summary.mode === 'live' ? 'Live Equity' : 'Paper Equity'}</div>
+            <div className="summary-label">{summary.mode === 'live' ? 'Live Equity' : 'Sandbox Equity'}</div>
             <div className={`summary-value ${getPnLClass((summary.equity || 0) - (summary.available_balance || 0) - (summary.invested_amount || 0))}`}>
               {formatCurrency(summary.equity)}
             </div>
@@ -236,8 +236,8 @@ const PositionTracker = ({ symbol, mode = "paper" }) => {
       <div className="positions-table-wrapper">
         <div className="positions-header">
           <h3>Open Positions</h3>
-          <span className={`live-indicator ${summary?.mode === 'live' ? '' : 'paper-mode'}`}>
-            ● {String(summary?.mode || 'paper').toUpperCase()}
+          <span className={`live-indicator ${summary?.mode === 'live' ? '' : 'sandbox-mode'}`}>
+            ● {String(summary?.mode || 'sandbox').toUpperCase()}
           </span>
         </div>
 

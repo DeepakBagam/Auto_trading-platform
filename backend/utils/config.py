@@ -1,3 +1,4 @@
+import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -6,7 +7,7 @@ from typing import List
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from backend.utils.symbols import normalize_symbol_key
+from backend.utils.symbols import canonical_symbol_name, is_option_execution_symbol, normalize_symbol_key
 
 
 class Settings(BaseSettings):
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
 
     upstox_base_url: str = "https://api.upstox.com"
     upstox_access_token: str = ""
+    upstox_sandbox_access_token: str = ""
     upstox_analytics_token: str = ""
     upstox_api_key: str = ""
     upstox_api_secret: str = ""
@@ -70,7 +72,7 @@ class Settings(BaseSettings):
     smtp_timeout_seconds: int = 20
 
     execution_enabled: bool = False
-    execution_mode: str = "paper"  # paper/live
+    execution_mode: str = "sandbox"  # sandbox/live
     execution_symbols: str = ""
     execution_interval: str = "1minute"
     execution_strategy_mode: str = "auto"
@@ -91,7 +93,6 @@ class Settings(BaseSettings):
     redis_chart_cache_ttl_seconds: int = 900
 
     execution_capital: float = 500000.0
-    paper_reset_requires_flat_positions: bool = Field(default=False, validation_alias="PAPER_RESET_REQUIRES_FLAT_POSITIONS")
     execution_per_trade_risk_pct: float = Field(
         default=0.02,
         validation_alias=AliasChoices("EXECUTION_PER_TRADE_RISK_PCT", "CAPITAL_PER_TRADE_PERCENT"),
@@ -120,6 +121,18 @@ class Settings(BaseSettings):
     ml_sell_threshold: float = Field(default=0.62, validation_alias="ML_SELL_THRESHOLD")
     ml_min_expected_move: float = Field(default=80.0, validation_alias="ML_MIN_EXPECTED_MOVE")
     pine_signal_max_age_seconds: int = Field(default=60, validation_alias="PINE_SIGNAL_MAX_AGE_SECONDS")
+    pine_signal_sensitivity: float = Field(default=1.0, validation_alias="PINE_SIGNAL_SENSITIVITY")
+    pine_signal_atr_length: int = Field(default=10, validation_alias="PINE_SIGNAL_ATR_LENGTH")
+    pine_signal_atr_multiplier: float = Field(default=7.0, validation_alias="PINE_SIGNAL_ATR_MULTIPLIER")
+    pine_signal_use_trend_filter: bool = Field(default=True, validation_alias="PINE_SIGNAL_USE_TREND_FILTER")
+    pine_signal_ma_length: int = Field(default=20, validation_alias="PINE_SIGNAL_MA_LENGTH")
+    pine_signal_use_volume_filter: bool = Field(default=False, validation_alias="PINE_SIGNAL_USE_VOLUME_FILTER")
+    pine_signal_volume_threshold: float = Field(default=1.1, validation_alias="PINE_SIGNAL_VOLUME_THRESHOLD")
+    pine_signal_show_signals: bool = Field(default=True, validation_alias="PINE_SIGNAL_SHOW_SIGNALS")
+    pine_signal_cooldown_bars: int = Field(default=2, validation_alias="PINE_SIGNAL_COOLDOWN_BARS")
+    pine_signal_atr_risk: int = Field(default=3, validation_alias="PINE_SIGNAL_ATR_RISK")
+    pine_signal_risk_atr_length: int = Field(default=14, validation_alias="PINE_SIGNAL_RISK_ATR_LENGTH")
+    pine_signal_percent_stop: float = Field(default=1.0, validation_alias="PINE_SIGNAL_PERCENT_STOP")
     ai_quality_minimum: float = Field(default=65.0, validation_alias="AI_QUALITY_MINIMUM")
     combined_score_threshold: float = Field(default=0.65, validation_alias="COMBINED_SCORE_THRESHOLD")
     tsl_activation_percent: float = Field(default=0.05, validation_alias="TSL_ACTIVATION_PERCENT")
@@ -128,6 +141,8 @@ class Settings(BaseSettings):
     target_profit_percent: float = Field(default=0.30, validation_alias="TARGET_PROFIT_PERCENT")
     order_retry_attempts: int = Field(default=2, validation_alias="ORDER_RETRY_ATTEMPTS")
     order_retry_backoff_ms: int = Field(default=300, validation_alias="ORDER_RETRY_BACKOFF_MS")
+    sandbox_limit_protection_pct: float = Field(default=0.01, validation_alias="SANDBOX_LIMIT_PROTECTION_PCT")
+    sandbox_price_tick: float = Field(default=0.05, validation_alias="SANDBOX_PRICE_TICK")
     ui_ws_reconnect_base_ms: int = Field(default=1000, validation_alias="UI_WS_RECONNECT_BASE_MS")
     ui_ws_reconnect_max_ms: int = Field(default=10000, validation_alias="UI_WS_RECONNECT_MAX_MS")
     data_ingestion_symbols: str = Field(
@@ -166,6 +181,8 @@ class Settings(BaseSettings):
     signal_vix_max: float = Field(default=20.0, validation_alias="SIGNAL_VIX_MAX")
     signal_atr_min_points: float = Field(default=4.0, validation_alias="SIGNAL_ATR_MIN_POINTS")
     signal_atr_max_points: float = Field(default=80.0, validation_alias="SIGNAL_ATR_MAX_POINTS")
+    signal_min_adx: float = Field(default=0.0, validation_alias="SIGNAL_MIN_ADX")
+    signal_symbol_profiles: str = Field(default="", validation_alias="SIGNAL_SYMBOL_PROFILES")
     option_min_volume: float = Field(default=500.0, validation_alias="OPTION_MIN_VOLUME")
     option_min_oi: float = Field(default=1000.0, validation_alias="OPTION_MIN_OI")
     option_max_spread_pct: float = Field(default=0.08, validation_alias="OPTION_MAX_SPREAD_PCT")
@@ -213,8 +230,10 @@ class Settings(BaseSettings):
     @property
     def execution_symbol_list(self) -> List[str]:
         if self.execution_symbols.strip():
-            return [x.strip() for x in self.execution_symbols.split(",") if x.strip()]
-        return [x.split("|", 1)[1] if "|" in x else x for x in self.instrument_keys]
+            symbols = [x.strip() for x in self.execution_symbols.split(",") if x.strip()]
+        else:
+            symbols = [x.split("|", 1)[1] if "|" in x else x for x in self.instrument_keys]
+        return [symbol for symbol in symbols if is_option_execution_symbol(symbol)]
 
     @property
     def smtp_recipients(self) -> List[str]:
@@ -243,6 +262,25 @@ class Settings(BaseSettings):
     def live_execution_blocked_symbol_list(self) -> List[str]:
         return [normalize_symbol_key(x) for x in self.live_execution_blocked_symbols.split(",") if x.strip()]
 
+    def signal_profile_for_symbol(self, symbol: str) -> dict:
+        raw = str(self.signal_symbol_profiles or "").strip()
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        target = normalize_symbol_key(canonical_symbol_name(symbol))
+        for key, value in payload.items():
+            if (
+                normalize_symbol_key(canonical_symbol_name(key)) == target
+                and isinstance(value, dict)
+            ):
+                return dict(value)
+        return {}
+
     @property
     def should_autostart_market_stream(self) -> bool:
         if self.market_stream_autostart is not None:
@@ -252,8 +290,12 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_live_execution_safety(self) -> "Settings":
         mode = self.execution_mode.strip().lower()
-        if mode not in {"paper", "live"}:
-            raise ValueError("EXECUTION_MODE must be 'paper' or 'live'")
+        if mode == "paper":
+            self.execution_mode = "sandbox"
+            self.execution_enabled = False
+            mode = "sandbox"
+        if mode not in {"sandbox", "live"}:
+            raise ValueError("EXECUTION_MODE must be 'sandbox' or 'live'")
         if mode != "live" or not self.execution_enabled:
             return self
 
@@ -304,4 +346,22 @@ def read_runtime_upstox_access_token(settings: Settings | None = None) -> str:
             pass
     if settings and settings.upstox_access_token.strip():
         return settings.upstox_access_token.strip()
+    return ""
+
+
+def read_runtime_upstox_sandbox_access_token(settings: Settings | None = None) -> str:
+    """Read the sandbox token without falling back to the live token."""
+    token = os.environ.get("UPSTOX_SANDBOX_ACCESS_TOKEN", "").strip()
+    if token:
+        return token
+    env_path = Path(".env")
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("UPSTOX_SANDBOX_ACCESS_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    if settings and settings.upstox_sandbox_access_token.strip():
+        return settings.upstox_sandbox_access_token.strip()
     return ""

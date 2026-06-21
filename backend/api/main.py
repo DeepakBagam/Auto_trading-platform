@@ -24,6 +24,7 @@ from backend.utils.app_state import apply_runtime_execution_settings
 from backend.utils.config import get_settings
 from backend.utils.constants import IST_ZONE
 from backend.utils.logger import get_logger, setup_logging
+from backend.utils.symbols import is_option_execution_symbol
 
 setup_logging()
 logger = get_logger(__name__)
@@ -43,7 +44,8 @@ _rate_limit_lock = threading.Lock()
 _RATE_LIMITED_EXECUTION_PATHS = {
     "/execution/run-once",
     "/execution/emergency-exit",
-    "/execution/paper/reset",
+    "/execution/sandbox/reset",
+    "/execution/sandbox/test-order",
     "/execution/update-sl-target",
 }
 
@@ -132,19 +134,28 @@ async def _refresh_option_chains_loop() -> None:
                 apply_runtime_execution_settings(db, settings)
                 collector = UpstoxOptionChainCollector(settings=settings)
                 for symbol in settings.execution_symbol_list:
-                    underlying_key = resolve_underlying_key(db, symbol, settings=settings)
-                    expiry_date, _ = _resolve_expiry(
-                        symbol=symbol,
-                        underlying_key=underlying_key,
-                        settings=settings,
-                    )
-                    collector.sync_option_chain(
-                        db,
-                        underlying_key=underlying_key,
-                        underlying_symbol=symbol,
-                        expiry_date=expiry_date,
-                    )
-                    db.commit()
+                    if not is_option_execution_symbol(symbol):
+                        continue
+                    try:
+                        underlying_key = resolve_underlying_key(db, symbol, settings=settings)
+                        expiry_date, _ = _resolve_expiry(
+                            symbol=symbol,
+                            underlying_key=underlying_key,
+                            settings=settings,
+                        )
+                        collector.sync_option_chain(
+                            db,
+                            underlying_key=underlying_key,
+                            underlying_symbol=symbol,
+                            expiry_date=expiry_date,
+                        )
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        logger.exception(
+                            "Option chain refresh failed for symbol=%s; continuing with remaining symbols.",
+                            symbol,
+                        )
             finally:
                 db.close()
         except Exception:

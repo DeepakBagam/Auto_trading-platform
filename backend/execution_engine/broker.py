@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from itertools import count
 from typing import Any
 
 import requests
+import upstox_client
+from upstox_client.rest import ApiException
 
 from backend.utils.constants import IST_ZONE
 from backend.utils.config import read_runtime_upstox_access_token
@@ -53,7 +54,13 @@ class BaseBroker:
         raise NotImplementedError
 
     def modify_order(
-        self, order_id: str, *, trigger_price: float | None = None, price: float | None = None
+        self,
+        order_id: str,
+        *,
+        trigger_price: float | None = None,
+        price: float | None = None,
+        quantity: int | None = None,
+        order_type: str | None = None,
     ) -> BrokerOrderResponse:
         raise NotImplementedError
 
@@ -68,120 +75,6 @@ class BaseBroker:
 
     def get_portfolio(self) -> dict[str, Any]:
         raise NotImplementedError
-
-
-class PaperBroker(BaseBroker):
-    broker_name = "paper"
-
-    def __init__(self) -> None:
-        self._counter = count(1)
-        self._orders: dict[str, dict[str, Any]] = {}
-
-    def place_order(self, request: BrokerOrderRequest) -> BrokerOrderResponse:
-        order_id = f"PAPER-{next(self._counter):08d}"
-        status = "TRIGGER_PENDING" if request.trigger_price is not None else "FILLED"
-        self._orders[order_id] = {
-            "request": request,
-            "status": status,
-            "created_at": datetime.now(IST_ZONE).isoformat(),
-        }
-        return BrokerOrderResponse(
-            success=True,
-            order_id=order_id,
-            status=status,
-            message="paper_order_accepted",
-            payload={"broker": self.broker_name},
-        )
-
-    def modify_order(
-        self, order_id: str, *, trigger_price: float | None = None, price: float | None = None
-    ) -> BrokerOrderResponse:
-        row = self._orders.get(order_id)
-        if row is None:
-            return BrokerOrderResponse(
-                success=False,
-                order_id=order_id,
-                status="REJECTED",
-                message="order_not_found",
-                payload={},
-            )
-        req: BrokerOrderRequest = row["request"]
-        row["request"] = BrokerOrderRequest(
-            instrument_key=req.instrument_key,
-            option_type=req.option_type,
-            strike=req.strike,
-            expiry_date=req.expiry_date,
-            side=req.side,
-            qty=req.qty,
-            order_type=req.order_type,
-            price=price if price is not None else req.price,
-            trigger_price=trigger_price if trigger_price is not None else req.trigger_price,
-            product=req.product,
-            tag=req.tag,
-        )
-        return BrokerOrderResponse(
-            success=True,
-            order_id=order_id,
-            status="MODIFIED",
-            message="paper_order_modified",
-            payload={},
-        )
-
-    def cancel_order(self, order_id: str) -> BrokerOrderResponse:
-        row = self._orders.get(order_id)
-        if row is None:
-            return BrokerOrderResponse(
-                success=False,
-                order_id=order_id,
-                status="REJECTED",
-                message="order_not_found",
-                payload={},
-            )
-        row["status"] = "CANCELLED"
-        return BrokerOrderResponse(
-            success=True,
-            order_id=order_id,
-            status="CANCELLED",
-            message="paper_order_cancelled",
-            payload={},
-        )
-
-    def cancel_all_pending(self) -> BrokerOrderResponse:
-        cancelled = 0
-        for order_id, row in self._orders.items():
-            if row.get("status") in {"OPEN", "TRIGGER_PENDING"}:
-                row["status"] = "CANCELLED"
-                cancelled += 1
-                logger.info("Paper broker cancelled pending order=%s", order_id)
-        return BrokerOrderResponse(
-            success=True,
-            order_id=None,
-            status="OK",
-            message=f"cancelled={cancelled}",
-            payload={"cancelled": cancelled},
-        )
-
-    def get_order_status(self, order_id: str) -> BrokerOrderResponse:
-        row = self._orders.get(order_id)
-        if row is None:
-            return BrokerOrderResponse(False, order_id, "NOT_FOUND", "order_not_found", {})
-        return BrokerOrderResponse(
-            True,
-            order_id,
-            str(row.get("status") or "UNKNOWN"),
-            "paper_order_status",
-            {"data": {"order_id": order_id, "status": row.get("status")}},
-        )
-
-    def get_portfolio(self) -> dict[str, Any]:
-        open_orders = [row for row in self._orders.values() if row.get("status") not in {"CANCELLED"}]
-        return {
-            "broker": self.broker_name,
-            "positions": [],
-            "holdings": [],
-            "orders": len(open_orders),
-            "status": "paper",
-        }
 
 
 class UpstoxBroker(BaseBroker):
@@ -384,7 +277,13 @@ class UpstoxBroker(BaseBroker):
         return self._request("POST", "/v2/order/place", payload)
 
     def modify_order(
-        self, order_id: str, *, trigger_price: float | None = None, price: float | None = None
+        self,
+        order_id: str,
+        *,
+        trigger_price: float | None = None,
+        price: float | None = None,
+        quantity: int | None = None,
+        order_type: str | None = None,
     ) -> BrokerOrderResponse:
         payload = {
             "order_id": order_id,
@@ -467,4 +366,174 @@ class UpstoxBroker(BaseBroker):
             "raw_funds": funds_payload,
             "errors": errors,
             "status": "ok" if funds or not errors else "warn",
+        }
+
+
+class UpstoxSandboxBroker(BaseBroker):
+    """Order-only adapter pinned to the Upstox sandbox host."""
+
+    broker_name = "upstox_sandbox"
+
+    def __init__(self, *, access_token: str) -> None:
+        configuration = upstox_client.Configuration(sandbox=True)
+        configuration.access_token = str(access_token or "").strip()
+        if configuration.order_host != "https://api-sandbox.upstox.com":
+            raise RuntimeError("Unsafe Upstox sandbox order host")
+        self.configuration = configuration
+        self.api_client = upstox_client.ApiClient(configuration)
+        self.order_api = upstox_client.OrderApiV3(self.api_client)
+
+    @staticmethod
+    def _payload(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if value is None:
+            return {}
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+            return payload if isinstance(payload, dict) else {"data": payload}
+        return {"data": str(value)}
+
+    @classmethod
+    def _success(
+        cls,
+        value: Any,
+        *,
+        fallback_order_id: str | None = None,
+        status: str = "ACCEPTED",
+        message: str = "sandbox_order_accepted",
+    ) -> BrokerOrderResponse:
+        payload = cls._payload(value)
+        data = payload.get("data") or {}
+        order_ids = data.get("order_ids") if isinstance(data, dict) else None
+        order_id = (
+            data.get("order_id") if isinstance(data, dict) else None
+        ) or (order_ids[0] if isinstance(order_ids, list) and order_ids else None)
+        return BrokerOrderResponse(
+            success=True,
+            order_id=str(order_id or fallback_order_id) if (order_id or fallback_order_id) else None,
+            status=status,
+            message=message,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _failure(exc: Exception, *, order_id: str | None = None) -> BrokerOrderResponse:
+        status_code = getattr(exc, "status", None)
+        body = getattr(exc, "body", None)
+        ambiguous = not isinstance(exc, ApiException) or status_code is None
+        return BrokerOrderResponse(
+            success=False,
+            order_id=order_id,
+            status="AMBIGUOUS" if ambiguous else str(status_code),
+            message=str(body or exc),
+            payload={"sandbox": True, "status_code": status_code, "body": body},
+        )
+
+    @staticmethod
+    def _product(product: str) -> str:
+        return "I" if str(product or "").upper() in {"MIS", "I"} else str(product or "D").upper()
+
+    def place_order(self, request: BrokerOrderRequest) -> BrokerOrderResponse:
+        if "|" not in request.instrument_key:
+            return BrokerOrderResponse(
+                False,
+                None,
+                "INVALID_INSTRUMENT",
+                f"instrument_key {request.instrument_key!r} is not a valid Upstox key",
+                {},
+            )
+        body = upstox_client.PlaceOrderV3Request(
+            quantity=int(request.qty),
+            product=self._product(request.product),
+            validity="DAY",
+            price=float(request.price or 0.0),
+            tag=request.tag or "ai_sandbox_exec",
+            slice=False,
+            instrument_token=request.instrument_key,
+            order_type=str(request.order_type or "LIMIT").upper(),
+            transaction_type=str(request.side).upper(),
+            disclosed_quantity=0,
+            trigger_price=float(request.trigger_price or 0.0),
+            is_amo=False,
+        )
+        try:
+            return self._success(self.order_api.place_order(body))
+        except Exception as exc:
+            return self._failure(exc)
+
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        trigger_price: float | None = None,
+        price: float | None = None,
+        quantity: int | None = None,
+        order_type: str | None = None,
+    ) -> BrokerOrderResponse:
+        if int(quantity or 0) <= 0:
+            return BrokerOrderResponse(
+                False,
+                order_id,
+                "INVALID_QUANTITY",
+                "Sandbox modify requires quantity",
+                {},
+            )
+        body = upstox_client.ModifyOrderRequest(
+            quantity=int(quantity),
+            validity="DAY",
+            price=float(price or 0.0),
+            order_id=order_id,
+            order_type=str(order_type or "SL").upper(),
+            disclosed_quantity=0,
+            trigger_price=float(trigger_price or 0.0),
+        )
+        try:
+            return self._success(
+                self.order_api.modify_order(body),
+                fallback_order_id=order_id,
+                status="MODIFIED",
+                message="sandbox_order_modified",
+            )
+        except Exception as exc:
+            return self._failure(exc, order_id=order_id)
+
+    def cancel_order(self, order_id: str) -> BrokerOrderResponse:
+        try:
+            return self._success(
+                self.order_api.cancel_order(order_id),
+                fallback_order_id=order_id,
+                status="CANCELLED",
+                message="sandbox_order_cancelled",
+            )
+        except Exception as exc:
+            return self._failure(exc, order_id=order_id)
+
+    def cancel_all_pending(self) -> BrokerOrderResponse:
+        return BrokerOrderResponse(
+            False,
+            None,
+            "UNSUPPORTED",
+            "sandbox_bulk_cancel_not_supported",
+            {"sandbox": True},
+        )
+
+    def get_order_status(self, order_id: str) -> BrokerOrderResponse:
+        return BrokerOrderResponse(
+            False,
+            order_id,
+            "UNSUPPORTED",
+            "sandbox_order_status_not_available",
+            {"sandbox": True},
+        )
+
+    def get_portfolio(self) -> dict[str, Any]:
+        return {
+            "broker": self.broker_name,
+            "positions": [],
+            "funds": {},
+            "errors": [],
+            "status": "sandbox",
+            "host": self.configuration.order_host,
         }

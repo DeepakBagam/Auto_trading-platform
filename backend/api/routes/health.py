@@ -4,15 +4,18 @@ from datetime import datetime
 
 import requests as _requests
 from fastapi import APIRouter, Depends
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from backend.api.market_stream_runtime import get_market_stream_runtime_status
 from backend.api.schemas import HealthResponse
 from backend.db.connection import get_db_session
 from backend.db.models import RawCandle
+from backend.utils.app_state import apply_runtime_execution_settings
+from backend.utils.calendar_utils import is_trading_day, market_session_bounds, previous_trading_day
 from backend.utils.config import get_settings, read_runtime_upstox_access_token
 from backend.utils.constants import IST_ZONE
+from backend.utils.symbols import instrument_key_filter
 
 router = APIRouter(prefix="/health", tags=["health"])
 
@@ -62,7 +65,8 @@ def health_detailed(db: Session = Depends(get_db_session)) -> dict:
         checks["market_stream"] = {"status": "error", "detail": str(exc)}
 
     # 4. Broker API reachability — ping Upstox profile endpoint
-    settings = get_settings()
+    settings = get_settings().model_copy()
+    apply_runtime_execution_settings(db, settings)
     token = read_runtime_upstox_access_token(settings)
     if not token:
         checks["broker"] = {"status": "error", "detail": "UPSTOX_ACCESS_TOKEN not set"}
@@ -99,6 +103,49 @@ def health_detailed(db: Session = Depends(get_db_session)) -> dict:
         "enabled": settings.execution_enabled,
         "mode": settings.execution_mode,
         "symbols": settings.execution_symbol_list,
+    }
+
+    session_start, session_end = market_session_bounds(now.date())
+    expected_date = (
+        now.date()
+        if is_trading_day(now.date()) and now >= session_start
+        else previous_trading_day(now.date())
+    )
+    symbol_freshness: dict[str, dict] = {}
+    for symbol in settings.execution_symbol_list:
+        latest_ts = db.scalar(
+            select(func.max(RawCandle.ts)).where(
+                RawCandle.interval == "1minute",
+                instrument_key_filter(RawCandle.instrument_key, symbol),
+            )
+        )
+        if latest_ts is None:
+            symbol_freshness[symbol] = {
+                "status": "error",
+                "latest_candle_ts": None,
+                "execution_blocked": True,
+                "reason": "no_1minute_candles",
+            }
+            continue
+        latest_ist = latest_ts.replace(tzinfo=IST_ZONE) if latest_ts.tzinfo is None else latest_ts
+        age_seconds = max(0.0, (now - latest_ist).total_seconds())
+        open_session_stale = bool(
+            is_trading_day(now.date())
+            and session_start <= now <= session_end
+            and latest_ist.date() == now.date()
+            and age_seconds > 180
+        )
+        blocked = latest_ist.date() < expected_date or open_session_stale
+        symbol_freshness[symbol] = {
+            "status": "error" if blocked else "ok",
+            "latest_candle_ts": latest_ist.isoformat(),
+            "age_seconds": round(age_seconds, 1),
+            "expected_session_date": expected_date.isoformat(),
+            "execution_blocked": blocked,
+        }
+    checks["execution_data"] = {
+        "status": "error" if any(row["execution_blocked"] for row in symbol_freshness.values()) else "ok",
+        "symbols": symbol_freshness,
     }
 
     overall = "ok" if all(c["status"] == "ok" for c in checks.values()) else (

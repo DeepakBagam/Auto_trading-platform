@@ -92,6 +92,39 @@ class CapturingLiveBroker:
         )
 
 
+class CapturingSandboxBroker(CapturingLiveBroker):
+    broker_name = "upstox_sandbox"
+
+    def get_portfolio(self) -> dict:
+        return {"broker": self.broker_name, "funds": {}, "positions": [], "errors": [], "status": "sandbox"}
+
+    def place_order(self, request: BrokerOrderRequest) -> BrokerOrderResponse:
+        self.placed.append(request)
+        if self.place_responses:
+            return self.place_responses.pop(0)
+        return BrokerOrderResponse(
+            True,
+            f"SANDBOX-{len(self.placed)}",
+            "ACCEPTED",
+            "ok",
+            {"broker": self.broker_name},
+        )
+
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        trigger_price: float | None = None,
+        price: float | None = None,
+        quantity: int | None = None,
+        order_type: str | None = None,
+    ) -> BrokerOrderResponse:
+        self.modified.append((order_id, trigger_price, price))
+        self.modified_quantity = quantity
+        self.modified_order_type = order_type
+        return BrokerOrderResponse(True, order_id, "MODIFIED", "ok", {"broker": self.broker_name})
+
+
 class _FakeHttpResponse:
     def __init__(self, payload: dict) -> None:
         self.ok = True
@@ -134,6 +167,16 @@ def _live_settings() -> Settings:
         execution_symbols="Nifty 50",
         upstox_access_token="token",
         execution_accept_external_webhook=False,
+    )
+
+
+def _sandbox_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        execution_enabled=True,
+        execution_mode="sandbox",
+        execution_symbols="Nifty 50",
+        upstox_sandbox_access_token="sandbox-token",
     )
 
 
@@ -202,6 +245,120 @@ def test_upstox_modify_uses_put_and_cancel_uses_delete(monkeypatch) -> None:
     assert session.calls[1][2]["params"] == {"order_id": "OID-1"}
 
 
+def test_sandbox_protected_prices_round_to_configured_tick() -> None:
+    service = IntradayOptionsExecutionEngine(
+        settings=_sandbox_settings(),
+        broker=CapturingSandboxBroker(),
+    )
+
+    assert service._sandbox_protected_price(100.0, "BUY") == 101.0
+    assert service._sandbox_protected_price(100.0, "SELL") == 99.0
+    rounded = service._sandbox_protected_price(123.47, "BUY")
+    assert round(rounded / 0.05) * 0.05 == rounded
+
+
+def test_india_vix_is_never_evaluated_as_an_option_underlying() -> None:
+    session = _memory_session()
+    service = IntradayOptionsExecutionEngine(
+        settings=_sandbox_settings(),
+        broker=CapturingSandboxBroker(),
+    )
+    try:
+        assert service._evaluate_symbol(
+            session,
+            datetime(2026, 6, 22, 10, 0, tzinfo=IST_ZONE),
+            "India VIX",
+        ) == "skip:unsupported_option_underlying"
+    finally:
+        session.close()
+
+
+def test_sandbox_broker_rebuilds_when_runtime_token_changes(monkeypatch) -> None:
+    session = _memory_session()
+    monkeypatch.setenv("UPSTOX_SANDBOX_ACCESS_TOKEN", "old-sandbox-token")
+    original = CapturingSandboxBroker()
+    replacement = CapturingSandboxBroker()
+    service = IntradayOptionsExecutionEngine(settings=_sandbox_settings(), broker=original)
+    monkeypatch.setattr(service, "_build_broker", lambda: replacement)
+    try:
+        monkeypatch.setenv("UPSTOX_SANDBOX_ACCESS_TOKEN", "new-sandbox-token")
+
+        assert service._sync_runtime_mode(session) == "sandbox"
+        assert service.broker is replacement
+    finally:
+        session.close()
+
+
+def test_sandbox_protective_stop_place_modify_and_cancel() -> None:
+    session = _memory_session()
+    broker = CapturingSandboxBroker()
+    service = IntradayOptionsExecutionEngine(settings=_sandbox_settings(), broker=broker)
+    position = _open_position()
+    position.metadata_json = {**position.metadata_json, "execution_mode": "sandbox"}
+    try:
+        session.add(position)
+        session.flush()
+
+        order = service._place_live_protective_stop(session, position=position)
+        assert order is not None
+        assert broker.placed[0].order_type == "SL"
+        assert broker.placed[0].trigger_price == 150.0
+        assert broker.placed[0].price == 148.5
+
+        service._modify_live_protective_stop(session, position=position, trigger_price=180.0)
+        assert broker.modified[-1] == ("SANDBOX-1", 180.0, 178.15)
+        assert broker.modified_quantity == 75
+        assert broker.modified_order_type == "SL"
+
+        cancelled = service._cancel_live_protective_stop(
+            session,
+            position=position,
+            reason="TP_HIT",
+            now=datetime(2026, 6, 9, 11, 0, tzinfo=IST_ZONE),
+            exit_premium=250.0,
+        )
+        assert cancelled is True
+        assert broker.cancelled == ["SANDBOX-1"]
+        assert position.metadata_json["broker_sl_active"] is False
+    finally:
+        session.close()
+
+
+def test_sandbox_exit_cancels_stop_and_submits_protected_limit() -> None:
+    session = _memory_session()
+    broker = CapturingSandboxBroker()
+    service = IntradayOptionsExecutionEngine(settings=_sandbox_settings(), broker=broker)
+    position = _open_position()
+    position.metadata_json = {
+        **position.metadata_json,
+        "execution_mode": "sandbox",
+        "broker_sl_order_id": "SANDBOX-SL",
+        "broker_sl_active": True,
+        "broker_sl_trigger_price": 150.0,
+    }
+    try:
+        session.add(position)
+        session.commit()
+
+        order = service._close_position(
+            session,
+            position=position,
+            now=datetime(2026, 6, 9, 11, 0, tzinfo=IST_ZONE),
+            reason="TP_HIT",
+            exit_premium=250.0,
+        )
+
+        assert order is not None
+        assert broker.cancelled == ["SANDBOX-SL"]
+        assert broker.placed[-1].side == "SELL"
+        assert broker.placed[-1].order_type == "LIMIT"
+        assert broker.placed[-1].price == 247.5
+        assert position.status == "CLOSED"
+        assert position.exit_premium == 250.0
+    finally:
+        session.close()
+
+
 def test_live_run_once_blocks_when_broker_is_not_ready() -> None:
     session = _memory_session()
     settings = _live_settings()
@@ -249,7 +406,7 @@ def test_signal_candle_claim_blocks_duplicate_workers() -> None:
 
 def test_daily_entry_positions_count_open_and_closed_for_active_mode() -> None:
     session = _memory_session()
-    service = IntradayOptionsExecutionEngine(settings=Settings(execution_mode="paper"))
+    service = IntradayOptionsExecutionEngine(settings=Settings(execution_mode="sandbox"))
     trade_date = date(2026, 6, 18)
     try:
         session.add_all(
@@ -258,13 +415,13 @@ def test_daily_entry_positions_count_open_and_closed_for_active_mode() -> None:
                     trade_date=trade_date,
                     opened_at=datetime(2026, 6, 18, 9, 30, tzinfo=IST_ZONE),
                     status="OPEN",
-                    mode="paper",
+                    mode="sandbox",
                 ),
                 _dated_position(
                     trade_date=trade_date,
                     opened_at=datetime(2026, 6, 18, 10, 0, tzinfo=IST_ZONE),
                     status="CLOSED",
-                    mode="paper",
+                    mode="sandbox",
                 ),
                 _dated_position(
                     trade_date=trade_date,
@@ -301,21 +458,21 @@ def test_position_and_pnl_queries_are_isolated_by_execution_mode() -> None:
         mode="live",
     )
     live_closed.realized_pnl = -500.0
-    paper_open = _dated_position(
+    sandbox_open = _dated_position(
         trade_date=trade_date,
         opened_at=datetime(2026, 6, 18, 10, 30, tzinfo=IST_ZONE),
         status="OPEN",
-        mode="paper",
+        mode="sandbox",
     )
-    paper_closed = _dated_position(
+    sandbox_closed = _dated_position(
         trade_date=trade_date,
         opened_at=datetime(2026, 6, 18, 11, 0, tzinfo=IST_ZONE),
         status="CLOSED",
-        mode="paper",
+        mode="sandbox",
     )
-    paper_closed.realized_pnl = -9000.0
+    sandbox_closed.realized_pnl = -9000.0
     try:
-        session.add_all([live_open, live_closed, paper_open, paper_closed])
+        session.add_all([live_open, live_closed, sandbox_open, sandbox_closed])
         session.commit()
 
         assert service._open_positions(session) == [live_open]
@@ -329,30 +486,30 @@ def test_position_and_pnl_queries_are_isolated_by_execution_mode() -> None:
         session.close()
 
 
-def test_live_reconciliation_ignores_paper_pending_positions() -> None:
+def test_live_reconciliation_ignores_sandbox_pending_positions() -> None:
     session = _memory_session()
     broker = CapturingLiveBroker()
     service = IntradayOptionsExecutionEngine(settings=_live_settings(), broker=broker)
     now = datetime(2026, 6, 18, 15, 0, tzinfo=IST_ZONE)
-    paper_entry = _dated_position(
+    sandbox_entry = _dated_position(
         trade_date=now.date(),
         opened_at=now,
         status="ENTRY_PENDING",
-        mode="paper",
+        mode="sandbox",
     )
-    paper_entry.entry_order_id = "PAPER-ENTRY"
-    paper_exit = _dated_position(
+    sandbox_entry.entry_order_id = "SANDBOX-ENTRY"
+    sandbox_exit = _dated_position(
         trade_date=now.date(),
         opened_at=now,
         status="EXIT_PENDING",
-        mode="paper",
+        mode="sandbox",
     )
-    paper_exit.metadata_json = {
-        **paper_exit.metadata_json,
-        "exit_order_id": "PAPER-EXIT",
+    sandbox_exit.metadata_json = {
+        **sandbox_exit.metadata_json,
+        "exit_order_id": "SANDBOX-EXIT",
     }
     try:
-        session.add_all([paper_entry, paper_exit])
+        session.add_all([sandbox_entry, sandbox_exit])
         session.commit()
 
         entry_result = service._reconcile_pending_entries(session, now)
@@ -368,7 +525,7 @@ def test_live_reconciliation_ignores_paper_pending_positions() -> None:
 def test_signal_cap_and_cooldown_ignore_rejected_signal_attempts() -> None:
     session = _memory_session()
     service = IntradayOptionsExecutionEngine(
-        settings=Settings(execution_mode="paper", signal_cooldown_minutes=12)
+        settings=Settings(execution_mode="sandbox", signal_cooldown_minutes=12)
     )
     now = datetime(2026, 6, 18, 10, 20, tzinfo=IST_ZONE)
     try:
@@ -398,7 +555,7 @@ def test_signal_cap_and_cooldown_ignore_rejected_signal_attempts() -> None:
 def test_signal_cap_and_cooldown_use_successful_position_entries() -> None:
     session = _memory_session()
     service = IntradayOptionsExecutionEngine(
-        settings=Settings(execution_mode="paper", signal_cooldown_minutes=12)
+        settings=Settings(execution_mode="sandbox", signal_cooldown_minutes=12)
     )
     now = datetime(2026, 6, 18, 10, 10, tzinfo=IST_ZONE)
     try:
@@ -407,7 +564,7 @@ def test_signal_cap_and_cooldown_use_successful_position_entries() -> None:
                 trade_date=now.date(),
                 opened_at=datetime(2026, 6, 18, 10, 5, tzinfo=IST_ZONE),
                 status="CLOSED",
-                mode="paper",
+                mode="sandbox",
             )
         )
         session.commit()
@@ -574,17 +731,17 @@ def test_cancelled_partial_entry_opens_only_filled_quantity_with_protection() ->
         session.close()
 
 
-def test_force_squareoff_defers_paper_exit_without_real_quote(monkeypatch) -> None:
+def test_force_squareoff_defers_sandbox_exit_without_real_quote(monkeypatch) -> None:
     session = _memory_session()
     service = IntradayOptionsExecutionEngine(
-        settings=Settings(execution_mode="paper"),
+        settings=Settings(execution_mode="sandbox"),
     )
     now = datetime(2026, 6, 18, 15, 15, tzinfo=IST_ZONE)
     position = _dated_position(
         trade_date=now.date(),
         opened_at=datetime(2026, 6, 18, 10, 0, tzinfo=IST_ZONE),
         status="OPEN",
-        mode="paper",
+        mode="sandbox",
     )
     try:
         session.add(position)

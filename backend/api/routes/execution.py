@@ -15,20 +15,34 @@ from backend.api.market_stream_runtime import ensure_market_stream_started, get_
 from backend.api.schemas import ExecutionReportResponse, ExecutionRunResponse
 from backend.db.models import AuditLog, ExecutionOrder, ExecutionPosition
 from backend.execution_engine.engine import IntradayOptionsExecutionEngine
-from backend.execution_engine.live_service import _serialize_position, compute_paper_portfolio_metrics, list_symbols
+from backend.execution_engine.broker import BrokerOrderRequest
+from backend.execution_engine.live_service import (
+    _position_matches_mode,
+    _serialize_position,
+    compute_sandbox_portfolio_metrics,
+    list_symbols,
+    resolve_underlying_key,
+)
+from backend.data_layer.instrument_metadata import resolve_option_contract_metadata
 from backend.utils.app_state import (
     apply_runtime_execution_settings,
     create_audit_log,
     get_runtime_execution_settings,
     get_runtime_trading_mode,
     mask_secret,
-    reset_paper_account,
+    reset_sandbox_account,
     set_runtime_execution_settings,
     set_runtime_trading_mode,
 )
-from backend.utils.config import Settings, get_settings, read_runtime_upstox_access_token
+from backend.utils.config import (
+    Settings,
+    get_settings,
+    read_runtime_upstox_access_token,
+    read_runtime_upstox_sandbox_access_token,
+)
 from backend.utils.constants import IST_ZONE
 from backend.utils.notifications import send_email_message_result, smtp_ready
+from backend.utils.symbols import is_option_execution_symbol
 
 router = APIRouter(prefix="/execution", tags=["execution"])
 
@@ -43,9 +57,23 @@ class TradingModeRequest(BaseModel):
     mode: str
 
 
-class PaperResetRequest(BaseModel):
+class SandboxResetRequest(BaseModel):
     starting_balance: float | None = None
-    clear_open_positions: bool = True
+
+
+class SandboxTestOrderRequest(BaseModel):
+    symbol: str
+    instrument_key: str
+    option_type: str
+    strike: float
+    expiry_date: str
+    quantity: int | None = None
+    reference_price: float
+
+
+class SandboxReviewRequest(BaseModel):
+    action: str
+    sandbox_order_id: str | None = None
 
 
 class RuntimeSettingsRequest(BaseModel):
@@ -79,10 +107,15 @@ class RuntimeSettingsRequest(BaseModel):
     signal_vix_max: float | None = None
     signal_atr_min_points: float | None = None
     signal_atr_max_points: float | None = None
+    signal_min_adx: float | None = None
+    signal_symbol_profiles: str | None = None
     option_min_volume: float | None = None
     option_min_oi: float | None = None
     option_max_spread_pct: float | None = None
     upstox_access_token: str | None = None
+    upstox_sandbox_access_token: str | None = None
+    sandbox_limit_protection_pct: float | None = None
+    sandbox_price_tick: float | None = None
     smtp_enabled: bool | None = None
     smtp_host: str | None = None
     smtp_port: int | None = None
@@ -102,10 +135,21 @@ def get_execution_engine() -> IntradayOptionsExecutionEngine:
 def get_runtime_engine(db: Session) -> IntradayOptionsExecutionEngine:
     engine = get_execution_engine()
     apply_runtime_execution_settings(db, engine.settings)
+    mode = get_runtime_trading_mode(db, settings=engine.settings)
+    expected_broker = "upstox" if mode == "live" else "upstox_sandbox"
+    if engine.settings.execution_mode != mode or engine.broker.broker_name != expected_broker:
+        engine.settings.execution_mode = mode
+        engine.broker = engine._build_broker()
     return engine
 
 
-def _serializable_settings(settings: Settings, *, runtime: dict | None = None, token: str = "") -> dict:
+def _serializable_settings(
+    settings: Settings,
+    *,
+    runtime: dict | None = None,
+    token: str = "",
+    sandbox_token: str = "",
+) -> dict:
     runtime = runtime or {}
     return {
         "execution_enabled": bool(settings.execution_enabled),
@@ -138,11 +182,17 @@ def _serializable_settings(settings: Settings, *, runtime: dict | None = None, t
         "signal_vix_max": float(settings.signal_vix_max),
         "signal_atr_min_points": float(settings.signal_atr_min_points),
         "signal_atr_max_points": float(settings.signal_atr_max_points),
+        "signal_min_adx": float(settings.signal_min_adx),
+        "signal_symbol_profiles": str(settings.signal_symbol_profiles),
         "option_min_volume": float(settings.option_min_volume),
         "option_min_oi": float(settings.option_min_oi),
         "option_max_spread_pct": float(settings.option_max_spread_pct),
         "upstox_token_present": bool(token),
         "upstox_token_masked": mask_secret(token),
+        "upstox_sandbox_token_present": bool(sandbox_token),
+        "upstox_sandbox_token_masked": mask_secret(sandbox_token),
+        "sandbox_limit_protection_pct": float(settings.sandbox_limit_protection_pct),
+        "sandbox_price_tick": float(settings.sandbox_price_tick),
         "smtp_enabled": bool(settings.smtp_enabled),
         "smtp_host": str(settings.smtp_host),
         "smtp_port": int(settings.smtp_port),
@@ -161,25 +211,46 @@ def _settings_payload(db: Session) -> dict:
     apply_runtime_execution_settings(db, settings)
     runtime = get_runtime_execution_settings(db)
     token = read_runtime_upstox_access_token(settings)
+    sandbox_token = read_runtime_upstox_sandbox_access_token(settings)
     defaults = Settings(_env_file=None)
     return {
-        "settings": _serializable_settings(settings, runtime=runtime, token=token),
+        "settings": _serializable_settings(
+            settings,
+            runtime=runtime,
+            token=token,
+            sandbox_token=sandbox_token,
+        ),
         "defaults": _serializable_settings(defaults),
-        "available_symbols": list_symbols(db, settings=settings),
+        "available_symbols": [
+            symbol
+            for symbol in list_symbols(db, settings=settings)
+            if is_option_execution_symbol(symbol)
+        ],
         "runtime_keys": sorted(runtime.keys()),
     }
 
 
 def broker_health(engine: IntradayOptionsExecutionEngine) -> dict:
     settings = engine.settings
-    token_present = bool(read_runtime_upstox_access_token(settings))
+    mode = str(settings.execution_mode).lower()
+    token_present = bool(
+        read_runtime_upstox_access_token(settings)
+        if mode == "live"
+        else read_runtime_upstox_sandbox_access_token(settings)
+    )
     out = {
-        "broker": "upstox" if str(settings.execution_mode).lower() == "live" else "paper",
+        "broker": "upstox" if mode == "live" else "upstox_sandbox",
         "token_present": token_present,
         "status": "ok",
         "errors": [],
     }
-    if str(settings.execution_mode).lower() != "live":
+    if mode == "sandbox":
+        if not token_present:
+            out["status"] = "error"
+            out["errors"] = [{"source": "token", "message": "UPSTOX_SANDBOX_ACCESS_TOKEN is missing"}]
+        else:
+            out["status"] = "sandbox"
+            out["host"] = "https://api-sandbox.upstox.com"
         return out
     if not token_present:
         out["status"] = "error"
@@ -249,6 +320,11 @@ def update_runtime_settings(request: RuntimeSettingsRequest, db: Session = Depen
         cleaned = []
         for symbol in symbols:
             text = str(symbol or "").strip()
+            if text and not is_option_execution_symbol(text):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{text} has no supported Upstox option contracts and cannot be enabled for execution",
+                )
             if text and text not in cleaned:
                 cleaned.append(text)
         values["execution_symbols"] = ",".join(cleaned)
@@ -272,9 +348,22 @@ def update_runtime_settings(request: RuntimeSettingsRequest, db: Session = Depen
     for key in ("execution_per_trade_risk_pct", "execution_max_daily_loss_pct", "execution_stop_loss_pct", "tsl_activation_percent", "tsl_trail_percent", "target_profit_percent"):
         if values.get(key) is not None and float(values[key]) < 0:
             raise HTTPException(status_code=400, detail=f"{key} cannot be negative")
-    for key in ("signal_min_score", "signal_min_volume_ratio", "signal_vix_min", "signal_vix_max", "signal_atr_min_points", "signal_atr_max_points", "option_min_volume", "option_min_oi", "option_max_spread_pct"):
+    for key in ("signal_min_score", "signal_min_volume_ratio", "signal_vix_min", "signal_vix_max", "signal_atr_min_points", "signal_atr_max_points", "signal_min_adx", "option_min_volume", "option_min_oi", "option_max_spread_pct"):
         if values.get(key) is not None and float(values[key]) < 0:
             raise HTTPException(status_code=400, detail=f"{key} cannot be negative")
+    if values.get("signal_symbol_profiles"):
+        try:
+            profiles = __import__("json").loads(str(values["signal_symbol_profiles"]))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="signal_symbol_profiles must be valid JSON") from exc
+        if not isinstance(profiles, dict):
+            raise HTTPException(status_code=400, detail="signal_symbol_profiles must be a JSON object")
+    if values.get("sandbox_limit_protection_pct") is not None and not (
+        0 <= float(values["sandbox_limit_protection_pct"]) <= 0.20
+    ):
+        raise HTTPException(status_code=400, detail="sandbox_limit_protection_pct must be between 0 and 0.20")
+    if values.get("sandbox_price_tick") is not None and float(values["sandbox_price_tick"]) <= 0:
+        raise HTTPException(status_code=400, detail="sandbox_price_tick must be positive")
     if values.get("signal_max_per_day") is not None and int(values["signal_max_per_day"]) < 1:
         raise HTTPException(status_code=400, detail="Successful trades per symbol must be at least 1")
     if (
@@ -300,7 +389,13 @@ def update_runtime_settings(request: RuntimeSettingsRequest, db: Session = Depen
         resource="settings",
         status="INFO",
         message="Runtime execution settings updated",
-        details={"updated_keys": sorted(key for key in values.keys() if key not in {"upstox_access_token", "smtp_password"})},
+        details={
+            "updated_keys": sorted(
+                key
+                for key in values.keys()
+                if key not in {"upstox_access_token", "upstox_sandbox_access_token", "smtp_password"}
+            )
+        },
     )
     db.commit()
     return {**_settings_payload(db), "mode": get_runtime_trading_mode(db, settings=engine.settings), "broker": broker_health(engine)}
@@ -348,6 +443,183 @@ def test_upstox_token_settings(db: Session = Depends(get_db)) -> dict:
         "broker": broker_health(engine),
         "token_test": token_test,
     }
+
+
+@router.post("/settings/test-sandbox-token")
+def test_sandbox_token_settings(db: Session = Depends(get_db)) -> dict:
+    engine = get_runtime_engine(db)
+    token = read_runtime_upstox_sandbox_access_token(engine.settings)
+    if not token:
+        raise HTTPException(status_code=400, detail="UPSTOX_SANDBOX_ACCESS_TOKEN is missing")
+    sandbox = engine._build_broker() if str(engine.settings.execution_mode).lower() == "sandbox" else None
+    if sandbox is None or sandbox.broker_name != "upstox_sandbox":
+        from backend.execution_engine.broker import UpstoxSandboxBroker
+
+        sandbox = UpstoxSandboxBroker(access_token=token)
+    return {
+        **_settings_payload(db),
+        "mode": get_runtime_trading_mode(db, settings=engine.settings),
+        "sandbox_test": {
+            "status": "ok",
+            "broker": sandbox.broker_name,
+            "host": sandbox.configuration.order_host,
+            "token_present": True,
+        },
+    }
+
+
+@router.post("/sandbox/test-order")
+def test_sandbox_order(request: SandboxTestOrderRequest, db: Session = Depends(get_db)) -> dict:
+    engine = get_runtime_engine(db)
+    if get_runtime_trading_mode(db, settings=engine.settings) != "sandbox":
+        raise HTTPException(status_code=400, detail="Sandbox test order requires Sandbox mode")
+    if not read_runtime_upstox_sandbox_access_token(engine.settings):
+        raise HTTPException(status_code=400, detail="UPSTOX_SANDBOX_ACCESS_TOKEN is missing")
+    underlying_key = resolve_underlying_key(db, request.symbol, settings=engine.settings)
+    metadata = (
+        resolve_option_contract_metadata(
+            settings=engine.settings,
+            underlying_key=str(underlying_key or ""),
+            expiry_date=date.fromisoformat(request.expiry_date),
+            instrument_key=request.instrument_key,
+        )
+        if underlying_key
+        else None
+    )
+    if metadata is None:
+        raise HTTPException(status_code=400, detail="Current Upstox contract metadata is unavailable")
+    quantity = int(request.quantity or metadata.lot_size)
+    if quantity < metadata.minimum_lot or quantity % metadata.lot_size != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Quantity must be a multiple of the current lot size {metadata.lot_size}",
+        )
+    if "|" not in request.instrument_key or quantity <= 0 or request.reference_price <= 0:
+        raise HTTPException(status_code=400, detail="A valid contract, quantity, and reference price are required")
+    limit_price = engine._sandbox_protected_price(
+        request.reference_price,
+        "BUY",
+        tick_size=metadata.tick_size,
+    )
+    response = engine.broker.place_order(
+        BrokerOrderRequest(
+            instrument_key=request.instrument_key,
+            option_type=request.option_type,
+            strike=request.strike,
+            expiry_date=request.expiry_date,
+            side="BUY",
+            qty=quantity,
+            order_type="LIMIT",
+            price=limit_price,
+            tag="sandbox_connectivity_test",
+        )
+    )
+    if not response.success:
+        raise HTTPException(status_code=502, detail=f"Sandbox test order failed: {response.message}")
+    if not response.order_id:
+        raise HTTPException(status_code=502, detail="Sandbox accepted the test order without returning an order ID")
+    cancel = engine.broker.cancel_order(str(response.order_id))
+    create_audit_log(
+        db,
+        action="sandbox_test_order",
+        resource="order",
+        resource_id=str(response.order_id or ""),
+        status="SUCCESS" if cancel.success else "WARN",
+        message="Sandbox test order placed and cancellation requested",
+        details={
+            "instrument_key": request.instrument_key,
+            "limit_price": limit_price,
+            "place_status": response.status,
+            "cancel_status": cancel.status,
+        },
+    )
+    db.commit()
+    return {
+        "status": "ok" if cancel.success else "warn",
+        "order_id": response.order_id,
+        "limit_price": limit_price,
+        "place_status": response.status,
+        "cancel_status": cancel.status,
+    }
+
+
+@router.post("/sandbox/manual-review/{position_id}")
+def resolve_sandbox_manual_review(
+    position_id: int,
+    request: SandboxReviewRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    engine = get_runtime_engine(db)
+    position = db.get(ExecutionPosition, position_id)
+    if position is None or not _position_matches_mode(position, "sandbox"):
+        raise HTTPException(status_code=404, detail="Sandbox position not found")
+    if str(position.status).upper() != "MANUAL_REVIEW":
+        raise HTTPException(status_code=400, detail="Position is not awaiting manual review")
+    action = str(request.action or "").strip().lower()
+    metadata = dict(position.metadata_json or {})
+    operation = str(metadata.get("manual_review_operation") or "")
+    if action == "discard":
+        position.status = "ENTRY_FAILED" if operation == "entry" else "OPEN"
+        if operation == "entry":
+            position.quantity = 0
+    elif action == "accept":
+        order_id = str(request.sandbox_order_id or "").strip()
+        if not order_id:
+            raise HTTPException(status_code=400, detail="sandbox_order_id is required for accept")
+        if operation == "entry":
+            position.entry_order_id = order_id
+            position.status = "OPEN"
+            metadata["entry_order_id"] = order_id
+            metadata["entry_order_status"] = "MANUALLY_CONFIRMED"
+            position.metadata_json = metadata
+            engine._place_live_protective_stop(db, position=position)
+        elif operation in {"protective_stop_place", "protective_stop_modify"}:
+            metadata["broker_sl_order_id"] = order_id
+            metadata["broker_sl_active"] = True
+            metadata["broker_sl_order_status"] = "MANUALLY_CONFIRMED"
+            position.status = "OPEN"
+        elif operation == "exit":
+            fill_price = float(metadata.get("exit_reference_quote") or position.current_premium or 0.0)
+            if fill_price <= 0:
+                raise HTTPException(status_code=400, detail="Exit reference quote is unavailable")
+            position.status = "CLOSED"
+            position.closed_at = datetime.now(IST_ZONE)
+            position.exit_premium = fill_price
+            position.current_price = fill_price
+            position.current_premium = fill_price
+            position.realized_pnl = round(
+                (fill_price - float(position.entry_premium or position.entry_price))
+                * int(position.quantity),
+                2,
+            )
+            position.pnl_value = position.realized_pnl
+            position.pnl_points = round(
+                fill_price - float(position.entry_premium or position.entry_price),
+                2,
+            )
+            position.unrealized_pnl = 0.0
+            metadata["exit_order_id"] = order_id
+            metadata["exit_order_status"] = "MANUALLY_CONFIRMED"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported manual review operation: {operation}")
+    else:
+        raise HTTPException(status_code=400, detail="Action must be 'accept' or 'discard'")
+    metadata = dict(position.metadata_json or metadata)
+    metadata.pop("manual_review_required", None)
+    metadata["manual_review_resolved_at"] = datetime.now(IST_ZONE).isoformat()
+    metadata["manual_review_resolution"] = action
+    position.metadata_json = metadata
+    create_audit_log(
+        db,
+        action="sandbox_manual_review_resolved",
+        resource="position",
+        resource_id=str(position.id),
+        status="WARN",
+        message=f"Sandbox manual review {action}",
+        details={"operation": operation, "sandbox_order_id": request.sandbox_order_id},
+    )
+    db.commit()
+    return {"status": "success", "position": _serialize_position(position)}
 
 
 @router.post("/settings/test-smtp")
@@ -403,7 +675,12 @@ def delete_position(position_id: int, db: Session = Depends(get_db)) -> dict:
     position = db.get(ExecutionPosition, position_id)
     if position is None:
         raise HTTPException(status_code=404, detail="Position not found")
-    if str(position.status).upper() in {"ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"}:
+    if str(position.status).upper() in {
+        "ENTRY_PENDING",
+        "EXIT_SUBMITTING",
+        "EXIT_PENDING",
+        "MANUAL_REVIEW",
+    }:
         raise HTTPException(
             status_code=409,
             detail="Cannot delete a position while broker reconciliation is pending",
@@ -441,6 +718,25 @@ def get_mode(db: Session = Depends(get_db)) -> dict:
 @router.post("/mode")
 def set_mode(request: TradingModeRequest, db: Session = Depends(get_db)) -> dict:
     engine = get_runtime_engine(db)
+    current_mode = get_runtime_trading_mode(db, settings=engine.settings)
+    if str(request.mode or "").strip().lower() != current_mode:
+        active = (
+            db.execute(
+                select(ExecutionPosition).where(
+                    ExecutionPosition.status.in_(
+                        ["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING", "MANUAL_REVIEW"]
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        active = [row for row in active if _position_matches_mode(row, current_mode)]
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Close or resolve all {current_mode} positions before switching mode",
+            )
     mode = set_runtime_trading_mode(db, request.mode)
     engine.settings.execution_mode = mode
     engine.broker = engine._build_broker()
@@ -457,29 +753,33 @@ def set_mode(request: TradingModeRequest, db: Session = Depends(get_db)) -> dict
     return {"status": "success", "mode": mode, "broker": broker_health(engine)}
 
 
-@router.post("/paper/reset")
-def reset_paper(request: PaperResetRequest, db: Session = Depends(get_db)) -> dict:
+@router.post("/sandbox/reset")
+def reset_sandbox(request: SandboxResetRequest, db: Session = Depends(get_db)) -> dict:
     engine = get_runtime_engine(db)
+    if get_runtime_trading_mode(db, settings=engine.settings) != "sandbox":
+        raise HTTPException(status_code=400, detail="Sandbox reset requires Sandbox mode")
     starting_balance = float(request.starting_balance or engine.settings.execution_capital)
-    if bool(engine.settings.paper_reset_requires_flat_positions) and request.clear_open_positions is False:
-        open_paper_positions = [
-            row for row in db.execute(select(ExecutionPosition).where(ExecutionPosition.status == "OPEN")).scalars().all()
-            if str((row.metadata_json or {}).get("execution_mode") or "paper").lower() == "paper"
-        ]
-        if open_paper_positions:
-            raise HTTPException(status_code=400, detail="Flat paper positions before reset or allow clear_open_positions")
-    out = reset_paper_account(
-        db,
-        starting_balance=starting_balance,
-        clear_open_positions=bool(request.clear_open_positions),
+    active = (
+        db.execute(
+            select(ExecutionPosition).where(
+                ExecutionPosition.status.in_(
+                    ["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING", "MANUAL_REVIEW"]
+                )
+            )
+        )
+        .scalars()
+        .all()
     )
+    if any(_position_matches_mode(row, "sandbox") for row in active):
+        raise HTTPException(status_code=409, detail="Sandbox account must be flat before reset")
+    out = reset_sandbox_account(db, starting_balance=starting_balance, clear_open_positions=False)
     create_audit_log(
         db,
-        action="paper_reset",
-        resource="paper_account",
+        action="sandbox_reset",
+        resource="sandbox_account",
         resource_id="default",
         status="WARN",
-        message="Paper account reset",
+        message="Sandbox account reset",
         details=out,
     )
     db.commit()
@@ -513,7 +813,9 @@ def status(db: Session = Depends(get_db)) -> dict:
     open_positions = (
         db.execute(
             select(ExecutionPosition).where(
-                ExecutionPosition.status.in_(["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"])
+                ExecutionPosition.status.in_(
+                    ["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING", "MANUAL_REVIEW"]
+                )
             )
         )
         .scalars()
@@ -559,21 +861,27 @@ def portfolio(db: Session = Depends(get_db)) -> dict:
         )
         db.commit()
         return {"mode": mode, **data}
-    paper = compute_paper_portfolio_metrics(db, settings=engine.settings)
+    sandbox = compute_sandbox_portfolio_metrics(db, settings=engine.settings)
     positions = (
         db.execute(
             select(ExecutionPosition).where(
-                ExecutionPosition.status.in_(["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"])
+                ExecutionPosition.status.in_(
+                    ["OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING", "MANUAL_REVIEW"]
+                )
             )
         )
         .scalars()
         .all()
     )
     return {
-        "mode": "paper",
-        "broker": "paper",
-        "summary": paper,
-        "positions": [_serialize_position(row) for row in positions],
+        "mode": "sandbox",
+        "broker": "upstox_sandbox",
+        "summary": sandbox,
+        "positions": [
+            _serialize_position(row)
+            for row in positions
+            if _position_matches_mode(row, "sandbox")
+        ],
     }
 
 
@@ -592,6 +900,8 @@ def trade_history(
     if strategy:
         query = query.where(ExecutionPosition.strategy_name == strategy)
     rows = db.execute(query.order_by(ExecutionPosition.closed_at.desc()).limit(300)).scalars().all()
+    runtime_mode = get_runtime_trading_mode(db)
+    rows = [row for row in rows if _position_matches_mode(row, runtime_mode)]
     pnl_values = [float(row.realized_pnl or row.pnl_value or 0.0) for row in rows]
     return {
         "rows": [_serialize_position(row) for row in rows],
@@ -609,6 +919,8 @@ def strategy_performance(db: Session = Depends(get_db)) -> dict:
     rows = db.execute(
         select(ExecutionPosition).where(ExecutionPosition.status == "CLOSED").order_by(ExecutionPosition.closed_at.asc())
     ).scalars().all()
+    runtime_mode = get_runtime_trading_mode(db)
+    rows = [row for row in rows if _position_matches_mode(row, runtime_mode)]
     grouped: dict[str, dict] = {}
     for row in rows:
         key = str(row.strategy_name or "unknown")

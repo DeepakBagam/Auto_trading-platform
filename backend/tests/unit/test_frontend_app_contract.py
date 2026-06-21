@@ -99,3 +99,17 @@ def test_chart_ui_is_fixed_to_execution_aligned_one_minute_mode() -> None:
     assert "mergeSignalMarker" not in source
     assert 'range: rangeKey || "1d"' not in source
     assert 'interval: intervalKey || "1minute"' not in source
+
+
+def test_execution_ui_exposes_sandbox_and_live_without_paper_mode() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'updateMode("sandbox")' in source
+    assert 'updateMode("live")' in source
+    assert "Sandbox Portfolio" in source
+    assert "Upstox Sandbox Token" in source
+    assert "/execution/sandbox/reset" in source
+    assert "/execution/sandbox/test-order" in source
+    assert 'updateMode("paper")' not in source
+    assert "Paper Portfolio" not in source
+    assert "/execution/paper/reset" not in source

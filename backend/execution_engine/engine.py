@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import copy
 from datetime import date, datetime, time
+import hashlib
+import math
 import time as time_module
 from typing import Any
 
@@ -10,11 +12,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.db.models import DailySummary, ExecutionOrder, ExecutionPosition, ExecutionSignalAudit
-from backend.execution_engine.broker import BaseBroker, BrokerOrderRequest, PaperBroker, UpstoxBroker
+from backend.execution_engine.broker import (
+    BaseBroker,
+    BrokerOrderRequest,
+    UpstoxBroker,
+    UpstoxSandboxBroker,
+)
 from backend.execution_engine.live_service import (
     DIRECTIONAL_SIGNALS_ENABLED,
     build_option_selection,
-    compute_paper_portfolio_metrics,
+    compute_sandbox_portfolio_metrics,
     build_technical_signal,
     latest_option_premium,
     load_market_context,
@@ -25,11 +32,16 @@ from backend.execution_engine.slippage_tracker import estimate_slippage
 from backend.execution_engine.strike_selector import compute_position_lots, lot_size_for_symbol
 from backend.utils.calendar_utils import is_trading_day
 from backend.utils.app_state import create_audit_log, get_runtime_trading_mode
-from backend.utils.config import Settings, get_settings, read_runtime_upstox_access_token
+from backend.utils.config import (
+    Settings,
+    get_settings,
+    read_runtime_upstox_access_token,
+    read_runtime_upstox_sandbox_access_token,
+)
 from backend.utils.constants import IST_ZONE
 from backend.utils.logger import get_logger
 from backend.utils.notifications import send_order_notification
-from backend.utils.symbols import normalize_symbol_key, symbol_value_filter
+from backend.utils.symbols import is_option_execution_symbol, normalize_symbol_key, symbol_value_filter
 
 logger = get_logger(__name__)
 
@@ -50,7 +62,18 @@ class IntradayOptionsExecutionEngine:
     def __init__(self, settings: Settings | None = None, broker: BaseBroker | None = None) -> None:
         self.settings = settings or get_settings()
         self.broker = broker or self._build_broker()
+        self._broker_credential_marker = self._active_broker_credential_marker()
         self._last_entry_candle: dict[str, str] = {}
+
+    def _active_broker_credential_marker(self, mode: str | None = None) -> tuple[str, str]:
+        normalized_mode = str(mode or self.settings.execution_mode).lower()
+        token = (
+            read_runtime_upstox_access_token(self.settings)
+            if normalized_mode == "live"
+            else read_runtime_upstox_sandbox_access_token(self.settings)
+        )
+        digest = hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+        return normalized_mode, digest
 
     def _build_broker(self) -> BaseBroker:
         if str(self.settings.execution_mode).lower() == "live":
@@ -58,19 +81,31 @@ class IntradayOptionsExecutionEngine:
                 base_url=self.settings.upstox_base_url,
                 access_token=read_runtime_upstox_access_token(self.settings),
             )
-        return PaperBroker()
+        return UpstoxSandboxBroker(
+            access_token=read_runtime_upstox_sandbox_access_token(self.settings),
+        )
 
     def _sync_runtime_mode(self, db: Session) -> str:
         mode = get_runtime_trading_mode(db, settings=self.settings)
-        expected_broker = "upstox" if mode == "live" else "paper"
-        if str(self.settings.execution_mode).lower() != mode or str(self.broker.broker_name).lower() != expected_broker:
+        expected_broker = "upstox" if mode == "live" else "upstox_sandbox"
+        credential_marker = self._active_broker_credential_marker(mode)
+        if (
+            str(self.settings.execution_mode).lower() != mode
+            or str(self.broker.broker_name).lower() != expected_broker
+            or self._broker_credential_marker != credential_marker
+        ):
             self.settings.execution_mode = mode
             self.broker = self._build_broker()
+            self._broker_credential_marker = credential_marker
         return mode
 
     def _live_broker_ready(self) -> tuple[bool, str]:
-        if str(self.settings.execution_mode).lower() != "live":
-            return True, "paper_mode"
+        if self._is_sandbox_mode():
+            if not read_runtime_upstox_sandbox_access_token(self.settings):
+                return False, "UPSTOX_SANDBOX_ACCESS_TOKEN is missing"
+            return True, "sandbox_ready"
+        if not self._is_live_mode():
+            return False, "unsupported_execution_mode"
         if not read_runtime_upstox_access_token(self.settings):
             return False, "UPSTOX_ACCESS_TOKEN is missing"
         try:
@@ -141,7 +176,7 @@ class IntradayOptionsExecutionEngine:
     def _open_positions(self, db: Session, symbol: str | None = None) -> list[ExecutionPosition]:
         return self._positions_with_status(
             db,
-            {"OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING"},
+            {"OPEN", "ENTRY_PENDING", "EXIT_SUBMITTING", "EXIT_PENDING", "MANUAL_REVIEW"},
             symbol=symbol,
         )
 
@@ -149,7 +184,7 @@ class IntradayOptionsExecutionEngine:
         return self._positions_with_status(db, {"OPEN"})
 
     def _position_execution_mode(self, position: ExecutionPosition) -> str:
-        return str((position.metadata_json or {}).get("execution_mode") or "paper").lower()
+        return str((position.metadata_json or {}).get("execution_mode") or "archived_paper").lower()
 
     def _entry_positions_for_day(
         self,
@@ -210,10 +245,10 @@ class IntradayOptionsExecutionEngine:
 
     def _available_trading_balance(self, db: Session) -> tuple[float, str, dict[str, Any]]:
         mode = str(self.settings.execution_mode).lower()
-        if mode == "paper":
-            paper = compute_paper_portfolio_metrics(db, settings=self.settings)
-            balance = max(0.0, float(paper["available_balance"]))
-            return balance, "paper_available_balance", {"paper_portfolio": paper}
+        if mode == "sandbox":
+            sandbox = compute_sandbox_portfolio_metrics(db, settings=self.settings)
+            balance = max(0.0, float(sandbox["available_balance"]))
+            return balance, "sandbox_available_balance", {"sandbox_portfolio": sandbox}
 
         portfolio = self.broker.get_portfolio()
         funds = portfolio.get("funds") or {}
@@ -761,8 +796,16 @@ class IntradayOptionsExecutionEngine:
             "position_opened_at": getattr(position, "opened_at", None),
             "position_closed_at": getattr(position, "closed_at", None),
             "capital_invested": (metadata or {}).get("capital_invested"),
-            "balance_before_trade": (metadata or {}).get("paper_balance_before_trade"),
-            "balance_after_trade": (metadata or {}).get("paper_balance_after_trade"),
+            "balance_before_trade": (
+                (metadata or {}).get("sandbox_balance_before_trade")
+                if self._is_sandbox_mode()
+                else (metadata or {}).get("paper_balance_before_trade")
+            ),
+            "balance_after_trade": (
+                (metadata or {}).get("sandbox_balance_after_trade")
+                if self._is_sandbox_mode()
+                else (metadata or {}).get("paper_balance_after_trade")
+            ),
             "latest_quote_source": (metadata or {}).get("latest_quote_source"),
             "latest_quote_ts": (metadata or {}).get("latest_quote_ts"),
         }
@@ -796,7 +839,7 @@ class IntradayOptionsExecutionEngine:
     ):
         attempts = (
             1
-            if self._is_live_mode()
+            if self._is_live_mode() or self._is_sandbox_mode()
             else max(1, int(getattr(self.settings, "order_retry_attempts", 2)))
         )
         backoff_ms = max(0, int(getattr(self.settings, "order_retry_backoff_ms", 300)))
@@ -832,19 +875,56 @@ class IntradayOptionsExecutionEngine:
     def _is_live_mode(self) -> bool:
         return str(self.settings.execution_mode).lower() == "live"
 
+    def _is_sandbox_mode(self) -> bool:
+        return str(self.settings.execution_mode).lower() == "sandbox"
+
+    def _uses_broker_protection(self) -> bool:
+        return self._is_live_mode() or self._is_sandbox_mode()
+
+    def _sandbox_protected_price(
+        self,
+        reference: float,
+        side: str,
+        *,
+        tick_size: float | None = None,
+    ) -> float:
+        tick = max(
+            0.01,
+            float(tick_size or getattr(self.settings, "sandbox_price_tick", 0.05)),
+        )
+        protection = max(0.0, float(getattr(self.settings, "sandbox_limit_protection_pct", 0.01)))
+        raw = float(reference) * (1.0 + protection if str(side).upper() == "BUY" else 1.0 - protection)
+        ticks = (
+            math.ceil(raw / tick)
+            if str(side).upper() == "BUY"
+            else math.floor(raw / tick)
+        )
+        return round(max(tick, ticks * tick), 2)
+
+    @staticmethod
+    def _round_to_tick(reference: float, tick_size: float) -> float:
+        tick = max(0.01, float(tick_size or 0.05))
+        return round(max(tick, round(float(reference) / tick) * tick), 2)
+
     def _place_live_protective_stop(
         self,
         db: Session,
         *,
         position: ExecutionPosition,
     ) -> ExecutionOrder | None:
-        if not self._is_live_mode():
+        if not self._uses_broker_protection():
             return None
         instrument_key = str((position.metadata_json or {}).get("instrument_key") or "")
         if not instrument_key:
             logger.error("Cannot place live protective SL for position=%s without instrument_key", position.id)
             return None
-        trigger_price = round(float(position.current_sl or position.stop_loss or 0.0), 2)
+        sandbox = self._is_sandbox_mode()
+        tick_size = float((position.metadata_json or {}).get("contract_tick_size") or 0.05)
+        trigger_price = (
+            self._round_to_tick(float(position.current_sl or position.stop_loss or 0.0), tick_size)
+            if sandbox
+            else round(float(position.current_sl or position.stop_loss or 0.0), 2)
+        )
         request = BrokerOrderRequest(
             instrument_key=instrument_key,
             option_type=str(position.option_type),
@@ -852,7 +932,12 @@ class IntradayOptionsExecutionEngine:
             expiry_date=position.expiry_date.isoformat(),
             side="SELL",
             qty=int(position.quantity),
-            order_type="SL-M",
+            order_type="SL" if sandbox else "SL-M",
+            price=(
+                self._sandbox_protected_price(trigger_price, "SELL", tick_size=tick_size)
+                if sandbox
+                else None
+            ),
             trigger_price=trigger_price,
             tag=f"protective_sl_{position.id}",
         )
@@ -889,6 +974,11 @@ class IntradayOptionsExecutionEngine:
         metadata["broker_sl_trigger_price"] = trigger_price
         metadata["broker_sl_updated_at"] = _now_ist().isoformat()
         metadata["broker_sl_active"] = bool(response.success and getattr(response, "order_id", None))
+        if self._is_sandbox_mode() and str(response.status).upper() == "AMBIGUOUS":
+            metadata["manual_review_required"] = True
+            metadata["manual_review_operation"] = "protective_stop_place"
+            metadata["manual_review_message"] = response.message
+            position.status = "MANUAL_REVIEW"
         position.metadata_json = metadata
         if not response.success and str(response.status).upper() != "AMBIGUOUS":
             create_audit_log(
@@ -909,7 +999,7 @@ class IntradayOptionsExecutionEngine:
         position: ExecutionPosition,
         trigger_price: float,
     ) -> None:
-        if not self._is_live_mode():
+        if not self._uses_broker_protection():
             return
         metadata = dict(position.metadata_json or {})
         order_id = str(metadata.get("broker_sl_order_id") or "")
@@ -917,10 +1007,28 @@ class IntradayOptionsExecutionEngine:
             self._place_live_protective_stop(db, position=position)
             return
         previous_trigger = float(metadata.get("broker_sl_trigger_price") or 0.0)
-        trigger_price = round(float(trigger_price), 2)
+        tick_size = float(metadata.get("contract_tick_size") or 0.05)
+        trigger_price = (
+            self._round_to_tick(float(trigger_price), tick_size)
+            if self._is_sandbox_mode()
+            else round(float(trigger_price), 2)
+        )
         if trigger_price <= previous_trigger:
             return
-        response = self.broker.modify_order(order_id, trigger_price=trigger_price)
+        if self._is_sandbox_mode():
+            response = self.broker.modify_order(
+                order_id,
+                trigger_price=trigger_price,
+                price=self._sandbox_protected_price(
+                    trigger_price,
+                    "SELL",
+                    tick_size=tick_size,
+                ),
+                quantity=int(position.quantity),
+                order_type="SL",
+            )
+        else:
+            response = self.broker.modify_order(order_id, trigger_price=trigger_price)
         create_audit_log(
             db,
             action="protective_sl_modify",
@@ -961,6 +1069,11 @@ class IntradayOptionsExecutionEngine:
         if response.success:
             metadata["broker_sl_trigger_price"] = trigger_price
             metadata["broker_sl_active"] = True
+        elif self._is_sandbox_mode() and str(response.status).upper() == "AMBIGUOUS":
+            metadata["manual_review_required"] = True
+            metadata["manual_review_operation"] = "protective_stop_modify"
+            metadata["manual_review_message"] = response.message
+            position.status = "MANUAL_REVIEW"
         position.metadata_json = metadata
 
     def _cancel_live_protective_stop(
@@ -972,7 +1085,7 @@ class IntradayOptionsExecutionEngine:
         now: datetime,
         exit_premium: float | None,
     ) -> bool:
-        if not self._is_live_mode():
+        if not self._uses_broker_protection():
             return True
         metadata = dict(position.metadata_json or {})
         order_id = str(metadata.get("broker_sl_order_id") or "")
@@ -988,6 +1101,21 @@ class IntradayOptionsExecutionEngine:
             message=response.message,
             details={"position_id": position.id, "reason": reason, "status": response.status},
         )
+        if self._is_sandbox_mode():
+            if response.success:
+                metadata["broker_sl_active"] = False
+                metadata["broker_sl_order_status"] = response.status
+                metadata["broker_sl_cancelled_at"] = now.isoformat()
+                position.metadata_json = metadata
+                return True
+            if str(response.status).upper() == "AMBIGUOUS":
+                metadata["manual_review_required"] = True
+                metadata["manual_review_operation"] = "protective_stop_cancel"
+                metadata["manual_review_message"] = response.message
+                position.status = "MANUAL_REVIEW"
+                position.metadata_json = metadata
+            return False
+
         status_response = self.broker.get_order_status(order_id)
         status_payload = getattr(status_response, "payload", {}) or {}
         broker_status = self._extract_order_status(status_payload) or str(status_response.status or "").upper()
@@ -1168,7 +1296,7 @@ class IntradayOptionsExecutionEngine:
                 resource="position",
                 resource_id=str(position.id),
                 status="WARN",
-                message="Paper exit deferred because no real option quote is available",
+                message="Sandbox exit deferred because no real option quote is available",
                 details={"symbol": position.symbol, "reason": reason},
             )
             return None
@@ -1194,9 +1322,20 @@ class IntradayOptionsExecutionEngine:
                 exit_premium=exit_premium,
             )
 
+        if self._is_sandbox_mode() and not self._cancel_live_protective_stop(
+            db,
+            position=position,
+            reason=reason,
+            now=now,
+            exit_premium=exit_premium,
+        ):
+            return None
+
         instrument_key = (position.metadata_json or {}).get("instrument_key") or ""
-        balance_before_close = None
-        balance_before_close = compute_paper_portfolio_metrics(db, settings=self.settings)["available_balance"]
+        balance_before_close = compute_sandbox_portfolio_metrics(
+            db,
+            settings=self.settings,
+        )["available_balance"]
 
         # Log slippage estimate for exits (never block — exits are always executed)
         try:
@@ -1224,7 +1363,16 @@ class IntradayOptionsExecutionEngine:
             expiry_date=position.expiry_date.isoformat(),
             side="SELL",
             qty=int(position.quantity),
-            order_type="MARKET",
+            order_type="LIMIT" if self._is_sandbox_mode() else "MARKET",
+            price=(
+                self._sandbox_protected_price(
+                    float(exit_premium),
+                    "SELL",
+                    tick_size=(position.metadata_json or {}).get("contract_tick_size"),
+                )
+                if self._is_sandbox_mode() and exit_premium is not None
+                else None
+            ),
             tag=f"exit_{reason.lower()}",
         )
         response = self._place_order_with_retry(
@@ -1245,6 +1393,12 @@ class IntradayOptionsExecutionEngine:
             metadata["exit_order_failed"] = True
             metadata["exit_order_error"] = response.message
             position.metadata_json = metadata
+            if self._is_sandbox_mode() and str(response.status).upper() == "AMBIGUOUS":
+                position.status = "MANUAL_REVIEW"
+                metadata["manual_review_required"] = True
+                metadata["manual_review_operation"] = "exit"
+                metadata["manual_review_message"] = response.message
+                position.metadata_json = metadata
             create_audit_log(
                 db,
                 action="position_exit_failed",
@@ -1309,11 +1463,11 @@ class IntradayOptionsExecutionEngine:
             2,
         )
         metadata["capital_invested"] = round(capital_invested, 2)
-        metadata["paper_balance_before_trade"] = round(float(balance_before_close or 0.0), 2)
-        metadata["paper_balance_after_trade"] = balance_after_close
+        metadata["sandbox_balance_before_trade"] = round(float(balance_before_close or 0.0), 2)
+        metadata["sandbox_balance_after_trade"] = balance_after_close
         position.metadata_json = metadata
         logger.info(
-            "Paper exit symbol=%s strike=%s option=%s price=%.2f balance_before=%.2f balance_after=%.2f realized_pnl=%.2f",
+            "Sandbox exit symbol=%s strike=%s option=%s price=%.2f balance_before=%.2f balance_after=%.2f realized_pnl=%.2f",
             position.symbol,
             position.strike,
             position.option_type,
@@ -1455,6 +1609,8 @@ class IntradayOptionsExecutionEngine:
         self._sync_runtime_mode(db)
         if not DIRECTIONAL_SIGNALS_ENABLED:
             return "skip:signals_disabled"
+        if not is_option_execution_symbol(symbol):
+            return "skip:unsupported_option_underlying"
 
         # Guard: max simultaneous trades across all symbols
         all_open = self._open_positions(db)
@@ -1551,10 +1707,13 @@ class IntradayOptionsExecutionEngine:
             db.commit()
             return "skip:no_liquid_strike"
 
-        if str(self.settings.execution_mode).lower() == "live" and option_selection.chain_source == "synthetic":
-            log_row.skip_reason = "Synthetic option chain is not allowed in live mode."
+        if (
+            str(self.settings.execution_mode).lower() in {"sandbox", "live"}
+            and option_selection.chain_source == "synthetic"
+        ):
+            log_row.skip_reason = "Synthetic option chain is not allowed for broker execution."
             db.commit()
-            return "skip:synthetic_chain_live_blocked"
+            return "skip:synthetic_chain_broker_blocked"
 
         entry_price = float(option_signal["entry_price"])
         regime = str(signal.details.get("regime", "TRENDING"))
@@ -1572,7 +1731,11 @@ class IntradayOptionsExecutionEngine:
             capital=float(available_balance),
             capital_per_trade_pct=float(self.settings.execution_per_trade_risk_pct),
             entry_price=entry_price,
-            lot_size=lot_size_for_symbol(symbol),
+            lot_size=(
+                int(option_signal["lot_size"])
+                if self._is_sandbox_mode() and option_signal.get("lot_size")
+                else lot_size_for_symbol(symbol)
+            ),
             stop_loss_price=float(option_signal["stop_loss"]),
             max_lots=max_lots,
             fixed_lots=scaled_lots,
@@ -1636,6 +1799,15 @@ class IntradayOptionsExecutionEngine:
         except Exception:
             logger.warning("Slippage estimation failed for %s, proceeding anyway", symbol)
 
+        sandbox_entry_price = (
+            self._sandbox_protected_price(
+                entry_price,
+                "BUY",
+                tick_size=option_signal.get("tick_size"),
+            )
+            if self._is_sandbox_mode()
+            else None
+        )
         request = BrokerOrderRequest(
             instrument_key=instrument_key,
             option_type=str(option_signal["option_type"]),
@@ -1643,7 +1815,8 @@ class IntradayOptionsExecutionEngine:
             expiry_date=option_selection.expiry_date.isoformat(),
             side="BUY",
             qty=int(sizing.qty),
-            order_type="MARKET",
+            order_type="LIMIT" if self._is_sandbox_mode() else "MARKET",
+            price=sandbox_entry_price,
             tag="fast_live_entry",
         )
         response = self._place_order_with_retry(
@@ -1654,6 +1827,68 @@ class IntradayOptionsExecutionEngine:
         )
         if not response.success:
             log_row.skip_reason = f"Broker rejected order: {response.message}"
+            if self._is_sandbox_mode() and str(response.status).upper() == "AMBIGUOUS":
+                review_position = ExecutionPosition(
+                    trade_date=now.date(),
+                    symbol=symbol,
+                    interval="1minute",
+                    strategy_name="fast_live_breakout",
+                    option_type=str(option_signal["option_type"]),
+                    side="BUY",
+                    expiry_date=option_selection.expiry_date,
+                    strike=float(option_signal["strike"]),
+                    quantity=int(sizing.qty),
+                    status="MANUAL_REVIEW",
+                    entry_price=entry_price,
+                    entry_premium=entry_price,
+                    stop_loss=float(option_signal["stop_loss"]),
+                    initial_sl=float(option_signal["stop_loss"]),
+                    current_sl=float(option_signal["stop_loss"]),
+                    trailing_stop=float(option_signal["stop_loss"]),
+                    peak_premium=entry_price,
+                    take_profit=float(option_signal["take_profit"]),
+                    target_premium=float(option_signal["take_profit"]),
+                    current_price=entry_price,
+                    current_premium=entry_price,
+                    entry_order_id=None,
+                    opened_at=now,
+                    metadata_json={
+                        "execution_mode": "sandbox",
+                        "instrument_key": instrument_key,
+                        "manual_review_required": True,
+                        "manual_review_operation": "entry",
+                        "manual_review_message": response.message,
+                        "entry_reference_price": entry_price,
+                        "entry_requested_quantity": int(sizing.qty),
+                        "sandbox_limit_price": sandbox_entry_price,
+                        "contract_lot_size": option_signal.get("lot_size"),
+                        "contract_tick_size": option_signal.get("tick_size"),
+                        "contract_freeze_quantity": option_signal.get("freeze_quantity"),
+                        "signal_log_id": log_row.id,
+                    },
+                )
+                db.add(review_position)
+                db.flush()
+                self._log_order(
+                    db,
+                    position_id=review_position.id,
+                    trade_date=review_position.trade_date,
+                    symbol=review_position.symbol,
+                    order_kind="ENTRY",
+                    side="BUY",
+                    quantity=review_position.quantity,
+                    response=response,
+                    strike_price=review_position.strike,
+                    option_type=review_position.option_type,
+                    expiry_date=review_position.expiry_date,
+                    entry_premium=review_position.entry_premium,
+                    initial_sl=review_position.initial_sl,
+                    current_sl=review_position.current_sl,
+                    target_premium=review_position.target_premium,
+                    peak_premium=review_position.peak_premium,
+                    tsl_active=False,
+                    consensus_reason="Sandbox entry requires manual review",
+                )
             create_audit_log(
                 db,
                 action="position_entry_failed",
@@ -1729,10 +1964,22 @@ class IntradayOptionsExecutionEngine:
                 "entry_order_status": str(response.status),
                 "entry_requested_quantity": int(sizing.qty),
                 "entry_reference_price": entry_price,
+                "contract_lot_size": option_signal.get("lot_size"),
+                "contract_tick_size": option_signal.get("tick_size"),
+                "contract_freeze_quantity": option_signal.get("freeze_quantity"),
                 "entry_reconciliation_needed": self._is_live_mode(),
                 "capital_invested": capital_invested,
-                "paper_balance_before_trade": balance_before_trade,
-                "paper_balance_after_trade": balance_after_trade,
+                **(
+                    {
+                        "sandbox_balance_before_trade": balance_before_trade,
+                        "sandbox_balance_after_trade": balance_after_trade,
+                    }
+                    if self._is_sandbox_mode()
+                    else {
+                        "paper_balance_before_trade": balance_before_trade,
+                        "paper_balance_after_trade": balance_after_trade,
+                    }
+                ),
                 "sizing": sizing_meta,
                 **slippage_meta,
                 "premium_history": [
@@ -1823,9 +2070,17 @@ class IntradayOptionsExecutionEngine:
                 self._notify_order(entry_order, position)
                 return "entry_pending"
 
-        if not self._is_live_mode():
+        if self._is_sandbox_mode():
             protective_order = self._place_live_protective_stop(db, position=position)
-        if self._is_live_mode() and not bool((position.metadata_json or {}).get("broker_sl_active")):
+        if str(position.status).upper() == "MANUAL_REVIEW":
+            log_row.trade_placed = False
+            log_row.skip_reason = "sandbox_manual_review_required"
+            db.commit()
+            self._notify_order(entry_order, position)
+            if protective_order is not None:
+                self._notify_order(protective_order, position)
+            return "manual_review"
+        if self._uses_broker_protection() and not bool((position.metadata_json or {}).get("broker_sl_active")):
             exit_order = self._close_position(
                 db,
                 position=position,
@@ -1857,8 +2112,17 @@ class IntradayOptionsExecutionEngine:
             "quote_age_seconds": option_signal.get("quote_age_seconds"),
             "instrument_key": instrument_key,
             "entry_price": entry_price,
-            "paper_balance_before_trade": balance_before_trade,
-            "paper_balance_after_trade": balance_after_trade,
+            **(
+                {
+                    "sandbox_balance_before_trade": balance_before_trade,
+                    "sandbox_balance_after_trade": balance_after_trade,
+                }
+                if self._is_sandbox_mode()
+                else {
+                    "paper_balance_before_trade": balance_before_trade,
+                    "paper_balance_after_trade": balance_after_trade,
+                }
+            ),
             "sizing": sizing_meta,
         }
         self._refresh_daily_summary(db, position.trade_date)

@@ -26,6 +26,8 @@ _DISPLAY_ORDER = {
     "India VIX": 3,
 }
 
+_NON_OPTION_EXECUTION_SYMBOLS = {"INDIAVIX"}
+
 
 def normalize_symbol_key(symbol: str) -> str:
     return "".join(ch for ch in str(symbol or "").upper() if ch.isalnum())
@@ -55,6 +57,11 @@ def canonical_symbol_name(symbol: str) -> str:
     if not raw:
         return raw
     return _PREFERRED_DISPLAY.get(normalize_symbol_key(raw), raw)
+
+
+def is_option_execution_symbol(symbol: str) -> bool:
+    """Return whether the symbol can be used as an options underlying."""
+    return normalize_symbol_key(symbol) not in _NON_OPTION_EXECUTION_SYMBOLS
 
 
 def display_symbol_from_instrument_key(instrument_key: str) -> str:

@@ -83,6 +83,25 @@ def test_runtime_settings_rejects_zero_signal_max_per_day() -> None:
         session.close()
 
 
+def test_runtime_settings_rejects_india_vix_for_option_execution() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        with pytest.raises(HTTPException, match="has no supported Upstox option contracts"):
+            update_runtime_settings(
+                RuntimeSettingsRequest(execution_symbols=["Nifty 50", "India VIX"]),
+                session,
+            )
+    finally:
+        session.close()
+
+
 @pytest.mark.parametrize("status", ["ENTRY_PENDING", "EXIT_PENDING"])
 def test_delete_position_rejects_pending_reconciliation(status: str) -> None:
     engine = create_engine(

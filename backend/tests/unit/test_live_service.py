@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -14,7 +15,7 @@ from backend.execution_engine.live_service import (
     build_live_price_update,
     build_option_selection,
     build_technical_signal,
-    compute_paper_portfolio_metrics,
+    compute_sandbox_portfolio_metrics,
     latest_option_premium,
     refresh_open_positions_snapshot,
     resolve_live_option_quote,
@@ -161,7 +162,7 @@ def _add_option_quote(
     )
 
 
-def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> None:
+def test_fresh_pine_marker_preserves_state_across_regular_sessions(monkeypatch) -> None:
     from backend.execution_engine.live_service import _latest_fresh_pine_marker
 
     previous_start = datetime(2026, 6, 17, 14, 0, tzinfo=IST_ZONE)
@@ -229,12 +230,29 @@ def test_fresh_pine_marker_uses_only_current_trading_session(monkeypatch) -> Non
 
     assert marker is not None
     assert marker["text"] == "BUY"
-    assert len(captured_rows) == 60
-    assert {row["ts"].date() for row in captured_rows} == {current_start.date()}
-    assert min(row["ts"] for row in captured_rows).time().isoformat() == "09:15:00"
+    assert len(captured_rows) == 120
+    assert {row["ts"].date() for row in captured_rows} == {
+        previous_start.date(),
+        current_start.date(),
+    }
+    assert all(row["ts"].time().isoformat() >= "09:15:00" for row in captured_rows)
 
 
-def test_pine_marker_calculation_is_ready_after_thirty_closed_candles() -> None:
+def test_pine_rma_matches_tradingview_sma_seed_and_wilder_smoothing() -> None:
+    import pandas as pd
+
+    from backend.execution_engine.live_service import _pine_rma
+
+    result = _pine_rma(pd.Series([1.0, 2.0, 3.0, 4.0, 5.0]), 3)
+
+    assert pd.isna(result.iloc[0])
+    assert pd.isna(result.iloc[1])
+    assert result.iloc[2] == pytest.approx(2.0)
+    assert result.iloc[3] == pytest.approx(8.0 / 3.0)
+    assert result.iloc[4] == pytest.approx(31.0 / 9.0)
+
+
+def test_pine_marker_calculation_uses_twenty_bar_script_warmup() -> None:
     from backend.execution_engine.live_service import _build_pine_chart_overlay
 
     start = datetime(2026, 6, 18, 9, 15, tzinfo=IST_ZONE)
@@ -247,7 +265,7 @@ def test_pine_marker_calculation_is_ready_after_thirty_closed_candles() -> None:
             "close": 24001.0 + index,
             "volume": 100.0,
         }
-        for index in range(30)
+        for index in range(20)
     ]
 
     overlay = _build_pine_chart_overlay(
@@ -258,6 +276,102 @@ def test_pine_marker_calculation_is_ready_after_thirty_closed_candles() -> None:
     )
 
     assert set(overlay) == {"markers", "levels"}
+    assert _build_pine_chart_overlay(
+        rows[:-1],
+        interval="1minute",
+        settings=Settings(),
+        range_key="1d",
+    ) == {"markers": [], "levels": []}
+
+
+def test_pine_overlay_matches_reference_crossover_sequence() -> None:
+    from backend.execution_engine.live_service import _build_pine_chart_overlay
+
+    start = datetime(2026, 6, 15, 9, 15, tzinfo=IST_ZONE)
+    closes = (
+        [100.0] * 25
+        + [100.0 + (3.0 * index) for index in range(1, 11)]
+        + [130.0 - (4.0 * index) for index in range(1, 16)]
+        + [70.0 + (5.0 * index) for index in range(1, 16)]
+    )
+    rows = []
+    for index, close in enumerate(closes):
+        previous_close = closes[index - 1] if index else close
+        rows.append(
+            {
+                "ts": start + timedelta(minutes=index),
+                "open": previous_close,
+                "high": max(previous_close, close) + 1.0,
+                "low": min(previous_close, close) - 1.0,
+                "close": close,
+                "volume": 100.0,
+            }
+        )
+
+    overlay = _build_pine_chart_overlay(
+        rows,
+        interval="1minute",
+        settings=Settings(),
+        range_key="all",
+    )
+
+    assert [(marker["time"], marker["text"]) for marker in overlay["markers"]] == [
+        ("2026-06-15T09:44:00+05:30", "BUY"),
+        ("2026-06-15T09:56:00+05:30", "SELL"),
+        ("2026-06-15T10:12:00+05:30", "BUY"),
+    ]
+    hidden_overlay = _build_pine_chart_overlay(
+        rows,
+        interval="1minute",
+        settings=Settings(PINE_SIGNAL_SHOW_SIGNALS=False),
+        range_key="all",
+    )
+    assert hidden_overlay
+    assert hidden_overlay["markers"] == overlay["markers"]
+
+
+def test_fresh_pine_marker_is_cached_per_closed_instrument_candle(monkeypatch) -> None:
+    from backend.execution_engine.live_service import _PINE_MARKER_CACHE, _latest_fresh_pine_marker
+
+    _PINE_MARKER_CACHE.clear()
+    start = datetime(2026, 6, 18, 9, 15, tzinfo=IST_ZONE)
+    rows = [
+        SimpleNamespace(
+            ts=start + timedelta(minutes=index),
+            open=24000.0,
+            high=24002.0,
+            low=23998.0,
+            close=24001.0,
+            volume=100.0,
+        )
+        for index in range(20)
+    ]
+    calls = 0
+
+    def fake_overlay(_rows, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "markers": [{"time": rows[-1].ts.isoformat(), "text": "BUY"}],
+            "levels": [],
+        }
+
+    monkeypatch.setattr(
+        "backend.execution_engine.live_service._build_pine_chart_overlay",
+        fake_overlay,
+    )
+
+    for _ in range(2):
+        marker = _latest_fresh_pine_marker(
+            rows,
+            settings=Settings(),
+            candle_ts=rows[-1].ts,
+            instrument_key="NSE_INDEX|Nifty 50",
+        )
+        assert marker is not None
+        assert marker["text"] == "BUY"
+
+    assert calls == 1
 
 
 def test_serialize_signal_log_exposes_execution_decision() -> None:
@@ -386,7 +500,7 @@ def test_build_technical_signal_holds_when_vix_too_high(monkeypatch) -> None:
     signal = build_technical_signal(
         fake_db,
         context=context,
-        now=datetime(2026, 4, 21, 11, 16, tzinfo=IST_ZONE),
+        now=datetime(2026, 4, 21, 11, 12, tzinfo=IST_ZONE),
     )
 
     assert signal.action == "HOLD"
@@ -406,18 +520,44 @@ def test_build_technical_signal_holds_during_cooldown(monkeypatch) -> None:
     # Latest signal 6 minutes ago; default cooldown = 12 minutes → 360 s remaining
     fake_db = _FakeDb(
         signal_count=1,
-        latest_signal_ts=datetime(2026, 4, 21, 11, 10, tzinfo=IST_ZONE),
+        latest_signal_ts=datetime(2026, 4, 21, 11, 6, tzinfo=IST_ZONE),
     )
 
     signal = build_technical_signal(
         fake_db,
         context=context,
-        now=datetime(2026, 4, 21, 11, 16, tzinfo=IST_ZONE),
+        now=datetime(2026, 4, 21, 11, 12, tzinfo=IST_ZONE),
     )
 
     assert signal.action == "HOLD"
     assert signal.cooldown_seconds > 0
     assert any("cooldown" in reason.lower() for reason in signal.reasons)
+
+
+def test_build_technical_signal_applies_symbol_adx_profile(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.execution_engine.live_service.get_vix_context",
+        lambda _db: (15.0, 15.0, 1.0),
+    )
+    monkeypatch.setattr(
+        "backend.execution_engine.live_service._latest_fresh_pine_marker",
+        lambda *_args, **_kwargs: {"time": "2026-04-21T11:10:00+05:30", "text": "BUY"},
+    )
+
+    signal = build_technical_signal(
+        _FakeDb(),
+        context=_context(),
+        settings=Settings(
+            _env_file=None,
+            SIGNAL_SYMBOL_PROFILES='{"Nifty 50":{"signal_min_adx":100}}',
+        ),
+        now=datetime(2026, 4, 21, 11, 12, tzinfo=IST_ZONE),
+    )
+
+    assert signal.details["raw_signal"] == "BUY"
+    assert signal.action == "HOLD"
+    assert signal.details["adx_ok"] is False
+    assert any("ADX" in reason for reason in signal.reasons)
 
 
 def test_build_chart_payload_forces_single_one_minute_mode(monkeypatch) -> None:
@@ -450,11 +590,21 @@ def test_build_chart_payload_forces_single_one_minute_mode(monkeypatch) -> None:
                 )
             )
         session.commit()
+        marker_time = start + timedelta(minutes=60)
         monkeypatch.setattr(
             "backend.execution_engine.live_service._build_pine_chart_overlay",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("chart-only marker generation must not run")
-            ),
+            lambda *_args, **_kwargs: {
+                "markers": [
+                    {
+                        "time": marker_time.isoformat(),
+                        "position": "belowBar",
+                        "color": "#16a34a",
+                        "shape": "arrowUp",
+                        "text": "BUY",
+                    }
+                ],
+                "levels": [],
+            },
         )
 
         payload = build_chart_payload(
@@ -473,7 +623,15 @@ def test_build_chart_payload_forces_single_one_minute_mode(monkeypatch) -> None:
         assert payload["is_resampled"] is False
         assert payload["start_date"] == "2026-04-15"
         assert payload["end_date"] == "2026-04-21"
-        assert payload["markers"] == []
+        assert payload["markers"] == [
+            {
+                "time": marker_time.isoformat(),
+                "position": "belowBar",
+                "color": "#16a34a",
+                "shape": "arrowUp",
+                "text": "BUY",
+            }
+        ]
         assert payload["pine_levels"] == []
         assert range_keys == ["recent"]
         assert interval_keys == ["1minute"]
@@ -731,9 +889,10 @@ def test_build_option_selection_uses_best_liquid_nearby_real_strike(monkeypatch)
             session,
             context=_option_context(),
             signal=_option_signal(),
-            settings=Settings(
-                _env_file=None,
-                upstox_access_token="",
+                settings=Settings(
+                    _env_file=None,
+                    execution_mode="live",
+                    upstox_access_token="",
                 option_chain_refresh_seconds=4,
                 option_min_volume=500,
                 option_min_oi=1000,
@@ -1266,7 +1425,10 @@ def test_refresh_open_positions_snapshot_preserves_pnl_when_real_quote_is_unavai
             pnl_value=0.0,
             realized_pnl=0.0,
             unrealized_pnl=0.0,
-            metadata_json={"instrument_key": "NSE_FO|24100CE"},
+                metadata_json={
+                    "execution_mode": "sandbox",
+                    "instrument_key": "NSE_FO|24100CE",
+                },
         )
         session.add(position)
         session.commit()
@@ -1324,7 +1486,10 @@ def test_refresh_open_positions_snapshot_does_not_mark_non_positive_quote() -> N
             pnl_value=500.0,
             realized_pnl=0.0,
             unrealized_pnl=500.0,
-            metadata_json={"instrument_key": "NSE_FO|24100CE"},
+                metadata_json={
+                    "execution_mode": "sandbox",
+                    "instrument_key": "NSE_FO|24100CE",
+                },
         )
         session.add(position)
         _add_option_quote(
@@ -1389,7 +1554,10 @@ def test_refresh_open_positions_snapshot_uses_fresh_real_quote() -> None:
             pnl_value=0.0,
             realized_pnl=0.0,
             unrealized_pnl=0.0,
-            metadata_json={"instrument_key": "NSE_FO|24100CE"},
+                metadata_json={
+                    "execution_mode": "sandbox",
+                    "instrument_key": "NSE_FO|24100CE",
+                },
         )
         session.add(position)
         _add_option_quote(
@@ -1430,7 +1598,7 @@ def test_refresh_open_positions_snapshot_uses_fresh_real_quote() -> None:
         session.close()
 
 
-def test_compute_paper_portfolio_metrics_derives_balance_from_open_and_closed_positions() -> None:
+def test_compute_sandbox_portfolio_metrics_derives_balance_from_open_and_closed_positions() -> None:
     engine = create_engine(
         "sqlite:///:memory:",
         future=True,
@@ -1458,7 +1626,7 @@ def test_compute_paper_portfolio_metrics_derives_balance_from_open_and_closed_po
                 trailing_stop=0.0,
                 current_premium=110.0,
                 unrealized_pnl=500.0,
-                metadata_json={"latest_quote_status": "unavailable"},
+                metadata_json={"execution_mode": "sandbox", "latest_quote_status": "unavailable"},
             )
         )
         session.add(
@@ -1479,12 +1647,33 @@ def test_compute_paper_portfolio_metrics_derives_balance_from_open_and_closed_po
                 trailing_stop=0.0,
                 exit_premium=220.0,
                 realized_pnl=500.0,
-                metadata_json={},
+                metadata_json={"execution_mode": "sandbox"},
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                trade_date=datetime(2026, 5, 2, tzinfo=IST_ZONE).date(),
+                symbol="SENSEX",
+                interval="1minute",
+                strategy_name="archived",
+                option_type="CE",
+                side="BUY",
+                expiry_date=datetime(2026, 5, 6, tzinfo=IST_ZONE).date(),
+                strike=80000.0,
+                quantity=20,
+                status="CLOSED",
+                entry_price=100.0,
+                entry_premium=100.0,
+                stop_loss=80.0,
+                trailing_stop=0.0,
+                exit_premium=200.0,
+                realized_pnl=2000.0,
+                metadata_json={"execution_mode": "paper"},
             )
         )
         session.commit()
 
-        metrics = compute_paper_portfolio_metrics(session, settings=Settings(execution_capital=100000.0))
+        metrics = compute_sandbox_portfolio_metrics(session, settings=Settings(execution_capital=100000.0))
 
         assert metrics["starting_balance"] == 100000.0
         assert metrics["invested_amount"] == 5000.0

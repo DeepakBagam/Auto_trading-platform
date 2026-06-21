@@ -2417,7 +2417,7 @@ function TradesTable({ rows }) {
   );
 }
 
-function PortfolioCard({ mode, portfolio, onResetPaper, onRefresh, busy }) {
+function PortfolioCard({ mode, portfolio, onResetSandbox, onRefresh, onResolveReview, busy }) {
   const summary = portfolio?.summary || {};
   const positions = portfolio?.positions || [];
   const livePositions = portfolio?.positions || [];
@@ -2428,16 +2428,16 @@ function PortfolioCard({ mode, portfolio, onResetPaper, onRefresh, busy }) {
     <article className="panel">
       <div className="panel-head">
         <div>
-          <h2>{mode === "live" ? "Upstox Portfolio" : "Paper Portfolio"}</h2>
+          <h2>{mode === "live" ? "Upstox Portfolio" : "Sandbox Portfolio"}</h2>
         </div>
         <div className="button-row">
           <button type="button" className="secondary-button" disabled={busy} onClick={onRefresh}>Refresh portfolio</button>
-          {mode === "paper" ? (
-            <button type="button" className="secondary-button" disabled={busy} onClick={onResetPaper}>Reset paper capital</button>
+          {mode === "sandbox" ? (
+            <button type="button" className="secondary-button" disabled={busy} onClick={onResetSandbox}>Reset sandbox capital</button>
           ) : null}
         </div>
       </div>
-      {mode === "paper" ? (
+      {mode === "sandbox" ? (
         <div className="info-grid">
           <div className="info-tile"><span>Available</span><strong>{formatMoney(summary.available_balance)}</strong></div>
           <div className="info-tile"><span>Invested</span><strong>{formatMoney(summary.invested_amount)}</strong></div>
@@ -2453,7 +2453,7 @@ function PortfolioCard({ mode, portfolio, onResetPaper, onRefresh, busy }) {
         </div>
       )}
       {!rows.length ? (
-        <div className="empty-state">{mode === "live" ? "No live broker positions." : "No paper positions."}</div>
+        <div className="empty-state">{mode === "live" ? "No live broker positions." : "No sandbox positions."}</div>
       ) : (
         <div className="table-shell compact-table">
           <table>
@@ -2465,6 +2465,7 @@ function PortfolioCard({ mode, portfolio, onResetPaper, onRefresh, busy }) {
                 <th>Last</th>
                 <th>Quote</th>
                 <th>P&amp;L</th>
+                {mode === "sandbox" ? <th>Broker</th> : null}
               </tr>
             </thead>
             <tbody>
@@ -2480,6 +2481,20 @@ function PortfolioCard({ mode, portfolio, onResetPaper, onRefresh, busy }) {
                   <td className={Number(row.pnl || row.unrealized_pnl || 0) >= 0 ? "positive" : "negative"}>
                     {formatSignedMoney(row.pnl || row.unrealized_pnl || 0)}
                   </td>
+                  {mode === "sandbox" ? (
+                    <td>
+                      {String(row.status || "").toUpperCase() === "MANUAL_REVIEW" ? (
+                        <div className="button-row">
+                          <button type="button" className="line-button" disabled={busy} onClick={() => onResolveReview?.(row, "accept")}>Accept</button>
+                          <button type="button" className="line-button" disabled={busy} onClick={() => onResolveReview?.(row, "discard")}>Discard</button>
+                        </div>
+                      ) : (
+                        <span title={row.metadata?.broker_sl_order_id || row.entry_order_id || ""}>
+                          {row.metadata?.broker_sl_order_status || row.metadata?.entry_order_status || row.status || "-"}
+                        </span>
+                      )}
+                    </td>
+                  ) : null}
                 </tr>
               ))}
             </tbody>
@@ -2503,7 +2518,7 @@ function RiskControlsCard({ execution, stats }) {
           <h2>Risk Controls</h2>
         </div>
         <span className={`tag ${execution?.mode === "live" ? "sell" : "hold"}`}>
-          {execution?.mode || "paper"}
+          {execution?.mode || "sandbox"}
         </span>
       </div>
 
@@ -2538,6 +2553,7 @@ const SETTINGS_PERCENT_FIELDS = new Set([
   "tsl_activation_percent",
   "tsl_trail_percent",
   "target_profit_percent",
+  "sandbox_limit_protection_pct",
 ]);
 
 function settingsToDraft(settings = {}) {
@@ -2545,6 +2561,7 @@ function settingsToDraft(settings = {}) {
     execution_enabled: Boolean(settings.execution_enabled),
     execution_symbols: Array.isArray(settings.execution_symbols) ? settings.execution_symbols : [],
     upstox_access_token: "",
+    upstox_sandbox_access_token: "",
     smtp_password: "",
   };
   [
@@ -2566,6 +2583,10 @@ function settingsToDraft(settings = {}) {
     "signal_min_score",
     "signal_cooldown_minutes",
     "signal_max_per_day",
+    "signal_min_adx",
+    "signal_symbol_profiles",
+    "sandbox_limit_protection_pct",
+    "sandbox_price_tick",
     "smtp_enabled",
     "smtp_host",
     "smtp_port",
@@ -2601,6 +2622,8 @@ function settingsDraftPayload(draft = {}) {
     "tsl_trail_percent",
     "target_profit_percent",
     "signal_min_score",
+    "signal_min_adx",
+    "sandbox_limit_protection_pct",
   ].forEach((key) => {
     const raw = payload[key];
     if (raw === "" || raw === null || raw === undefined) {
@@ -2627,6 +2650,9 @@ function settingsDraftPayload(draft = {}) {
   });
   if (!String(payload.upstox_access_token || "").trim()) {
     delete payload.upstox_access_token;
+  }
+  if (!String(payload.upstox_sandbox_access_token || "").trim()) {
+    delete payload.upstox_sandbox_access_token;
   }
   if (!String(payload.smtp_password || "").trim()) {
     delete payload.smtp_password;
@@ -2675,6 +2701,7 @@ function SettingsWindow({
   loading,
   saving,
   testingToken,
+  testingSandbox,
   testingSmtp,
   notice,
   onDraftChange,
@@ -2682,6 +2709,8 @@ function SettingsWindow({
   onSave,
   onReload,
   onTestToken,
+  onTestSandbox,
+  onTestSandboxOrder,
   onTestSmtp,
 }) {
   if (loading && !draft) {
@@ -2705,7 +2734,7 @@ function SettingsWindow({
             <h2>Settings</h2>
           </div>
           <div className="button-row">
-            <span className={`tag ${brokerStatus === "ok" || brokerStatus === "paper" ? "buy" : "sell"}`}>
+            <span className={`tag ${brokerStatus === "ok" || brokerStatus === "sandbox" ? "buy" : "sell"}`}>
               Broker {brokerStatus}
             </span>
             <button type="button" className="secondary-button" disabled={loading || saving} onClick={onReload}>
@@ -2769,6 +2798,38 @@ function SettingsWindow({
           </div>
         </article>
 
+        <article className="panel settings-card settings-wide">
+          <div className="panel-head">
+            <div>
+              <h2>Sandbox Orders</h2>
+            </div>
+            <div className="button-row">
+              <span className={`tag ${settings.upstox_sandbox_token_present ? "buy" : "sell"}`}>
+                {settings.upstox_sandbox_token_present ? "Token saved" : "Token missing"}
+              </span>
+              <button type="button" className="secondary-button" disabled={testingSandbox || saving || !settings.upstox_sandbox_token_present} onClick={onTestSandbox}>
+                <span className="material-symbols-outlined" aria-hidden="true">verified_user</span>
+                {testingSandbox ? "Checking" : "Check Setup"}
+              </button>
+              <button type="button" className="secondary-button" disabled={testingSandbox || saving || !settings.upstox_sandbox_token_present} onClick={onTestSandboxOrder}>
+                <span className="material-symbols-outlined" aria-hidden="true">receipt_long</span>
+                Test Order
+              </button>
+            </div>
+          </div>
+          <SettingsField label="Upstox Sandbox Token">
+            <textarea className="settings-textarea" value={settingsInputValue(draft, "upstox_sandbox_access_token")} onChange={(event) => update("upstox_sandbox_access_token", event.target.value)} placeholder={settings.upstox_sandbox_token_masked || "Paste sandbox token"} />
+          </SettingsField>
+          <div className="settings-form-grid">
+            <SettingsField label="Limit Protection %" defaultText={formatDefaultValue(defaults, "sandbox_limit_protection_pct", "percent")}>
+              <input className="select" type="number" min="0" max="20" step="0.1" value={settingsInputValue(draft, "sandbox_limit_protection_pct")} onChange={(event) => update("sandbox_limit_protection_pct", event.target.value)} />
+            </SettingsField>
+            <SettingsField label="Price Tick" defaultText={formatDefaultValue(defaults, "sandbox_price_tick")}>
+              <input className="select" type="number" min="0.01" step="0.01" value={settingsInputValue(draft, "sandbox_price_tick")} onChange={(event) => update("sandbox_price_tick", event.target.value)} />
+            </SettingsField>
+          </div>
+        </article>
+
         <article className="panel settings-card">
           <div className="panel-head">
             <div>
@@ -2820,7 +2881,13 @@ function SettingsWindow({
             <SettingsField label="Successful Trades / Symbol" defaultText={formatDefaultValue(defaults, "signal_max_per_day")}>
               <input className="select" type="number" min="1" value={settingsInputValue(draft, "signal_max_per_day")} onChange={(event) => update("signal_max_per_day", event.target.value)} />
             </SettingsField>
+            <SettingsField label="Minimum ADX" defaultText={formatDefaultValue(defaults, "signal_min_adx")}>
+              <input className="select" type="number" min="0" step="0.5" value={settingsInputValue(draft, "signal_min_adx")} onChange={(event) => update("signal_min_adx", event.target.value)} />
+            </SettingsField>
           </div>
+          <SettingsField label="Per-symbol signal profiles">
+            <textarea className="settings-textarea" value={settingsInputValue(draft, "signal_symbol_profiles")} onChange={(event) => update("signal_symbol_profiles", event.target.value)} placeholder='{"Bank Nifty":{"signal_min_adx":18}}' />
+          </SettingsField>
         </article>
 
         <article className="panel settings-card settings-wide">
@@ -3276,7 +3343,7 @@ function App() {
   const [error, setError] = useState("");
   const [streamState, setStreamState] = useState("connecting");
   const [busy, setBusy] = useState(false);
-  const [runtimeMode, setRuntimeMode] = useState("paper");
+  const [runtimeMode, setRuntimeMode] = useState("sandbox");
   const [brokerHealth, setBrokerHealth] = useState(null);
   const [bootstrapped, setBootstrapped] = useState(false);
   const [activeView, setActiveView] = useState("overview");
@@ -3292,6 +3359,7 @@ function App() {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [upstoxTesting, setUpstoxTesting] = useState(false);
+  const [sandboxTesting, setSandboxTesting] = useState(false);
   const [smtpTesting, setSmtpTesting] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
   const chartCacheRef = useRef(new Map());
@@ -3356,11 +3424,11 @@ function App() {
         if (cancelled) {
           return;
         }
-        setRuntimeMode(payload.mode || "paper");
+        setRuntimeMode(payload.mode || "sandbox");
         setBrokerHealth(payload.broker || null);
       } catch (_loadError) {
         if (!cancelled) {
-          setRuntimeMode("paper");
+          setRuntimeMode("sandbox");
           setBrokerHealth(null);
         }
       }
@@ -3598,10 +3666,10 @@ function App() {
   const signal = selectedSnapshot.signal || {};
   const execution = {
     ...(selectedSnapshot.execution || {}),
-    mode: runtimeMode || selectedSnapshot.execution?.mode || "paper",
+    mode: runtimeMode || selectedSnapshot.execution?.mode || "sandbox",
     broker: brokerHealth || selectedSnapshot.execution?.broker,
   };
-  const brokerStatus = execution.broker?.status || (execution.mode === "live" ? "unknown" : "paper");
+  const brokerStatus = execution.broker?.status || (execution.mode === "live" ? "unknown" : "sandbox");
   const calendar = selectedSnapshot.calendar || {};
   const history = selectedSnapshot.history || {};
   const stream = selectedSnapshot.stream || {};
@@ -3811,6 +3879,81 @@ function App() {
     }
   }
 
+  async function testSandboxTokenSettings() {
+    setSandboxTesting(true);
+    try {
+      const data = await apiFetch("/execution/settings/test-sandbox-token", { method: "POST" });
+      applySettingsPayload(data);
+      setSettingsNotice(`Sandbox token ready at ${data?.sandbox_test?.host || "Upstox sandbox"}.`);
+    } catch (testError) {
+      setError(testError.message || "Unable to test Upstox sandbox token.");
+    } finally {
+      setSandboxTesting(false);
+    }
+  }
+
+  async function testSandboxOrder() {
+    const optionSignal = option?.signal || {};
+    const instrumentKey = optionSignal.instrument_key;
+    const referencePrice = Number(optionSignal.entry_price || optionSignal.ltp || 0);
+    if (!instrumentKey || !option?.expiry_date || !optionSignal.strike || !optionSignal.option_type || referencePrice <= 0) {
+      setError("Select a live option contract with a current quote before testing a sandbox order.");
+      return;
+    }
+    if (!window.confirm("Place and immediately cancel one Upstox sandbox test order?")) {
+      return;
+    }
+    setSandboxTesting(true);
+    try {
+      const data = await apiFetch("/execution/sandbox/test-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: option.symbol || signal.symbol || symbol,
+          instrument_key: instrumentKey,
+          option_type: optionSignal.option_type,
+          strike: optionSignal.strike,
+          expiry_date: option.expiry_date,
+          reference_price: referencePrice,
+        }),
+      });
+      setSettingsNotice(`Sandbox order ${data.order_id || "-"}: ${data.place_status}; cancel ${data.cancel_status}.`);
+    } catch (testError) {
+      setError(testError.message || "Unable to complete sandbox test order.");
+    } finally {
+      setSandboxTesting(false);
+    }
+  }
+
+  async function resolveSandboxReview(row, action) {
+    const positionId = row?.position_id;
+    if (!positionId) {
+      return;
+    }
+    let sandboxOrderId = null;
+    if (action === "accept") {
+      sandboxOrderId = window.prompt("Enter the confirmed Upstox sandbox order ID");
+      if (!sandboxOrderId) {
+        return;
+      }
+    } else if (!window.confirm("Discard this ambiguous sandbox operation after confirming no order exists?")) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await apiFetch(`/execution/sandbox/manual-review/${positionId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, sandbox_order_id: sandboxOrderId }),
+      });
+      await Promise.all([refreshSnapshot(), refreshPortfolio(), refreshTradeHistory()]);
+    } catch (actionError) {
+      setError(actionError.message || "Unable to resolve sandbox manual review.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function refreshChart() {
     const data = await fetchChartPayload(symbol);
     chartCacheRef.current.set(chartCacheKey(symbol, chartRange, chartInterval), data);
@@ -3851,21 +3994,21 @@ function App() {
     }
   }
 
-  async function resetPaperCapital() {
-    const nextBalance = window.prompt("Reset paper capital to amount", String(snapshot?.stats?.paper_starting_balance || 500000));
+  async function resetSandboxCapital() {
+    const nextBalance = window.prompt("Reset sandbox capital to amount", String(snapshot?.stats?.sandbox_starting_balance || 500000));
     if (!nextBalance) {
       return;
     }
     setBusy(true);
     try {
-      await apiFetch("/execution/paper/reset", {
+      await apiFetch("/execution/sandbox/reset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ starting_balance: Number(nextBalance), clear_open_positions: true }),
+        body: JSON.stringify({ starting_balance: Number(nextBalance) }),
       });
       await Promise.all([refreshSnapshot(), refreshPortfolio(), refreshTradeHistory()]);
     } catch (actionError) {
-      setError(actionError.message || "Unable to reset paper capital.");
+      setError(actionError.message || "Unable to reset sandbox capital.");
     } finally {
       setBusy(false);
     }
@@ -4185,11 +4328,11 @@ function App() {
               <div className="mode-toggle">
                 <button
                   type="button"
-                  className={`toggle-button ${execution.mode === "paper" ? "active" : ""}`}
+                  className={`toggle-button ${execution.mode === "sandbox" ? "active" : ""}`}
                   disabled={busy}
-                  onClick={() => updateMode("paper")}
+                  onClick={() => updateMode("sandbox")}
                 >
-                  Paper
+                  Sandbox
                 </button>
                 <button
                   type="button"
@@ -4368,9 +4511,10 @@ function App() {
         {activeView === "operations" ? (
           <section className="support-grid operations-screen">
             <PortfolioCard
-              mode={execution.mode || "paper"}
+              mode={execution.mode || "sandbox"}
               portfolio={portfolio}
-              onResetPaper={resetPaperCapital}
+              onResetSandbox={resetSandboxCapital}
+              onResolveReview={resolveSandboxReview}
               onRefresh={refreshPortfolio}
               busy={busy || portfolioLoading}
             />
@@ -4382,7 +4526,7 @@ function App() {
 
         {activeView === "positions" ? (
           <section>
-            <PositionTracker symbol={symbol} mode={execution.mode || "paper"} />
+            <PositionTracker symbol={symbol} mode={execution.mode || "sandbox"} />
           </section>
         ) : null}
 
@@ -4421,6 +4565,7 @@ function App() {
             loading={settingsLoading}
             saving={settingsSaving}
             testingToken={upstoxTesting}
+            testingSandbox={sandboxTesting}
             testingSmtp={smtpTesting}
             notice={settingsNotice}
             onDraftChange={updateSettingsDraft}
@@ -4428,6 +4573,8 @@ function App() {
             onSave={saveRuntimeSettings}
             onReload={() => loadRuntimeSettings(true)}
             onTestToken={testUpstoxTokenSettings}
+            onTestSandbox={testSandboxTokenSettings}
+            onTestSandboxOrder={testSandboxOrder}
             onTestSmtp={testSmtpSettings}
           />
         ) : null}

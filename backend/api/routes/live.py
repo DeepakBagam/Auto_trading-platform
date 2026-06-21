@@ -15,7 +15,7 @@ from backend.execution_engine.live_service import (
     build_chart_payload,
     build_live_price_update,
     build_live_snapshot,
-    compute_paper_portfolio_metrics,
+    compute_sandbox_portfolio_metrics,
     default_symbol,
     list_symbols,
     load_market_context,
@@ -557,5 +557,5 @@ def dashboard_state(db: Session = Depends(get_db_session)) -> dict:
     settings = _runtime_settings(db)
     return {
         "mode": get_runtime_trading_mode(db, settings=settings),
-        "paper": compute_paper_portfolio_metrics(db, settings=settings),
+        "sandbox": compute_sandbox_portfolio_metrics(db, settings=settings),
     }
