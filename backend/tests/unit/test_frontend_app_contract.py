@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 APP_JS = Path(__file__).parents[3] / "frontend" / "web" / "app.js"
+OPTION_CHAIN_JS = Path(__file__).parents[3] / "frontend" / "web" / "OptionChain.js"
 
 
 def _run_helper_expression(expression: str):
@@ -113,3 +114,12 @@ def test_execution_ui_exposes_sandbox_and_live_without_paper_mode() -> None:
     assert 'updateMode("paper")' not in source
     assert "Paper Portfolio" not in source
     assert "/execution/paper/reset" not in source
+
+
+def test_option_chain_auto_refreshes_live_quotes_without_browser_reload() -> None:
+    source = OPTION_CHAIN_JS.read_text(encoding="utf-8")
+
+    assert "const AUTO_REFRESH_MS = 1000;" in source
+    assert "fetchChain(false, true)" in source
+    assert "cache: 'no-store'" in source
+    assert "document.visibilityState !== 'visible'" in source

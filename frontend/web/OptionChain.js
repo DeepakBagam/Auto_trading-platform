@@ -2,16 +2,18 @@
 // Upstox-style layout with CE/PE side-by-side
 
 const OptionChain = ({ symbol, onInspectContract }) => {
+  const AUTO_REFRESH_MS = 1000;
   const [chainData, setChainData] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [selectedStrike, setSelectedStrike] = React.useState(null);
   const [expiryDate, setExpiryDate] = React.useState(null);
   const inFlightRef = React.useRef(false);
+  const mountedRef = React.useRef(true);
 
   // Fetch option chain data
   const fetchChain = async (showLoader = false, forceRefresh = false) => {
-    if (inFlightRef.current) {
+    if (inFlightRef.current || (!showLoader && document.visibilityState !== 'visible')) {
       return;
     }
     try {
@@ -26,26 +28,42 @@ const OptionChain = ({ symbol, onInspectContract }) => {
       });
       if (expiryDate) params.append('expiry', expiryDate);
       
-      const response = await fetch(`/api/live/option-chain?${params}`);
+      const response = await fetch(`/api/live/option-chain?${params}`, {
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      });
       if (!response.ok) {
         throw new Error(`Option chain request failed: ${response.status}`);
       }
       const data = await response.json();
-      setChainData(data);
-      setError("");
+      if (mountedRef.current) {
+        setChainData(data);
+        setError("");
+      }
     } catch (error) {
       console.error('Failed to fetch option chain:', error);
-      setError(error.message || 'Failed to load option chain');
+      if (mountedRef.current) {
+        setError(error.message || 'Failed to load option chain');
+      }
     } finally {
       inFlightRef.current = false;
-      setLoading(false);
+      if (mountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   React.useEffect(() => {
-    fetchChain(true);
-    const interval = setInterval(() => fetchChain(false), 15000);
-    return () => clearInterval(interval);
+    mountedRef.current = true;
+    fetchChain(true, true);
+    const refreshVisibleChain = () => fetchChain(false, true);
+    const interval = window.setInterval(refreshVisibleChain, AUTO_REFRESH_MS);
+    document.addEventListener('visibilitychange', refreshVisibleChain);
+    return () => {
+      mountedRef.current = false;
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', refreshVisibleChain);
+    };
   }, [symbol, expiryDate]);
 
   if (loading && !chainData) {
