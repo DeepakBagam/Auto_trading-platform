@@ -5,7 +5,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any, Callable
 
 from sqlalchemy import select
@@ -60,6 +60,7 @@ class UpstoxMarketStream:
         self.session_factory = session_factory or SessionLocal
         self._lock = Lock()
         self._stop_event = Event()
+        self._disconnect_timeout_seconds = 2.0
         self._bars: dict[str, _MinuteBarState] = {}
         self._pending_candles: list[CandleRecord] = []
         self._pending_order_books: list[dict[str, Any]] = []
@@ -120,12 +121,26 @@ class UpstoxMarketStream:
         self.streamer.connect()
 
     def stop(self) -> None:
+        if self._stop_event.is_set():
+            return
         self._stop_event.set()
         self.flush_closed_candles(datetime.now(IST_ZONE), force=True)
-        try:
-            self.streamer.disconnect()
-        except Exception:
-            logger.exception("Failed to disconnect websocket streamer cleanly")
+        disconnected = Event()
+
+        def disconnect() -> None:
+            try:
+                self.streamer.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect websocket streamer cleanly")
+            finally:
+                disconnected.set()
+
+        Thread(target=disconnect, name="upstox-stream-disconnect", daemon=True).start()
+        if not disconnected.wait(timeout=self._disconnect_timeout_seconds):
+            logger.warning(
+                "Upstox websocket disconnect exceeded %.1fs; continuing shutdown",
+                self._disconnect_timeout_seconds,
+            )
 
     def run_forever(self) -> None:
         self.start()

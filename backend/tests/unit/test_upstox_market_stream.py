@@ -1,4 +1,5 @@
 from datetime import datetime
+from threading import Event
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine, func, select
@@ -31,6 +32,16 @@ class _FakeStreamer:
 
     def disconnect(self):
         return None
+
+
+class _BlockingDisconnectStreamer(_FakeStreamer):
+    def __init__(self) -> None:
+        self.release = Event()
+        self.finished = Event()
+
+    def disconnect(self):
+        self.release.wait(timeout=5)
+        self.finished.set()
 
 
 def test_stream_upserts_current_minute_candle_on_each_tick() -> None:
@@ -135,3 +146,27 @@ def test_stream_batches_database_flushes_to_once_per_second(monkeypatch) -> None
         )
 
     assert [row["received_ns"] for row in flushes] == [1, 3]
+
+
+def test_stream_stop_does_not_block_on_sdk_disconnect(monkeypatch) -> None:
+    fake = _BlockingDisconnectStreamer()
+    stream = UpstoxMarketStream(
+        settings=SimpleNamespace(
+            upstox_websocket_mode="full",
+            upstox_websocket_reconnect_interval_seconds=5,
+            upstox_websocket_retry_count=5,
+            instrument_keys=["NSE_INDEX|Nifty 50"],
+        ),
+        streamer=fake,
+    )
+    stream._disconnect_timeout_seconds = 0.01
+    monkeypatch.setattr(stream, "flush_closed_candles", lambda *_args, **_kwargs: None)
+
+    stream.stop()
+    stream.stop()
+
+    assert not fake.finished.is_set()
+    assert stream._stop_event.is_set()
+
+    fake.release.set()
+    assert fake.finished.wait(timeout=1)
