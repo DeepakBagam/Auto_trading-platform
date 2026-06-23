@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 import upstox_client
@@ -373,11 +374,29 @@ class UpstoxSandboxBroker(BaseBroker):
     """Order-only adapter pinned to the Upstox sandbox host."""
 
     broker_name = "upstox_sandbox"
+    SANDBOX_ORDER_HOST = "https://api-sandbox.upstox.com"
 
     def __init__(self, *, access_token: str) -> None:
         configuration = upstox_client.Configuration(sandbox=True)
+        # Some older SDK builds accept sandbox=True without applying the
+        # sandbox hosts. Keep both endpoints hard-coded and non-configurable.
+        configuration.sandbox = True
+        configuration.host = self.SANDBOX_ORDER_HOST
+        configuration.order_host = self.SANDBOX_ORDER_HOST
         configuration.access_token = str(access_token or "").strip()
-        if configuration.order_host != "https://api-sandbox.upstox.com":
+        configured_hosts = {
+            str(getattr(configuration, "host", "") or "").rstrip("/"),
+            str(getattr(configuration, "order_host", "") or "").rstrip("/"),
+        }
+        if configured_hosts != {self.SANDBOX_ORDER_HOST} or any(
+            urlsplit(host).scheme != "https"
+            or urlsplit(host).hostname != "api-sandbox.upstox.com"
+            or urlsplit(host).port is not None
+            or urlsplit(host).path not in {"", "/"}
+            or urlsplit(host).query
+            or urlsplit(host).fragment
+            for host in configured_hosts
+        ):
             raise RuntimeError("Unsafe Upstox sandbox order host")
         self.configuration = configuration
         self.api_client = upstox_client.ApiClient(configuration)

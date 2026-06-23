@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import upstox_client
+
 from backend.execution_engine.broker import BrokerOrderRequest, UpstoxSandboxBroker
 from backend.utils.config import (
     Settings,
@@ -58,6 +60,25 @@ def test_sandbox_broker_is_pinned_to_upstox_sandbox_and_maps_product() -> None:
     assert response.order_id == "SANDBOX-1"
     assert fake.placed[0].product == "I"
     assert fake.placed[0].instrument_token == "NSE_FO|12345"
+
+
+def test_sandbox_broker_repins_hosts_when_sdk_ignores_sandbox_flag(monkeypatch) -> None:
+    real_configuration = upstox_client.Configuration
+
+    def legacy_configuration(*_args, **_kwargs):
+        configuration = real_configuration()
+        configuration.sandbox = False
+        configuration.host = "https://api.upstox.com"
+        configuration.order_host = "https://api-hft.upstox.com"
+        return configuration
+
+    monkeypatch.setattr(upstox_client, "Configuration", legacy_configuration)
+
+    broker = UpstoxSandboxBroker(access_token="sandbox-token")
+
+    assert broker.configuration.sandbox is True
+    assert broker.configuration.host == "https://api-sandbox.upstox.com"
+    assert broker.configuration.order_host == "https://api-sandbox.upstox.com"
 
 
 def test_sandbox_broker_modify_and_cancel_use_v3_adapter_contract() -> None:
