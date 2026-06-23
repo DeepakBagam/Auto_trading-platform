@@ -20,7 +20,6 @@ from backend.execution_engine.live_service import (
     _position_matches_mode,
     _serialize_position,
     compute_sandbox_portfolio_metrics,
-    list_symbols,
     resolve_underlying_key,
 )
 from backend.data_layer.instrument_metadata import resolve_option_contract_metadata
@@ -42,7 +41,7 @@ from backend.utils.config import (
 )
 from backend.utils.constants import IST_ZONE
 from backend.utils.notifications import send_email_message_result, smtp_ready
-from backend.utils.symbols import is_option_execution_symbol
+from backend.utils.symbols import canonical_symbol_name, is_option_execution_symbol, sort_display_symbols
 
 router = APIRouter(prefix="/execution", tags=["execution"])
 
@@ -213,6 +212,18 @@ def _settings_payload(db: Session) -> dict:
     token = read_runtime_upstox_access_token(settings)
     sandbox_token = read_runtime_upstox_sandbox_access_token(settings)
     defaults = Settings(_env_file=None)
+    available_symbols = sort_display_symbols(
+        [
+            canonical_symbol_name(symbol)
+            for symbol in [
+                *settings.execution_symbol_list,
+                "Nifty 50",
+                "Bank Nifty",
+                "SENSEX",
+            ]
+            if is_option_execution_symbol(symbol)
+        ]
+    )
     return {
         "settings": _serializable_settings(
             settings,
@@ -221,13 +232,31 @@ def _settings_payload(db: Session) -> dict:
             sandbox_token=sandbox_token,
         ),
         "defaults": _serializable_settings(defaults),
-        "available_symbols": [
-            symbol
-            for symbol in list_symbols(db, settings=settings)
-            if is_option_execution_symbol(symbol)
-        ],
+        "available_symbols": available_symbols,
         "runtime_keys": sorted(runtime.keys()),
     }
+
+
+def configured_broker_status(settings: Settings, mode: str) -> dict:
+    normalized_mode = str(mode or "sandbox").lower()
+    sandbox = normalized_mode == "sandbox"
+    token_present = bool(
+        read_runtime_upstox_sandbox_access_token(settings)
+        if sandbox
+        else read_runtime_upstox_access_token(settings)
+    )
+    out = {
+        "broker": "upstox_sandbox" if sandbox else "upstox",
+        "token_present": token_present,
+        "status": "sandbox" if sandbox and token_present else ("ok" if token_present else "error"),
+        "errors": [],
+    }
+    if not token_present:
+        token_name = "UPSTOX_SANDBOX_ACCESS_TOKEN" if sandbox else "UPSTOX_ACCESS_TOKEN"
+        out["errors"] = [{"source": "token", "message": f"{token_name} is missing"}]
+    if sandbox:
+        out["host"] = "https://api-sandbox.upstox.com"
+    return out
 
 
 def broker_health(engine: IntradayOptionsExecutionEngine) -> dict:
@@ -307,8 +336,15 @@ def _check_upstox_profile(settings: Settings, token: str) -> dict:
 
 @router.get("/settings")
 def get_runtime_settings(db: Session = Depends(get_db)) -> dict:
-    engine = get_runtime_engine(db)
-    return {**_settings_payload(db), "mode": get_runtime_trading_mode(db, settings=engine.settings), "broker": broker_health(engine)}
+    settings = get_settings().model_copy()
+    apply_runtime_execution_settings(db, settings)
+    mode = get_runtime_trading_mode(db, settings=settings)
+    settings.execution_mode = mode
+    return {
+        **_settings_payload(db),
+        "mode": mode,
+        "broker": configured_broker_status(settings, mode),
+    }
 
 
 @router.put("/settings")
@@ -708,11 +744,10 @@ def delete_position(position_id: int, db: Session = Depends(get_db)) -> dict:
 
 @router.get("/mode")
 def get_mode(db: Session = Depends(get_db)) -> dict:
-    engine = get_runtime_engine(db)
-    mode = get_runtime_trading_mode(db, settings=engine.settings)
-    engine.settings.execution_mode = mode
-    engine.broker = engine._build_broker()
-    return {"mode": mode, "broker": broker_health(engine)}
+    settings = get_settings().model_copy()
+    apply_runtime_execution_settings(db, settings)
+    mode = get_runtime_trading_mode(db, settings=settings)
+    return {"mode": mode, "broker": configured_broker_status(settings, mode)}
 
 
 @router.post("/mode")

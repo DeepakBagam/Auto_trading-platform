@@ -3087,6 +3087,7 @@ function TradeHistoryDashboard({ historyData, strategyRows, filters, onFilterCha
 }
 
 function ContractChartModal({ contract, onClose }) {
+  const STRIKE_CHART_REFRESH_MS = 4000;
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -3097,16 +3098,23 @@ function ContractChartModal({ contract, onClose }) {
       return;
     }
     let active = true;
-    async function load() {
-      setLoading(true);
-      setError("");
+    let inFlight = false;
+    async function load(showLoader = false) {
+      if (inFlight || (!showLoader && document.visibilityState !== "visible")) {
+        return;
+      }
+      inFlight = true;
+      if (showLoader) {
+        setLoading(true);
+        setError("");
+      }
       try {
         const params = new URLSearchParams({
           symbol: contract.symbol,
           expiry: contract.expiry,
           strike: String(contract.strike),
           option_type: contract.optionType,
-          limit: "5000",
+          limit: "2000",
           include_previous: "false",
           refresh: "false",
           include_live: "false",
@@ -3136,14 +3144,20 @@ function ContractChartModal({ contract, onClose }) {
           setError(loadError.message || "Unable to load strike chart.");
         }
       } finally {
+        inFlight = false;
         if (active) {
           setLoading(false);
         }
       }
     }
-    load();
+    load(true);
+    const refreshVisibleChart = () => load(false);
+    const interval = window.setInterval(refreshVisibleChart, STRIKE_CHART_REFRESH_MS);
+    document.addEventListener("visibilitychange", refreshVisibleChart);
     return () => {
       active = false;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", refreshVisibleChart);
     };
   }, [contract]);
 

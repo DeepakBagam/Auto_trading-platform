@@ -55,8 +55,8 @@ const OptionChain = ({ symbol, onInspectContract }) => {
 
   React.useEffect(() => {
     mountedRef.current = true;
-    fetchChain(true, true);
-    const refreshVisibleChain = () => fetchChain(false, true);
+    fetchChain(true, false);
+    const refreshVisibleChain = () => fetchChain(false, false);
     const interval = window.setInterval(refreshVisibleChain, AUTO_REFRESH_MS);
     document.addEventListener('visibilitychange', refreshVisibleChain);
     return () => {

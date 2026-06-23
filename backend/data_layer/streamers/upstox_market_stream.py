@@ -63,6 +63,8 @@ class UpstoxMarketStream:
         self._bars: dict[str, _MinuteBarState] = {}
         self._pending_candles: list[CandleRecord] = []
         self._pending_order_books: list[dict[str, Any]] = []
+        self._last_stream_flush_monotonic = 0.0
+        self._stream_flush_interval_seconds = 1.0
         self.streamer = streamer or self._build_streamer()
         self._bind_streamer_events()
 
@@ -169,6 +171,24 @@ class UpstoxMarketStream:
             self._update_bar(instrument_key, tick_ts, price)
         if current_ts is not None:
             self.flush_closed_candles(current_ts)
+        self._flush_stream_batch_if_due(
+            latest_exchange_ts=latest_exchange_ts,
+            received_at=received_at,
+            received_ns=received_ns,
+        )
+
+    def _flush_stream_batch_if_due(
+        self,
+        *,
+        latest_exchange_ts: datetime | None,
+        received_at: datetime,
+        received_ns: int,
+    ) -> None:
+        current = time.monotonic()
+        with self._lock:
+            if current - self._last_stream_flush_monotonic < self._stream_flush_interval_seconds:
+                return
+            self._last_stream_flush_monotonic = current
         self._flush_pending_records(
             latest_exchange_ts=latest_exchange_ts,
             received_at=received_at,

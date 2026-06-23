@@ -120,6 +120,15 @@ def test_option_chain_auto_refreshes_live_quotes_without_browser_reload() -> Non
     source = OPTION_CHAIN_JS.read_text(encoding="utf-8")
 
     assert "const AUTO_REFRESH_MS = 1000;" in source
-    assert "fetchChain(false, true)" in source
+    assert "fetchChain(false, false)" in source
     assert "cache: 'no-store'" in source
     assert "document.visibilityState !== 'visible'" in source
+
+
+def test_strike_chart_refreshes_from_stored_live_quotes() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "const STRIKE_CHART_REFRESH_MS = 4000;" in source
+    assert 'limit: "2000"' in source
+    assert 'refresh: "false"' in source
+    assert "window.setInterval(refreshVisibleChart, STRIKE_CHART_REFRESH_MS)" in source

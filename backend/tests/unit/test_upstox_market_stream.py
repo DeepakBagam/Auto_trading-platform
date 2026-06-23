@@ -106,3 +106,32 @@ def test_stream_upserts_current_minute_candle_on_each_tick() -> None:
         assert float(updated_row.close) == 24012.5
     finally:
         session.close()
+
+
+def test_stream_batches_database_flushes_to_once_per_second(monkeypatch) -> None:
+    stream = UpstoxMarketStream(
+        settings=SimpleNamespace(
+            upstox_websocket_mode="full",
+            upstox_websocket_reconnect_interval_seconds=5,
+            upstox_websocket_retry_count=5,
+            instrument_keys=["NSE_INDEX|Nifty 50"],
+        ),
+        streamer=_FakeStreamer(),
+    )
+    flushes = []
+    monotonic_values = iter([10.0, 10.2, 11.1])
+    monkeypatch.setattr(
+        "backend.data_layer.streamers.upstox_market_stream.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(stream, "_flush_pending_records", lambda **kwargs: flushes.append(kwargs))
+    received_at = datetime(2026, 6, 23, 9, 30, tzinfo=IST_ZONE)
+
+    for received_ns in (1, 2, 3):
+        stream._flush_stream_batch_if_due(
+            latest_exchange_ts=received_at,
+            received_at=received_at,
+            received_ns=received_ns,
+        )
+
+    assert [row["received_ns"] for row in flushes] == [1, 3]

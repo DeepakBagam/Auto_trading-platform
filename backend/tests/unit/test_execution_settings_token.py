@@ -11,6 +11,8 @@ from backend.api.routes.execution import (
     _check_upstox_profile,
     _serializable_settings,
     delete_position,
+    get_mode,
+    get_runtime_settings,
     update_runtime_settings,
 )
 from backend.db.models import Base, ExecutionPosition
@@ -100,6 +102,37 @@ def test_runtime_settings_rejects_india_vix_for_option_execution() -> None:
             )
     finally:
         session.close()
+
+
+def test_settings_and_mode_reads_do_not_construct_broker(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    settings = Settings(
+        _env_file=None,
+        execution_mode="sandbox",
+        execution_symbols="Nifty 50,Bank Nifty,SENSEX",
+        upstox_sandbox_access_token="sandbox-token",
+    )
+    monkeypatch.setattr("backend.api.routes.execution.get_settings", lambda: settings)
+    monkeypatch.setattr(
+        "backend.api.routes.execution.get_execution_engine",
+        lambda: (_ for _ in ()).throw(AssertionError("broker construction is not allowed")),
+    )
+    try:
+        settings_payload = get_runtime_settings(session)
+        mode_payload = get_mode(session)
+    finally:
+        session.close()
+
+    assert settings_payload["available_symbols"] == ["Nifty 50", "Bank Nifty", "SENSEX"]
+    assert settings_payload["broker"]["status"] == "sandbox"
+    assert mode_payload["mode"] == "sandbox"
 
 
 @pytest.mark.parametrize("status", ["ENTRY_PENDING", "EXIT_PENDING"])

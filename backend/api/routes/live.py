@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from threading import Lock
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
@@ -31,12 +33,30 @@ from backend.utils.config import get_settings, read_runtime_upstox_access_token
 from backend.utils.symbols import symbol_value_filter
 
 router = APIRouter(prefix="/api/live", tags=["live"])
+_OPTION_EXPIRY_CACHE_TTL_SECONDS = 300.0
+_OPTION_EXPIRY_CACHE: dict[str, tuple[float, list]] = {}
+_OPTION_EXPIRY_CACHE_LOCK = Lock()
 
 
 def _runtime_settings(db: Session):
     settings = get_settings().model_copy()
     apply_runtime_execution_settings(db, settings)
     return settings
+
+
+def _cached_option_expiries(underlying_key: str, settings) -> list:
+    cache_key = str(underlying_key or "").strip()
+    if not cache_key or not settings.has_market_data_access:
+        return []
+    now = time.monotonic()
+    with _OPTION_EXPIRY_CACHE_LOCK:
+        cached = _OPTION_EXPIRY_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _OPTION_EXPIRY_CACHE_TTL_SECONDS:
+            return list(cached[1])
+    expiries = UpstoxOptionChainCollector(settings).list_expiries(cache_key, max_items=6)
+    with _OPTION_EXPIRY_CACHE_LOCK:
+        _OPTION_EXPIRY_CACHE[cache_key] = (now, list(expiries))
+    return list(expiries)
 
 
 @router.get("/symbols")
@@ -143,7 +163,7 @@ def option_chain(
         available_expiries = []
         if underlying_key and settings.has_market_data_access:
             try:
-                available_expiries = UpstoxOptionChainCollector(settings).list_expiries(underlying_key, max_items=6)
+                available_expiries = _cached_option_expiries(underlying_key, settings)
             except Exception:
                 available_expiries = []
         if not available_expiries:

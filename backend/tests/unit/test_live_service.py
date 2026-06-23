@@ -68,6 +68,30 @@ def _make_rows() -> list[SimpleNamespace]:
     return rows
 
 
+def test_option_expiry_lookup_is_cached_between_fast_ui_polls(monkeypatch) -> None:
+    from backend.api.routes.live import _OPTION_EXPIRY_CACHE, _cached_option_expiries
+
+    calls = []
+
+    class FakeCollector:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def list_expiries(self, underlying_key, max_items):
+            calls.append((underlying_key, max_items))
+            return [date(2026, 6, 25)]
+
+    _OPTION_EXPIRY_CACHE.clear()
+    monkeypatch.setattr("backend.api.routes.live.UpstoxOptionChainCollector", FakeCollector)
+    settings = SimpleNamespace(has_market_data_access=True)
+
+    first = _cached_option_expiries("NSE_INDEX|Nifty 50", settings)
+    second = _cached_option_expiries("NSE_INDEX|Nifty 50", settings)
+
+    assert first == second == [date(2026, 6, 25)]
+    assert calls == [("NSE_INDEX|Nifty 50", 6)]
+
+
 def _context() -> MarketContext:
     rows = _make_rows()
     latest = rows[-1]
