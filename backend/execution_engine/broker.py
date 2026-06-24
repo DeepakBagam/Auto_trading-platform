@@ -74,6 +74,24 @@ class BaseBroker:
     def get_order_status(self, order_id: str) -> BrokerOrderResponse:
         raise NotImplementedError
 
+    def get_order_book(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def get_order_history(self, order_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def get_trade_pnl_report(
+        self,
+        *,
+        segment: str,
+        financial_year: str,
+        from_date: str,
+        to_date: str,
+        page_number: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
     def get_portfolio(self) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -235,11 +253,11 @@ class UpstoxBroker(BaseBroker):
             )
 
         self._record_success()
-        order_id = (
-            (data.get("data") or {}).get("order_id")
-            or (data.get("data") or {}).get("id")
-            or data.get("order_id")
-        )
+        response_data = data.get("data") if isinstance(data, dict) else None
+        response_item = response_data if isinstance(response_data, dict) else {}
+        order_id = response_item.get("order_id") or response_item.get("id")
+        if not order_id and isinstance(data, dict):
+            order_id = data.get("order_id")
         return BrokerOrderResponse(
             success=True,
             order_id=str(order_id) if order_id else None,
@@ -310,6 +328,49 @@ class UpstoxBroker(BaseBroker):
         response = self._request("GET", "/v2/order/details", {"order_id": order_id})
         response.order_id = order_id
         return response
+
+    def _read_endpoint(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        response = self._request("GET", path, params)
+        if response.success:
+            return response.payload
+        return {
+            "status": "error",
+            "errors": [
+                {
+                    "status": response.status,
+                    "message": response.message,
+                }
+            ],
+            "data": [],
+        }
+
+    def get_order_book(self) -> dict[str, Any]:
+        return self._read_endpoint("/v2/order/retrieve-all")
+
+    def get_order_history(self, order_id: str) -> dict[str, Any]:
+        return self._read_endpoint("/v2/order/history", {"order_id": order_id})
+
+    def get_trade_pnl_report(
+        self,
+        *,
+        segment: str,
+        financial_year: str,
+        from_date: str,
+        to_date: str,
+        page_number: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        return self._read_endpoint(
+            "/v2/trade/profit-loss/data",
+            {
+                "segment": segment,
+                "financial_year": financial_year,
+                "from_date": from_date,
+                "to_date": to_date,
+                "page_number": page_number,
+                "page_size": page_size,
+            },
+        )
 
     def get_portfolio(self) -> dict[str, Any]:
         self._refresh_token_if_available()
@@ -401,6 +462,11 @@ class UpstoxSandboxBroker(BaseBroker):
         self.configuration = configuration
         self.api_client = upstox_client.ApiClient(configuration)
         self.order_api = upstox_client.OrderApiV3(self.api_client)
+        self.session = requests.Session()
+        self.headers = {
+            "Authorization": f"Bearer {configuration.access_token}",
+            "Accept": "application/json",
+        }
 
     @staticmethod
     def _payload(value: Any) -> dict[str, Any]:
@@ -539,13 +605,71 @@ class UpstoxSandboxBroker(BaseBroker):
         )
 
     def get_order_status(self, order_id: str) -> BrokerOrderResponse:
+        payload = self._read_endpoint("/v2/order/details", {"order_id": order_id})
+        success = payload.get("status") == "success"
         return BrokerOrderResponse(
-            False,
+            success,
             order_id,
-            "UNSUPPORTED",
-            "sandbox_order_status_not_available",
-            {"sandbox": True},
+            "ACCEPTED" if success else "ERROR",
+            "ok" if success else str(payload.get("errors") or "sandbox_order_status_failed"),
+            payload,
         )
+
+    def _read_endpoint(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        url = f"{self.SANDBOX_ORDER_HOST}{path}"
+        try:
+            response = self.session.get(
+                url,
+                headers=self.headers,
+                params=params or {},
+                timeout=15,
+            )
+            payload = response.json() if response.content else {}
+        except Exception as exc:
+            return {
+                "status": "error",
+                "errors": [{"status": "ERROR", "message": str(exc)}],
+                "data": [],
+            }
+        if response.ok and isinstance(payload, dict):
+            return payload
+        return {
+            "status": "error",
+            "errors": [
+                {
+                    "status": str(response.status_code),
+                    "message": payload if payload else response.text[:500],
+                }
+            ],
+            "data": [],
+        }
+
+    def get_order_book(self) -> dict[str, Any]:
+        return self._read_endpoint("/v2/order/retrieve-all")
+
+    def get_order_history(self, order_id: str) -> dict[str, Any]:
+        return self._read_endpoint("/v2/order/history", {"order_id": order_id})
+
+    def get_trade_pnl_report(
+        self,
+        *,
+        segment: str,
+        financial_year: str,
+        from_date: str,
+        to_date: str,
+        page_number: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        return {
+            "status": "error",
+            "errors": [
+                {
+                    "status": "UNSUPPORTED",
+                    "message": "Upstox Sandbox does not expose the trade profit/loss report API.",
+                }
+            ],
+            "data": [],
+        }
 
     def get_portfolio(self) -> dict[str, Any]:
         return {

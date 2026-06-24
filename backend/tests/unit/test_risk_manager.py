@@ -37,19 +37,21 @@ def test_update_risk_plan_activates_and_trails_after_profit_threshold() -> None:
     assert update.current_sl == 106.7
 
 
-def test_compute_quantity_uses_stop_distance_when_available() -> None:
+def test_compute_quantity_sizes_by_affordable_investment_and_records_sl_risk() -> None:
     result = compute_quantity(
         capital=100000.0,
         capital_per_trade_pct=0.02,
         entry_price=100.0,
         stop_loss_price=90.0,
         lot_size=50,
+        fixed_lots=4,
+        max_lots=5,
     )
 
     assert result.lots == 4
     assert result.qty == 200
     assert result.capital_allocated == 20000.0
-    assert result.risk_budget == 2000.0
+    assert result.risk_budget == 400.0
     assert result.risk_per_lot == 500.0
     assert result.estimated_risk == 2000.0
     assert result.reason == "sized"
@@ -69,21 +71,21 @@ def test_compute_quantity_rejects_invalid_stop_loss() -> None:
     assert result.reason == "invalid_stop_loss"
 
 
-def test_compute_quantity_returns_zero_when_one_lot_exceeds_risk_budget() -> None:
+def test_compute_quantity_does_not_reject_when_one_lot_exceeds_old_risk_budget() -> None:
     result = compute_quantity(
         capital=10000.0,
         capital_per_trade_pct=0.01,
         entry_price=100.0,
         stop_loss_price=90.0,
         lot_size=50,
-        fixed_lots=4,
+        fixed_lots=1,
     )
 
-    assert result.risk_budget == 100.0
+    assert result.risk_budget == 50.0
     assert result.risk_per_lot == 500.0
-    assert result.lots == 0
-    assert result.qty == 0
-    assert result.reason == "risk_budget_below_minimum_lot"
+    assert result.lots == 1
+    assert result.qty == 50
+    assert result.reason == "sized"
 
 
 def test_fixed_lots_is_a_cap_not_a_risk_override() -> None:
@@ -97,11 +99,11 @@ def test_fixed_lots_is_a_cap_not_a_risk_override() -> None:
         max_lots=3,
     )
 
-    assert result.risk_limited_lots == 2
+    assert result.risk_limited_lots == 3
     assert result.affordable_lots == 20
-    assert result.lots == 2
-    assert result.qty == 100
-    assert result.estimated_risk == 1000.0
+    assert result.lots == 3
+    assert result.qty == 150
+    assert result.estimated_risk == 1500.0
 
 
 def test_compute_quantity_enforces_affordability_and_max_lots() -> None:
@@ -116,6 +118,6 @@ def test_compute_quantity_enforces_affordability_and_max_lots() -> None:
     )
 
     assert result.affordable_lots == 2
-    assert result.risk_limited_lots == 120
+    assert result.risk_limited_lots == 2
     assert result.lots == 2
     assert result.capital_allocated == 10000.0

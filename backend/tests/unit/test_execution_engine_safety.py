@@ -140,6 +140,20 @@ class _VerbSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
 
+    def get(self, url: str, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return _FakeHttpResponse(
+            {
+                "status": "success",
+                "data": [
+                    {
+                        "order_id": "OID-1",
+                        "status": "open pending",
+                    }
+                ],
+            }
+        )
+
     def put(self, url: str, **kwargs):
         self.calls.append(("PUT", url, kwargs))
         return _FakeHttpResponse({"status": "success", "data": {"order_id": "OID-1"}})
@@ -243,6 +257,31 @@ def test_upstox_modify_uses_put_and_cancel_uses_delete(monkeypatch) -> None:
     assert session.calls[0][2]["json"]["order_id"] == "OID-1"
     assert session.calls[1][0] == "DELETE"
     assert session.calls[1][2]["params"] == {"order_id": "OID-1"}
+
+
+def test_upstox_read_endpoints_support_order_lists_and_report_params(monkeypatch) -> None:
+    broker = UpstoxBroker(base_url="https://api.example.test", access_token="token")
+    session = _VerbSession()
+    broker.session = session
+    monkeypatch.setattr(broker, "_refresh_token_if_available", lambda: None)
+
+    order_book = broker.get_order_book()
+    history = broker.get_order_history("OID-1")
+    pnl = broker.get_trade_pnl_report(
+        segment="FO",
+        financial_year="2627",
+        from_date="23-06-2026",
+        to_date="23-06-2026",
+    )
+
+    assert order_book["data"][0]["order_id"] == "OID-1"
+    assert session.calls[0][1].endswith("/v2/order/retrieve-all")
+    assert session.calls[1][1].endswith("/v2/order/history")
+    assert session.calls[1][2]["params"] == {"order_id": "OID-1"}
+    assert session.calls[2][1].endswith("/v2/trade/profit-loss/data")
+    assert session.calls[2][2]["params"]["financial_year"] == "2627"
+    assert pnl["status"] == "success"
+    assert history["status"] == "success"
 
 
 def test_sandbox_protected_prices_round_to_configured_tick() -> None:

@@ -920,6 +920,63 @@ def portfolio(db: Session = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/broker/orders")
+def broker_order_book(db: Session = Depends(get_db)) -> dict:
+    engine = get_runtime_engine(db)
+    mode = get_runtime_trading_mode(db, settings=engine.settings)
+    engine.settings.execution_mode = mode
+    engine.broker = engine._build_broker()
+    payload = engine.broker.get_order_book()
+    return {"mode": mode, "broker": engine.broker.broker_name, **payload}
+
+
+@router.get("/broker/orders/{order_id}/history")
+def broker_order_history(order_id: str, db: Session = Depends(get_db)) -> dict:
+    normalized_order_id = str(order_id or "").strip()
+    if not normalized_order_id:
+        raise HTTPException(status_code=400, detail="order_id is required")
+    engine = get_runtime_engine(db)
+    mode = get_runtime_trading_mode(db, settings=engine.settings)
+    engine.settings.execution_mode = mode
+    engine.broker = engine._build_broker()
+    payload = engine.broker.get_order_history(normalized_order_id)
+    return {
+        "mode": mode,
+        "broker": engine.broker.broker_name,
+        "order_id": normalized_order_id,
+        **payload,
+    }
+
+
+@router.get("/broker/trade-pnl")
+def broker_trade_pnl(
+    date_from: date = Query(...),
+    date_to: date = Query(...),
+    segment: str = Query("FO", min_length=1, max_length=10),
+    financial_year: str = Query(..., min_length=4, max_length=4),
+    page_number: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict:
+    if date_from > date_to:
+        raise HTTPException(status_code=400, detail="date_from cannot be after date_to")
+    if not financial_year.isdigit():
+        raise HTTPException(status_code=400, detail="financial_year must be four digits, for example 2627")
+    engine = get_runtime_engine(db)
+    mode = get_runtime_trading_mode(db, settings=engine.settings)
+    engine.settings.execution_mode = mode
+    engine.broker = engine._build_broker()
+    payload = engine.broker.get_trade_pnl_report(
+        segment=segment.upper(),
+        financial_year=financial_year,
+        from_date=date_from.strftime("%d-%m-%Y"),
+        to_date=date_to.strftime("%d-%m-%Y"),
+        page_number=page_number,
+        page_size=page_size,
+    )
+    return {"mode": mode, "broker": engine.broker.broker_name, **payload}
+
+
 @router.get("/trade-history")
 def trade_history(
     date_from: date | None = Query(None),

@@ -1937,6 +1937,16 @@ def log_signal_decision(
     skip_reason: str | None = None,
 ) -> SignalLog:
     details = {**signal.details, **(extra_details or {})}
+    rejection_reasons = [
+        str(reason)
+        for reason in (details.get("execution_rejection_reasons") or [])
+        if reason
+    ]
+    computed_skip_reason = skip_reason
+    if computed_skip_reason is None and signal.action not in {"BUY", "SELL"}:
+        computed_skip_reason = rejection_reasons[0] if rejection_reasons else (
+            signal.reasons[0] if signal.reasons else None
+        )
     row = SignalLog(
         timestamp=signal.timestamp,
         trade_date=signal.timestamp.date(),
@@ -1951,7 +1961,7 @@ def log_signal_decision(
         news_sentiment=0.0,
         combined_score=round(signal.score / 100.0, 4),
         consensus=signal.action if signal.action in {"BUY", "SELL"} else "non_trade_signal",
-        skip_reason=skip_reason or (None if signal.action in {"BUY", "SELL"} else (signal.reasons[0] if signal.reasons else None)),
+        skip_reason=computed_skip_reason,
         trade_placed=bool(trade_placed),
         details=details,
     )

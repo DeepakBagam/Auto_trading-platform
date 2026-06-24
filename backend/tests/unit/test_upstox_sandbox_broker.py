@@ -35,6 +35,32 @@ class TimeoutOrderApi(FakeOrderApi):
         raise TimeoutError("response lost")
 
 
+class FakeReadResponse:
+    def __init__(self, payload, *, ok=True, status_code=200) -> None:
+        self._payload = payload
+        self.ok = ok
+        self.status_code = status_code
+        self.content = b"{}"
+        self.text = str(payload)
+
+    def json(self):
+        return self._payload
+
+
+class FakeReadSession:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return FakeReadResponse(
+            {
+                "status": "success",
+                "data": [{"order_id": "SANDBOX-1", "status": "open pending"}],
+            }
+        )
+
+
 def test_sandbox_broker_is_pinned_to_upstox_sandbox_and_maps_product() -> None:
     broker = UpstoxSandboxBroker(access_token="sandbox-token")
     fake = FakeOrderApi()
@@ -142,3 +168,35 @@ def test_sandbox_mutating_timeout_is_ambiguous_and_not_retried() -> None:
     assert response.success is False
     assert response.status == "AMBIGUOUS"
     assert len(fake.placed) == 1
+
+
+def test_sandbox_read_endpoints_are_pinned_to_sandbox_host() -> None:
+    broker = UpstoxSandboxBroker(access_token="sandbox-token")
+    session = FakeReadSession()
+    broker.session = session
+
+    order_book = broker.get_order_book()
+    history = broker.get_order_history("SANDBOX-1")
+    status = broker.get_order_status("SANDBOX-1")
+
+    assert order_book["data"][0]["order_id"] == "SANDBOX-1"
+    assert session.calls[0][0] == "https://api-sandbox.upstox.com/v2/order/retrieve-all"
+    assert session.calls[1][0] == "https://api-sandbox.upstox.com/v2/order/history"
+    assert session.calls[1][1]["params"] == {"order_id": "SANDBOX-1"}
+    assert session.calls[2][0] == "https://api-sandbox.upstox.com/v2/order/details"
+    assert status.success is True
+    assert history["status"] == "success"
+
+
+def test_sandbox_trade_pnl_report_is_explicitly_unsupported() -> None:
+    broker = UpstoxSandboxBroker(access_token="sandbox-token")
+
+    payload = broker.get_trade_pnl_report(
+        segment="FO",
+        financial_year="2627",
+        from_date="23-06-2026",
+        to_date="23-06-2026",
+    )
+
+    assert payload["status"] == "error"
+    assert payload["errors"][0]["status"] == "UNSUPPORTED"

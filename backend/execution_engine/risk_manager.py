@@ -110,7 +110,7 @@ def compute_quantity(
     multiplier = vix_position_multiplier(vix_level)
     price = max(0.01, float(entry_price))
     available_capital = max(0.0, float(capital))
-    risk_budget = available_capital * max(0.0, float(capital_per_trade_pct)) * multiplier
+    risk_pct = max(0.0, float(capital_per_trade_pct)) * multiplier
     stop_distance = price - float(stop_loss_price) if stop_loss_price is not None else 0.0
     cost_per_lot = price * lot_size
     affordable_lots = floor(available_capital / cost_per_lot) if cost_per_lot > 0.0 else 0
@@ -122,17 +122,17 @@ def compute_quantity(
         reason = "invalid_stop_loss"
     else:
         risk_per_lot = stop_distance * lot_size
-        risk_limited_lots = floor(risk_budget / risk_per_lot) if risk_per_lot > 0.0 else 0
-        candidate_lots = min(affordable_lots, risk_limited_lots)
+        # Quantity is based on the configured/affordable investment amount. The
+        # stop-loss risk is recorded for diagnostics, while daily max loss is
+        # enforced by the execution engine as the portfolio-level protection.
+        candidate_lots = affordable_lots
         if fixed_lots is not None:
             candidate_lots = min(candidate_lots, max(0, int(fixed_lots)))
         if max_lots is not None:
             candidate_lots = min(candidate_lots, max(0, int(max_lots)))
+        risk_limited_lots = candidate_lots
 
-        if risk_limited_lots < min_lots:
-            lots = 0
-            reason = "risk_budget_below_minimum_lot"
-        elif affordable_lots < min_lots:
+        if affordable_lots < min_lots:
             lots = 0
             reason = "insufficient_available_balance"
         elif candidate_lots < min_lots:
@@ -145,6 +145,7 @@ def compute_quantity(
     qty = lots * lot_size
     capital_allocated = price * qty
     estimated_risk = risk_per_lot * lots
+    risk_budget = capital_allocated * risk_pct
     return TradeSizingResult(
         qty=int(qty),
         lots=int(lots),

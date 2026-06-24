@@ -1752,7 +1752,7 @@ class IntradayOptionsExecutionEngine:
         if sizing.qty <= 0:
             log_row.skip_reason = (
                 f"Position sizing rejected: {sizing.reason}; "
-                f"available={available_balance:.2f}, risk_budget={sizing.risk_budget:.2f}, "
+                f"available={available_balance:.2f}, investment_budget={sizing.risk_budget:.2f}, "
                 f"risk_per_lot={sizing.risk_per_lot:.2f}"
             )
             db.commit()
