@@ -772,6 +772,67 @@ def test_chart_payload_uses_recent_one_minute_sessions() -> None:
         session.close()
 
 
+def test_chart_payload_does_not_regress_to_older_complete_session(monkeypatch) -> None:
+    from backend.execution_engine.live_service import build_chart_payload
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        instrument_key = "NSE_INDEX|Nifty 50"
+        previous_start = datetime(2026, 6, 24, 9, 15, tzinfo=IST_ZONE)
+        current_start = datetime(2026, 6, 25, 9, 15, tzinfo=IST_ZONE)
+        for index in range(60):
+            session.add(
+                RawCandle(
+                    instrument_key=instrument_key,
+                    interval="1minute",
+                    ts=previous_start + timedelta(minutes=index),
+                    open=24000.0,
+                    high=24002.0,
+                    low=23998.0,
+                    close=24001.0,
+                    volume=100.0,
+                    source="test",
+                )
+            )
+        for index in range(60):
+            session.add(
+                RawCandle(
+                    instrument_key=instrument_key,
+                    interval="1minute",
+                    ts=current_start + timedelta(minutes=index),
+                    open=24100.0,
+                    high=24102.0,
+                    low=24098.0,
+                    close=24101.0,
+                    volume=100.0,
+                    source="test",
+                )
+            )
+        session.commit()
+        monkeypatch.setattr(
+            "backend.execution_engine.live_service._latest_complete_intraday_ts",
+            lambda *_args, **_kwargs: previous_start + timedelta(minutes=59),
+        )
+
+        payload = build_chart_payload(
+            session,
+            symbol="Nifty 50",
+            now=datetime(2026, 6, 25, 21, 30, tzinfo=IST_ZONE),
+        )
+
+        assert payload["latest"] == "2026-06-25T10:14:00+05:30"
+        assert payload["end_date"] == "2026-06-25"
+    finally:
+        session.close()
+
+
 def test_build_live_price_update_includes_stream_diagnostics(monkeypatch) -> None:
     monkeypatch.setattr(
         "backend.execution_engine.live_service.get_market_stream_runtime_status",

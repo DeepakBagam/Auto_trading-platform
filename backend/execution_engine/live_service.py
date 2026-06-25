@@ -3380,12 +3380,13 @@ def build_chart_payload(
     selected_interval = LIVE_INTERVAL
     plan = _chart_range_plan(range_name, current, interval_override=selected_interval)
     source_interval = LIVE_INTERVAL
-    latest_source_ts = _latest_chart_source_ts(db, instrument_key=instrument_key, interval=source_interval)
+    raw_latest_source_ts = _latest_chart_source_ts(db, instrument_key=instrument_key, interval=source_interval)
     earliest_source_ts = _earliest_chart_source_ts(db, instrument_key=instrument_key, interval=source_interval)
-    latest_source_ts = (
-        _latest_complete_intraday_ts(db, instrument_key=instrument_key, now=current)
-        or latest_source_ts
-    )
+    complete_latest_source_ts = _latest_complete_intraday_ts(db, instrument_key=instrument_key, now=current)
+    latest_candidates = [
+        ts for ts in (_ensure_ist(raw_latest_source_ts), _ensure_ist(complete_latest_source_ts)) if ts is not None
+    ]
+    latest_source_ts = max(latest_candidates) if latest_candidates else None
     cache_key = (
         instrument_key,
         range_name,
