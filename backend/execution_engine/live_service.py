@@ -508,6 +508,9 @@ def _timeframe_confirmation_columns(frame: pd.DataFrame) -> pd.DataFrame:
 def _expected_chart_end_date(now: datetime | None = None, latest_available_ts: datetime | None = None) -> date:
     current = _ensure_ist(now) or datetime.now(IST_ZONE)
     today = current.date()
+    latest_date = _ensure_ist(latest_available_ts).date() if latest_available_ts is not None else None
+    if latest_date is not None:
+        return latest_date
     session_start, _session_end = market_session_bounds(today)
     if not is_trading_day(today):
         expected = previous_trading_day(today)
@@ -515,9 +518,6 @@ def _expected_chart_end_date(now: datetime | None = None, latest_available_ts: d
         expected = previous_trading_day(today)
     else:
         expected = today
-    latest_date = _ensure_ist(latest_available_ts).date() if latest_available_ts is not None else None
-    if latest_date is not None and latest_date < expected:
-        return latest_date
     return expected
 
 
