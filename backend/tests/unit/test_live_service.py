@@ -855,7 +855,7 @@ def test_settings_should_autostart_market_stream_uses_safe_defaults() -> None:
     )
 
     assert sqlite_settings.should_autostart_market_stream is True
-    assert postgres_settings.should_autostart_market_stream is False
+    assert postgres_settings.should_autostart_market_stream is True
     assert forced_off.should_autostart_market_stream is False
 
 

@@ -285,7 +285,7 @@ class Settings(BaseSettings):
     def should_autostart_market_stream(self) -> bool:
         if self.market_stream_autostart is not None:
             return bool(self.market_stream_autostart)
-        return self.market_data_mode.strip().lower() == "websocket" and self.database_url.startswith("sqlite")
+        return self.market_data_mode.strip().lower() == "websocket"
 
     @model_validator(mode="after")
     def validate_live_execution_safety(self) -> "Settings":

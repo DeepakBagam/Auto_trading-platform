@@ -96,6 +96,21 @@ _CHART_PAYLOAD_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _INSTRUMENT_RESOLVE_CACHE: dict[str, tuple[str, str]] = {}
 _PINE_MARKER_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 
+
+def _chart_cache_is_fresh(payload: dict[str, Any], latest_source_ts: datetime | None) -> bool:
+    if latest_source_ts is None:
+        return True
+    payload_latest = _parse_iso_datetime(payload.get("latest"))
+    if payload_latest is None:
+        candles = payload.get("candles") or []
+        if candles:
+            payload_latest = _parse_iso_datetime(candles[-1].get("x"))
+    if payload_latest is None:
+        return False
+    source_latest = _ensure_ist(latest_source_ts)
+    payload_latest = _ensure_ist(payload_latest)
+    return bool(source_latest is not None and payload_latest is not None and payload_latest >= source_latest)
+
 # ---------------------------------------------------------------------------
 # Market regime constants
 # ---------------------------------------------------------------------------
@@ -3379,14 +3394,16 @@ def build_chart_payload(
         _pine_settings_fingerprint(settings),
     )
     cached = _CHART_PAYLOAD_CACHE.get(cache_key)
-    if cached is not None:
+    if cached is not None and _chart_cache_is_fresh(cached, latest_source_ts):
         return _attach_execution_signal_markers(db, cached, symbol=display_symbol)
+    if cached is not None:
+        _CHART_PAYLOAD_CACHE.pop(cache_key, None)
     redis_key = (
-        f"chart:v10:{instrument_key}:{range_name}:{source_interval}:"
+        f"chart:v11:{instrument_key}:{range_name}:{source_interval}:"
         f"{cache_key[3] or 'none'}:{hash(cache_key[4])}"
     )
     redis_cached = redis_get_json(redis_key)
-    if redis_cached is not None:
+    if redis_cached is not None and _chart_cache_is_fresh(redis_cached, latest_source_ts):
         _CHART_PAYLOAD_CACHE[cache_key] = redis_cached
         return _attach_execution_signal_markers(db, redis_cached, symbol=display_symbol)
 
